@@ -1,4 +1,4 @@
-//! Shared CiaoShip domain, detection and deployment primitives.
+//! Shared Ciao domain, detection and deployment primitives.
 //!
 //! The CLI and MCP layers deliberately depend on this crate instead of
 //! invoking one another. Remote work is performed through OpenSSH, while the
@@ -9,14 +9,17 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const APP_ROOT: &str = "/var/lib/ciaoship/apps";
-pub const CONFIG_ENV: &str = "CIAOSHIP_CONFIG";
+pub const APP_ROOT: &str = "/var/lib/ciao/apps";
+pub const CONFIG_ENV: &str = "CIAO_CONFIG";
+pub const GITHUB_CONFIG_ENV: &str = "CIAO_GITHUB_CONFIG";
 pub const PORT_START: u16 = 41_000;
 pub const PORT_END: u16 = 49_000;
 pub const LOCAL_PORT_START: u16 = 41_000;
@@ -77,6 +80,8 @@ pub struct Host {
     #[serde(skip)]
     pub name: String,
     pub ssh: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<PathBuf>,
 }
 
 impl Host {
@@ -85,7 +90,17 @@ impl Host {
         validate_identifier("host name", &name)?;
         let ssh = ssh.into();
         validate_ssh_target(&ssh)?;
-        Ok(Self { name, ssh })
+        Ok(Self {
+            name,
+            ssh,
+            identity_file: None,
+        })
+    }
+
+    pub fn with_identity_file(mut self, identity_file: PathBuf) -> Result<Self> {
+        validate_identity_file(&identity_file)?;
+        self.identity_file = Some(identity_file);
+        Ok(self)
     }
 }
 
@@ -274,6 +289,120 @@ pub struct LocalProject {
     pub static_root: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepoRef {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl GitHubRepoRef {
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepository {
+    pub owner: String,
+    pub repo: String,
+    pub repository_id: String,
+    pub default_branch: String,
+    pub remote: String,
+    pub private: bool,
+}
+
+impl GitHubRepository {
+    pub fn reference(&self) -> GitHubRepoRef {
+        GitHubRepoRef {
+            owner: self.owner.clone(),
+            repo: self.repo.clone(),
+        }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubDeploymentLink {
+    pub repository: String,
+    pub repository_id: String,
+    pub branch: String,
+    pub host: String,
+    pub tailscale_host: String,
+    pub ssh_user: String,
+    pub federated_identity_id: Option<String>,
+    pub workflow_path: PathBuf,
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub ciao_version: String,
+    #[serde(default)]
+    pub source_token_configured: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitHubConfig {
+    #[serde(default)]
+    pub links: BTreeMap<String, GitHubDeploymentLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailscaleTarget {
+    pub hostname: Option<String>,
+    pub ipv4: Option<String>,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailscaleInstallResult {
+    pub executable: String,
+    pub installed: bool,
+}
+
+impl TailscaleTarget {
+    pub fn preferred_address(&self) -> Result<String> {
+        self.hostname
+            .clone()
+            .or_else(|| self.ipv4.clone())
+            .ok_or_else(|| {
+                CiaoError::Config(
+                    "Tailscale is connected but did not report a MagicDNS hostname or IPv4 address"
+                        .to_owned(),
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedSshKey {
+    pub private_key: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowSpec {
+    pub branch: String,
+    pub ciao_version: String,
+    pub ciao_repository: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailscaleFederatedIdentity {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub audience: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiTarget {
+    pub host: String,
+    pub user: String,
+    pub app: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalDevPlan {
     pub name: String,
@@ -323,6 +452,9 @@ impl Config {
             validate_identifier("host name", name)?;
             host.name = name.clone();
             validate_ssh_target(&host.ssh)?;
+            if let Some(identity_file) = &host.identity_file {
+                validate_identity_file(identity_file)?;
+            }
         }
         validate_profile(&config.mcp.profile)?;
         if config.local.port_start < 1024 || config.local.port_end < config.local.port_start {
@@ -375,8 +507,1631 @@ pub fn default_config_path() -> PathBuf {
     }
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|path| path.join(".config/ciaoship/config.toml"))
-        .unwrap_or_else(|| PathBuf::from(".ciaoship/config.toml"))
+        .map(|path| path.join(".config/ciao/config.toml"))
+        .unwrap_or_else(|| PathBuf::from(".ciao/config.toml"))
+}
+
+fn validate_identity_file(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.to_string_lossy().contains(['\n', '\r'])
+        || !path.is_absolute()
+    {
+        return Err(CiaoError::Config(
+            "SSH identity file must be an absolute path without newlines".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn github_config_path() -> PathBuf {
+    if let Ok(path) = std::env::var(GITHUB_CONFIG_ENV) {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join(".config/ciao/github.toml"))
+        .unwrap_or_else(|| PathBuf::from(".ciao/github.toml"))
+}
+
+impl GitHubConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        toml::from_str(&fs::read_to_string(path)?)
+            .map_err(|error| CiaoError::Config(format!("GitHub configuration is invalid: {error}")))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)
+            .map_err(|error| CiaoError::Serialization(error.to_string()))?;
+        fs::write(path, contents)?;
+        Ok(())
+    }
+}
+
+pub fn git_remote_origin(root: &Path) -> Result<Option<String>> {
+    let output = run_local_command(
+        "git",
+        &[
+            "-C".to_owned(),
+            root.display().to_string(),
+            "config".to_owned(),
+            "--get".to_owned(),
+            "remote.origin.url".to_owned(),
+        ],
+        None,
+        "read GitHub origin",
+    );
+    match output {
+        Ok(output) => {
+            let remote = output.stdout.trim();
+            if remote.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(remote.to_owned()))
+            }
+        }
+        Err(CiaoError::LocalCommand { exit: 1, .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn parse_github_remote(remote: &str) -> Result<Option<GitHubRepoRef>> {
+    let value = remote.trim();
+    let path = if let Some(path) = value.strip_prefix("https://github.com/") {
+        path
+    } else if let Some(path) = value.strip_prefix("http://github.com/") {
+        path
+    } else if let Some(path) = value.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = value.strip_prefix("ssh://git@github.com/") {
+        path
+    } else {
+        return Ok(None);
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if parts.next().is_some() || owner.is_empty() || repo.is_empty() {
+        return Err(CiaoError::Config(format!(
+            "GitHub remote must use owner/repository: {remote}"
+        )));
+    }
+    validate_github_segment("GitHub owner", owner)?;
+    validate_github_segment("GitHub repository", repo)?;
+    Ok(Some(GitHubRepoRef {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    }))
+}
+
+pub fn detect_github_repository(root: &Path) -> Result<Option<GitHubRepository>> {
+    let Some(remote) = git_remote_origin(root)? else {
+        return Ok(None);
+    };
+    let Some(reference) = parse_github_remote(&remote)? else {
+        return Ok(None);
+    };
+    let branch = run_local_command(
+        "git",
+        &[
+            "-C".to_owned(),
+            root.display().to_string(),
+            "branch".to_owned(),
+            "--show-current".to_owned(),
+        ],
+        None,
+        "read current Git branch",
+    )?
+    .stdout
+    .trim()
+    .to_owned();
+    Ok(Some(GitHubRepository {
+        owner: reference.owner,
+        repo: reference.repo,
+        repository_id: String::new(),
+        default_branch: if branch.is_empty() {
+            "main".to_owned()
+        } else {
+            branch
+        },
+        remote,
+        private: false,
+    }))
+}
+
+pub fn github_repository_metadata(reference: &GitHubRepoRef) -> Result<GitHubRepository> {
+    let output = run_local_command(
+        "gh",
+        &["api".to_owned(), format!("repos/{}", reference.full_name())],
+        None,
+        "read GitHub repository metadata",
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
+        CiaoError::Config(format!(
+            "GitHub returned invalid repository metadata: {error}"
+        ))
+    })?;
+    let repository_id = value
+        .get("id")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|id| id.to_string()))
+        })
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            CiaoError::Config("GitHub metadata did not include repository id".to_owned())
+        })?;
+    let default_branch = value
+        .get("default_branch")
+        .and_then(serde_json::Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| {
+            CiaoError::Config("GitHub metadata did not include the default branch".to_owned())
+        })?;
+    let private = value
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(GitHubRepository {
+        owner: reference.owner.clone(),
+        repo: reference.repo.clone(),
+        repository_id,
+        default_branch: default_branch.to_owned(),
+        remote: format!("https://github.com/{}.git", reference.full_name()),
+        private,
+    })
+}
+
+pub fn github_auth_status() -> Result<CommandOutput> {
+    run_local_command(
+        "gh",
+        &["auth".to_owned(), "status".to_owned()],
+        None,
+        "check GitHub authentication",
+    )
+}
+
+pub fn ssh_user_from_target(target: &str) -> Option<String> {
+    ssh_login_user(target)
+}
+
+pub fn ssh_host_from_target(target: &str) -> &str {
+    target.rsplit('@').next().unwrap_or(target)
+}
+
+pub fn ssh_target_uses_tailscale(target: &str) -> bool {
+    let host = ssh_host_from_target(target);
+    host.ends_with(".ts.net")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| match address {
+                IpAddr::V4(address) => {
+                    let octets = address.octets();
+                    octets[0] == 100 && (64..=127).contains(&octets[1])
+                }
+                IpAddr::V6(address) => address.segments()[0] == 0xfd7a,
+            })
+            .unwrap_or(false)
+}
+
+pub fn github_set_secret(repository: &GitHubRepoRef, name: &str, value: &str) -> Result<()> {
+    validate_github_secret_name(name)?;
+    if value.is_empty() {
+        return Err(CiaoError::Config(format!(
+            "GitHub secret {name} cannot be empty"
+        )));
+    }
+    run_local_command(
+        "gh",
+        &[
+            "secret".to_owned(),
+            "set".to_owned(),
+            name.to_owned(),
+            "--repo".to_owned(),
+            repository.full_name(),
+        ],
+        Some(value.as_bytes()),
+        &format!("configure GitHub secret {name}"),
+    )?;
+    Ok(())
+}
+
+pub fn github_set_variable(repository: &GitHubRepoRef, name: &str, value: &str) -> Result<()> {
+    validate_github_variable_name(name)?;
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return Err(CiaoError::Config(format!(
+            "GitHub variable {name} must be a single non-empty line"
+        )));
+    }
+    run_local_command(
+        "gh",
+        &[
+            "variable".to_owned(),
+            "set".to_owned(),
+            name.to_owned(),
+            "--repo".to_owned(),
+            repository.full_name(),
+            "--body".to_owned(),
+            value.to_owned(),
+        ],
+        None,
+        &format!("configure GitHub variable {name}"),
+    )?;
+    Ok(())
+}
+
+pub fn github_delete_secret(repository: &GitHubRepoRef, name: &str) -> Result<()> {
+    validate_github_secret_name(name)?;
+    run_local_command(
+        "gh",
+        &[
+            "secret".to_owned(),
+            "delete".to_owned(),
+            name.to_owned(),
+            "--repo".to_owned(),
+            repository.full_name(),
+        ],
+        None,
+        &format!("remove GitHub secret {name}"),
+    )?;
+    Ok(())
+}
+
+pub fn github_delete_variable(repository: &GitHubRepoRef, name: &str) -> Result<()> {
+    validate_github_variable_name(name)?;
+    run_local_command(
+        "gh",
+        &[
+            "variable".to_owned(),
+            "delete".to_owned(),
+            name.to_owned(),
+            "--repo".to_owned(),
+            repository.full_name(),
+        ],
+        None,
+        &format!("remove GitHub variable {name}"),
+    )?;
+    Ok(())
+}
+
+fn validate_github_secret_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 100
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(CiaoError::InvalidIdentifier {
+            field: "GitHub secret",
+            value: name.to_owned(),
+            reason: "must contain only letters, numbers and `_`",
+        });
+    }
+    Ok(())
+}
+
+fn validate_github_variable_name(name: &str) -> Result<()> {
+    validate_github_secret_name(name).map_err(|error| match error {
+        CiaoError::InvalidIdentifier { value, .. } => CiaoError::InvalidIdentifier {
+            field: "GitHub variable",
+            value,
+            reason: "must contain only letters, numbers and `_`",
+        },
+        other => other,
+    })
+}
+
+pub fn ci_target_from_env(env: &BTreeMap<String, String>) -> Result<CiTarget> {
+    let required = |key: &str| {
+        env.get(key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| CiaoError::Config(format!("CI variable {key} is required")))
+    };
+    let host = required("CIAO_HOST")?.to_owned();
+    let user = required("CIAO_USER")?.to_owned();
+    let app = required("CIAO_APP")?.to_owned();
+    validate_ssh_target(&format!("{user}@{host}"))?;
+    validate_identifier("app name", &app)?;
+    Ok(CiTarget { host, user, app })
+}
+
+pub fn workflow_spec_for(
+    branch: impl Into<String>,
+    ciao_version: impl Into<String>,
+) -> WorkflowSpec {
+    WorkflowSpec {
+        branch: branch.into(),
+        ciao_version: ciao_version.into(),
+        ciao_repository: "jepgambardella/ciao".to_owned(),
+    }
+}
+
+pub fn github_workflow_path(root: &Path) -> PathBuf {
+    root.join(".github/workflows/ciao-deploy.yml")
+}
+
+pub fn git_revision(root: &Path) -> Result<String> {
+    let revision = run_local_command(
+        "git",
+        &[
+            "-C".to_owned(),
+            root.display().to_string(),
+            "rev-parse".to_owned(),
+            "HEAD".to_owned(),
+        ],
+        None,
+        "read Ciao workflow revision",
+    )?
+    .stdout
+    .trim()
+    .to_owned();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CiaoError::Config(
+            "Ciao workflow requires a full Git commit revision".to_owned(),
+        ));
+    }
+    Ok(revision)
+}
+
+fn yaml_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+pub fn render_github_workflow(spec: &WorkflowSpec) -> Result<String> {
+    if spec.branch.is_empty() || spec.branch.contains(['\n', '\r', '\'']) {
+        return Err(CiaoError::Config(
+            "GitHub workflow branch is invalid".to_owned(),
+        ));
+    }
+    if spec.ciao_version.is_empty()
+        || spec.ciao_version.contains(['\n', '\r', '\''])
+        || spec.ciao_version == "latest"
+    {
+        return Err(CiaoError::Config(
+            "GitHub workflow requires a pinned Ciao version".to_owned(),
+        ));
+    }
+    if !spec.ciao_repository.contains('/') || spec.ciao_repository.contains(['\n', '\r', '\'', ' '])
+    {
+        return Err(CiaoError::Config(
+            "Ciao GitHub repository is invalid".to_owned(),
+        ));
+    }
+    let branch = yaml_quote(&spec.branch);
+    let version = yaml_quote(&spec.ciao_version);
+    let gh = "$";
+    Ok(format!(
+        r#"name: Ciao Deploy
+
+on:
+  push:
+    branches:
+      - {branch}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ciao-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned Ciao
+        uses: actions/checkout@v4
+        with:
+          repository: {repo}
+          ref: {version}
+          path: .ciao-tool
+          token: {gh}{{{{ secrets.CIAO_GITHUB_TOKEN || github.token }}}}
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: {gh}{{{{ vars.TS_OAUTH_CLIENT_ID }}}}
+          audience: {gh}{{{{ vars.TS_AUDIENCE }}}}
+          tags: tag:ciao-ci
+          ping: {gh}{{{{ vars.CIAO_HOST }}}}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Ciao
+        run: cargo install --locked --path .ciao-tool/crates/ciao
+      - name: Configure SSH
+        env:
+          CIAO_SSH_KEY: {gh}{{{{ secrets.CIAO_SSH_KEY }}}}
+          CIAO_SSH_KNOWN_HOSTS: {gh}{{{{ secrets.CIAO_SSH_KNOWN_HOSTS }}}}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s' "$CIAO_SSH_KEY" > "$HOME/.ssh/ciao_ci_ed25519"
+          chmod 600 "$HOME/.ssh/ciao_ci_ed25519"
+          printf '%s\n' "$CIAO_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          cat > "$HOME/.ssh/config" <<'EOF'
+          Host ciao-target
+            HostName {gh}{{{{ vars.CIAO_HOST }}}}
+            User {gh}{{{{ vars.CIAO_USER }}}}
+            IdentityFile ~/.ssh/ciao_ci_ed25519
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            StrictHostKeyChecking yes
+          EOF
+      - name: Deploy
+        env:
+          CIAO_HOST: {gh}{{{{ vars.CIAO_HOST }}}}
+          CIAO_USER: {gh}{{{{ vars.CIAO_USER }}}}
+          CIAO_APP: {gh}{{{{ vars.CIAO_APP }}}}
+        run: ciao deploy --ci --path . ciao-target
+"#,
+        branch = branch,
+        repo = spec.ciao_repository,
+        version = version,
+        gh = gh,
+    ))
+}
+
+pub fn tailscale_target_from_status(status: &serde_json::Value) -> Result<TailscaleTarget> {
+    let backend_state = status
+        .get("BackendState")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let online = backend_state == "Running";
+    let hostname = status
+        .get("Self")
+        .and_then(|self_node| self_node.get("DNSName"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim_end_matches('.').to_owned());
+    let ipv4 = status
+        .get("TailscaleIPs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| {
+            values.iter().find_map(|value| {
+                let address = value.as_str()?;
+                match address.parse::<IpAddr>().ok()? {
+                    IpAddr::V4(_) => Some(address.to_owned()),
+                    IpAddr::V6(_) => None,
+                }
+            })
+        });
+    if !online {
+        return Err(CiaoError::Config(
+            "Tailscale is installed but not connected on the target".to_owned(),
+        ));
+    }
+    if hostname.is_none() && ipv4.is_none() {
+        return Err(CiaoError::Config(
+            "Tailscale status did not include a usable target address".to_owned(),
+        ));
+    }
+    Ok(TailscaleTarget {
+        hostname,
+        ipv4,
+        online,
+    })
+}
+
+pub fn tailscale_status_command() -> CommandSpec {
+    CommandSpec::fixed("sh", &["-s"], "inspect Tailscale status").with_stdin(
+        br#"set -eu
+for candidate in /usr/local/bin/tailscale /usr/local/opt/tailscale/bin/tailscale /opt/homebrew/bin/tailscale /opt/homebrew/opt/tailscale/bin/tailscale /usr/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+    if [ -x "$candidate" ]; then exec "$candidate" status --json; fi
+done
+if command -v tailscale >/dev/null 2>&1; then exec tailscale status --json; fi
+echo 'Tailscale CLI was not found on the target' >&2
+exit 127
+"#
+        .to_vec(),
+    )
+}
+
+/// Find an already installed local Tailscale CLI before attempting any
+/// installation. The standalone macOS app can keep the CLI outside PATH.
+pub fn local_tailscale_executable() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = find_executable("tailscale") {
+        candidates.push(path);
+    }
+    if cfg!(target_os = "macos") {
+        candidates.extend([
+            PathBuf::from("/usr/local/bin/tailscale"),
+            PathBuf::from("/usr/local/opt/tailscale/bin/tailscale"),
+            PathBuf::from("/opt/homebrew/bin/tailscale"),
+            PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/tailscale"),
+            PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+        ]);
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Install Tailscale only when it is missing from the local device. Joining a
+/// tailnet is handled separately by the caller through the browser-guided
+/// authentication flow below.
+pub fn ensure_local_tailscale() -> Result<TailscaleInstallResult> {
+    if let Some(executable) = local_tailscale_executable() {
+        return Ok(TailscaleInstallResult {
+            executable: executable.display().to_string(),
+            installed: false,
+        });
+    }
+    let script = if cfg!(target_os = "macos") {
+        r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'macOS curl is required to install Tailscale' >&2; exit 1; }
+brew_bin=''
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+done
+if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
+if [ -z "$brew_bin" ]; then
+    brew_script=$(mktemp -t ciao-homebrew)
+    trap 'rm -f "$brew_script"' EXIT
+    curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_script"
+    NONINTERACTIVE=1 /bin/bash "$brew_script"
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+        if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+    done
+fi
+[ -n "$brew_bin" ] || { echo 'Homebrew installation finished without a usable brew executable' >&2; exit 1; }
+if ! "$brew_bin" list --formula tailscale >/dev/null 2>&1; then "$brew_bin" install tailscale; fi
+brew_prefix=$("$brew_bin" --prefix)
+export PATH="$brew_prefix/bin:$PATH"
+sudo -n "$brew_bin" services start tailscale >/dev/null 2>&1 || true
+tailscale_bin="$brew_prefix/opt/tailscale/bin/tailscale"
+[ -x "$tailscale_bin" ] || tailscale_bin="$brew_prefix/bin/tailscale"
+[ -x "$tailscale_bin" ] || { echo 'Tailscale was installed but its CLI was not found' >&2; exit 1; }
+"#.to_owned()
+    } else if cfg!(target_os = "linux") {
+        r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'curl is required to install Tailscale' >&2; exit 1; }
+curl -fsSL 'https://tailscale.com/install.sh' | sudo -n sh
+if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl enable --now tailscaled; fi
+command -v tailscale >/dev/null 2>&1 || { echo 'Tailscale was installed but its CLI is not on PATH' >&2; exit 1; }
+"#.to_owned()
+    } else {
+        return Err(CiaoError::Config(
+            "automatic Tailscale installation is supported on macOS and Linux".to_owned(),
+        ));
+    };
+    let output = run_local_interactive_capture(&format!(
+        "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{script}"
+    ))?;
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "install local Tailscale client".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    let executable = local_tailscale_executable().ok_or_else(|| {
+        CiaoError::Config(
+            "Tailscale installation finished, but no local `tailscale` executable was found"
+                .to_owned(),
+        )
+    })?;
+    Ok(TailscaleInstallResult {
+        executable: executable.display().to_string(),
+        installed: true,
+    })
+}
+
+pub fn local_tailscale_target() -> Result<TailscaleTarget> {
+    let executable = local_tailscale_executable().ok_or_else(|| {
+        CiaoError::Config(
+            "Tailscale is not installed on this device; Ciao can install it during GitHub setup"
+                .to_owned(),
+        )
+    })?;
+    let (program, args) = if cfg!(target_os = "linux") {
+        (
+            "sudo".to_owned(),
+            vec![
+                "-n".to_owned(),
+                executable.display().to_string(),
+                "status".to_owned(),
+                "--json".to_owned(),
+            ],
+        )
+    } else {
+        (
+            executable.display().to_string(),
+            vec!["status".to_owned(), "--json".to_owned()],
+        )
+    };
+    let output = run_local_command(&program, &args, None, "inspect local Tailscale status")?;
+    let status: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
+        CiaoError::Config(format!(
+            "local Tailscale returned invalid status JSON: {error}"
+        ))
+    })?;
+    tailscale_target_from_status(&status)
+}
+
+/// Start a local browser-guided login and return its URL. The command is
+/// detached so the caller can open the browser before waiting for Running.
+pub fn start_local_tailscale_auth() -> Result<Option<String>> {
+    if local_tailscale_target().is_ok() {
+        return Ok(None);
+    }
+    let executable = local_tailscale_executable().ok_or_else(|| {
+        CiaoError::Config(
+            "Tailscale is not installed on this device; Ciao can install it during GitHub setup"
+                .to_owned(),
+        )
+    })?;
+    let executable = shell_quote(&executable.display().to_string());
+    let privilege = if cfg!(target_os = "linux") {
+        "sudo -n "
+    } else {
+        ""
+    };
+    let state = format!("/tmp/ciao-tailscale-auth-local-{}", std::process::id());
+    let script = format!(
+        r#"set -eu
+state={state}
+mkdir -p "$state"
+chmod 700 "$state"
+output="$state/output"
+rm -f "$output"
+nohup {privilege}{executable} up > "$output" 2>&1 < /dev/null &
+for attempt in $(seq 1 45); do
+    url=$(grep -Eo 'https://login\.tailscale\.com/[A-Za-z0-9._/?=&%:-]+' "$output" 2>/dev/null | head -n 1 || true)
+    if [ -n "$url" ]; then printf '%s\n' "$url"; exit 0; fi
+    status=$({privilege}{executable} status --json 2>/dev/null || true)
+    if printf '%s' "$status" | grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+        printf '%s\n' '__CIAO_TAILSCALE_CONNECTED__'
+        exit 0
+    fi
+    sleep 1
+done
+cat "$output" 2>/dev/null || true
+exit 124
+"#,
+        state = shell_quote(&state),
+        privilege = privilege,
+        executable = executable,
+    );
+    let output = if cfg!(target_os = "linux") {
+        run_local_interactive_capture(&format!(
+            "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{script}"
+        ))?
+    } else {
+        run_local_script(script.as_bytes())?
+    };
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "start guided local Tailscale authentication".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    if output.stdout.contains(TAILSCALE_CONNECTED_MARKER) {
+        return Ok(None);
+    }
+    tailscale_auth_url_from_output(&output.stdout)
+        .map(Some)
+        .ok_or_else(|| {
+            CiaoError::Config(
+                "Ciao could not obtain a local Tailscale browser login URL".to_owned(),
+            )
+        })
+}
+
+pub fn wait_for_local_tailscale_auth(timeout: Duration) -> Result<TailscaleTarget> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match local_tailscale_target() {
+            Ok(target) => return Ok(target),
+            Err(error @ CiaoError::Config(_)) | Err(error @ CiaoError::LocalCommand { .. }) => {
+                last_error = Some(error)
+            }
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(CiaoError::Config(format!(
+        "timed out waiting for local Tailscale browser authentication{}",
+        last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    )))
+}
+
+/// Reuse the target's Tailscale installation or install it through the
+/// target's native path when the explicit GitHub setup needs it. Authentication
+/// is started by Ciao and completed in the user's browser.
+pub fn ensure_tailscale_target(
+    transport: &OpenSshTransport,
+    os: &HostOs,
+) -> Result<TailscaleInstallResult> {
+    let detection = remote_script(
+        transport,
+        "detect Tailscale installation",
+        "set -eu\nfor candidate in /usr/local/bin/tailscale /usr/local/opt/tailscale/bin/tailscale /opt/homebrew/bin/tailscale /opt/homebrew/opt/tailscale/bin/tailscale /usr/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do if [ -x \"$candidate\" ]; then printf '%s\\n' \"$candidate\"; exit 0; fi; done\nif command -v tailscale >/dev/null 2>&1; then command -v tailscale; else printf '__CIAO_TAILSCALE_MISSING__\\n'; fi\n",
+    )?;
+    let executable = detection.stdout.trim();
+    if !executable.is_empty() && executable != "__CIAO_TAILSCALE_MISSING__" {
+        return Ok(TailscaleInstallResult {
+            executable: executable.to_owned(),
+            installed: false,
+        });
+    }
+    remote_script(
+        transport,
+        "install Tailscale on target",
+        &target_tailscale_install_script(os)?,
+    )?;
+    Ok(TailscaleInstallResult {
+        executable: "tailscale".to_owned(),
+        installed: true,
+    })
+}
+
+fn target_tailscale_install_script(os: &HostOs) -> Result<String> {
+    match os {
+        HostOs::Linux => Ok(r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'curl is required to install Tailscale on Linux' >&2; exit 1; }
+sudo -n true
+curl -fsSL 'https://tailscale.com/install.sh' | sudo -n sh
+if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl enable --now tailscaled; fi
+command -v tailscale >/dev/null 2>&1 || { echo 'Tailscale installation finished without a usable CLI' >&2; exit 1; }
+"#.to_owned()),
+        HostOs::MacOs => Ok(r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'macOS curl is required to install Tailscale' >&2; exit 1; }
+brew_bin=''
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+done
+if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
+if [ -z "$brew_bin" ]; then
+    brew_script=$(mktemp -t ciao-homebrew)
+    trap 'rm -f "$brew_script"' EXIT
+    curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_script"
+    NONINTERACTIVE=1 /bin/bash "$brew_script"
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+        if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+    done
+fi
+[ -n "$brew_bin" ] || { echo 'Homebrew installation finished without a usable brew executable' >&2; exit 1; }
+if ! "$brew_bin" list --formula tailscale >/dev/null 2>&1; then "$brew_bin" install tailscale; fi
+brew_prefix=$("$brew_bin" --prefix)
+export PATH="$brew_prefix/bin:$PATH"
+sudo -n true
+sudo -n "$brew_bin" services start tailscale >/dev/null 2>&1 || true
+tailscale_bin="$brew_prefix/opt/tailscale/bin/tailscale"
+[ -x "$tailscale_bin" ] || tailscale_bin="$brew_prefix/bin/tailscale"
+[ -x "$tailscale_bin" ] || { echo 'Tailscale installation finished without a usable CLI' >&2; exit 1; }
+"#.to_owned()),
+        HostOs::Unknown(value) => Err(CiaoError::Config(format!(
+            "automatic Tailscale installation is unsupported on host OS {value}"
+        ))),
+    }
+}
+
+pub fn tailscale_target(transport: &dyn RemoteHost) -> Result<TailscaleTarget> {
+    let status = match transport.exec(tailscale_status_command()) {
+        Ok(output) => tailscale_status_value(&output.stdout, &output.stderr)
+            .ok_or_else(|| CiaoError::Config("Tailscale returned invalid status JSON".to_owned())),
+        Err(CiaoError::RemoteCommand {
+            ref stderr,
+            ref stdout,
+            ..
+        }) => {
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            if combined.contains("not found") || combined.contains("command not found") {
+                return Err(CiaoError::Config(
+                    "Tailscale is not installed on the target; run `ciao github setup` to install it automatically".to_owned(),
+                ));
+            }
+            match tailscale_status_value(stdout, stderr) {
+                Some(status) => Ok(status),
+                None => Err(CiaoError::Config(
+                    "Tailscale returned invalid status JSON".to_owned(),
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let status = status?;
+    tailscale_target_from_status(&status)
+}
+
+fn tailscale_status_value(stdout: &str, stderr: &str) -> Option<serde_json::Value> {
+    [stdout, stderr]
+        .into_iter()
+        .find_map(|value| serde_json::from_str(value.trim()).ok())
+}
+
+const TAILSCALE_CONNECTED_MARKER: &str = "__CIAO_TAILSCALE_CONNECTED__";
+
+/// Extract the login URL emitted by `tailscale up` without treating any other
+/// output as a URL. The value is safe to hand to a browser launcher because it
+/// must use Tailscale's HTTPS login origin.
+pub fn tailscale_auth_url_from_output(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        let token =
+            token.trim_matches(|character: char| matches!(character, '"' | '\'' | '(' | '[' | '{'));
+        let token = token.strip_prefix("https://login.tailscale.com/")?;
+        let end = token
+            .find(['"', '\'', ')', ']', '}', ',', ';'])
+            .unwrap_or(token.len());
+        let path = token[..end].trim_end_matches('.');
+        if path.is_empty() {
+            None
+        } else {
+            Some(format!("https://login.tailscale.com/{path}"))
+        }
+    })
+}
+
+/// Start a background `tailscale up` on the target and return its login URL.
+/// The SSH command exits after the URL is available, while the detached
+/// process remains alive until the browser authentication completes.
+pub fn start_tailscale_auth(transport: &dyn RemoteHost) -> Result<Option<String>> {
+    if tailscale_target(transport).is_ok() {
+        return Ok(None);
+    }
+    let output = transport.exec(tailscale_auth_start_command())?;
+    if output.stdout.contains(TAILSCALE_CONNECTED_MARKER) {
+        return Ok(None);
+    }
+    if let Some(url) = tailscale_auth_url_from_output(&output.stdout) {
+        return Ok(Some(url));
+    }
+    let details = [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let details = details
+        .lines()
+        .filter(|line| !line.contains("https://login.tailscale.com/"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(CiaoError::Config(format!(
+        "Ciao could not obtain a Tailscale browser login URL from the target{}",
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!("; target output: {details}")
+        }
+    )))
+}
+
+/// Wait for the browser-guided target login to finish, with a bounded timeout
+/// so a closed browser or an expired login cannot leave Ciao hanging forever.
+pub fn wait_for_tailscale_auth(
+    transport: &dyn RemoteHost,
+    timeout: Duration,
+) -> Result<TailscaleTarget> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match tailscale_target(transport) {
+            Ok(target) => return Ok(target),
+            Err(error @ CiaoError::Config(_)) => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(CiaoError::Config(format!(
+        "timed out waiting for Tailscale browser authentication on the target{}",
+        last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    )))
+}
+
+fn tailscale_auth_start_command() -> CommandSpec {
+    CommandSpec::fixed("sh", &["-s"], "start guided Tailscale authentication").with_stdin(
+        br#"set -eu
+state="/tmp/ciao-tailscale-auth-$(id -u)"
+tailscale_bin=''
+for candidate in /usr/local/bin/tailscale /usr/local/opt/tailscale/bin/tailscale /opt/homebrew/bin/tailscale /opt/homebrew/opt/tailscale/bin/tailscale /usr/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+    if [ -x "$candidate" ]; then tailscale_bin="$candidate"; break; fi
+done
+if [ -z "$tailscale_bin" ] && command -v tailscale >/dev/null 2>&1; then tailscale_bin=$(command -v tailscale); fi
+[ -n "$tailscale_bin" ] || { echo 'Tailscale CLI was not found on the target' >&2; exit 127; }
+status=$(sudo -n "$tailscale_bin" status --json 2>/dev/null || true)
+if printf '%s' "$status" | grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+        printf '%s\n' '__CIAO_TAILSCALE_CONNECTED__'
+        exit 0
+fi
+install -d -m 700 "$state"
+rm -f "$state/output" "$state/pid"
+: > "$state/output"
+chmod 600 "$state/output"
+nohup sudo -n "$tailscale_bin" up > "$state/output" 2>&1 < /dev/null &
+printf '%s\n' "$!" > "$state/pid"
+for attempt in $(seq 1 45); do
+    url=$(grep -Eo 'https://login\.tailscale\.com/[A-Za-z0-9._/?=&%:-]+' "$state/output" 2>/dev/null | head -n 1 || true)
+    if [ -n "$url" ]; then printf '%s\n' "$url"; exit 0; fi
+    status=$(sudo -n "$tailscale_bin" status --json 2>/dev/null || true)
+    if printf '%s' "$status" | grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+        printf '%s\n' '__CIAO_TAILSCALE_CONNECTED__'
+        exit 0
+    fi
+    sleep 1
+done
+cat "$state/output" 2>/dev/null || true
+exit 124
+"#.to_vec(),
+    )
+}
+
+pub fn generate_ed25519_key(comment: &str) -> Result<GeneratedSshKey> {
+    if comment.is_empty() || comment.contains(['\n', '\r']) {
+        return Err(CiaoError::Config("SSH key comment is invalid".to_owned()));
+    }
+    let temp = tempfile_path("ciao-ssh-key");
+    let _output = match run_local_command(
+        "ssh-keygen",
+        &[
+            "-q".to_owned(),
+            "-t".to_owned(),
+            "ed25519".to_owned(),
+            "-N".to_owned(),
+            String::new(),
+            "-C".to_owned(),
+            comment.to_owned(),
+            "-f".to_owned(),
+            temp.display().to_string(),
+        ],
+        None,
+        "generate CI SSH key",
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            let _ = fs::remove_file(temp.with_extension("pub"));
+            return Err(error);
+        }
+    };
+    let private_key = fs::read_to_string(&temp);
+    let public_key = fs::read_to_string(temp.with_extension("pub"));
+    let cleanup_private = fs::remove_file(&temp);
+    let _ = fs::remove_file(temp.with_extension("pub"));
+    cleanup_private?;
+    let private_key = private_key?;
+    let public_key = public_key?;
+    Ok(GeneratedSshKey {
+        private_key,
+        public_key: public_key.trim().to_owned(),
+    })
+}
+
+/// Return the local path used by the opt-in SSH bootstrap key.
+pub fn default_ssh_identity_path(host_name: &str) -> Result<PathBuf> {
+    validate_identifier("host name", host_name)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CiaoError::Config("cannot determine HOME for the SSH identity path".to_owned())
+    })?;
+    Ok(home
+        .join(".ssh")
+        .join("ciao")
+        .join(format!("{host_name}_ed25519")))
+}
+
+#[cfg(test)]
+fn ssh_command_arguments_for_test(transport: &OpenSshTransport) -> Vec<String> {
+    let command = transport.ssh_command(&CommandSpec::fixed("true", &[], "test"));
+    command
+        .get_args()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Create or reuse the optional local bootstrap identity and return its
+/// public key. Existing Ciao identities are never overwritten.
+pub fn ensure_ssh_identity(path: &Path, comment: &str) -> Result<String> {
+    validate_identity_file(path)?;
+    if comment.is_empty() || comment.contains(['\n', '\r']) {
+        return Err(CiaoError::Config("SSH key comment is invalid".to_owned()));
+    }
+    let public_path = PathBuf::from(format!("{}.pub", path.display()));
+    if path.exists() {
+        if !path.is_file() {
+            return Err(CiaoError::Config(format!(
+                "SSH identity path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        secure_private_key_permissions(path)?;
+        if public_path.exists() {
+            let public_key = read_ssh_public_key(&public_path)?;
+            let derived = run_local_command(
+                "ssh-keygen",
+                &["-y".to_owned(), "-f".to_owned(), path.display().to_string()],
+                None,
+                "verify existing SSH public key",
+            )?;
+            let derived = validate_ssh_public_key(derived.stdout.trim())?;
+            if derived
+                != public_key
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            {
+                return Err(CiaoError::Config(format!(
+                    "SSH public key does not match its private key: {}",
+                    public_path.display()
+                )));
+            }
+            return Ok(public_key);
+        }
+        let output = run_local_command(
+            "ssh-keygen",
+            &["-y".to_owned(), "-f".to_owned(), path.display().to_string()],
+            None,
+            "read existing SSH public key",
+        )?;
+        let public_key = validate_ssh_public_key(output.stdout.trim())?;
+        fs::write(&public_path, format!("{public_key}\n"))?;
+        secure_public_key_permissions(&public_path)?;
+        return Ok(public_key);
+    }
+    if public_path.exists() {
+        return Err(CiaoError::Config(format!(
+            "SSH public key exists without its private key: {}",
+            public_path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        secure_directory_permissions(parent)?;
+    }
+    let result = run_local_command(
+        "ssh-keygen",
+        &[
+            "-q".to_owned(),
+            "-t".to_owned(),
+            "ed25519".to_owned(),
+            "-N".to_owned(),
+            String::new(),
+            "-C".to_owned(),
+            comment.to_owned(),
+            "-f".to_owned(),
+            path.display().to_string(),
+        ],
+        None,
+        "create SSH identity",
+    );
+    if let Err(error) = result {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&public_path);
+        return Err(error);
+    }
+    secure_private_key_permissions(path)?;
+    secure_public_key_permissions(&public_path)?;
+    read_ssh_public_key(&public_path)
+}
+
+/// Install a public key through one normal interactive OpenSSH session.
+/// Passwords are read by OpenSSH from the user's terminal and are never
+/// accepted as a Ciao argument, environment variable, or file.
+pub fn install_public_key_interactively(
+    target: &str,
+    public_key: &str,
+    identity_file: Option<&Path>,
+) -> Result<()> {
+    validate_ssh_target(target)?;
+    if let Some(path) = identity_file {
+        validate_identity_file(path)?;
+    }
+    let script = install_public_key_script(public_key)?;
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2")
+        .args(
+            identity_file
+                .into_iter()
+                .flat_map(|path| ["-i".to_owned(), path.display().to_string()]),
+        )
+        .arg(target)
+        .arg("sh")
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = command.spawn().map_err(|error| CiaoError::Transport {
+        stage: "install SSH public key".to_owned(),
+        message: error.to_string(),
+        details: String::new(),
+    })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| CiaoError::Transport {
+            stage: "install SSH public key".to_owned(),
+            message: "SSH stdin was not available".to_owned(),
+            details: String::new(),
+        })?
+        .write_all(script.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CiaoError::LocalCommand {
+            stage: "install SSH public key".to_owned(),
+            exit: exit_code(status),
+            stdout: String::new(),
+            stderr: "OpenSSH could not authenticate or install the public key".to_owned(),
+        })
+    }
+}
+
+fn read_ssh_public_key(path: &Path) -> Result<String> {
+    let contents = fs::read_to_string(path)?;
+    validate_ssh_public_key(contents.trim())
+}
+
+fn validate_ssh_public_key(value: &str) -> Result<String> {
+    let mut fields = value.split_whitespace();
+    let key_type = fields.next().unwrap_or_default();
+    let key_data = fields.next().unwrap_or_default();
+    let supported = [
+        "ssh-ed25519",
+        "ssh-rsa",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    ];
+    if value.is_empty()
+        || value.contains(['\n', '\r'])
+        || value.len() > 16 * 1024
+        || !supported.contains(&key_type)
+        || key_data.is_empty()
+        || fields.any(|field| field.contains(['\n', '\r']))
+    {
+        return Err(CiaoError::Config("SSH public key is invalid".to_owned()));
+    }
+    Ok(value.to_owned())
+}
+
+fn secure_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn secure_private_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn secure_public_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+pub fn install_public_key_script(public_key: &str) -> Result<String> {
+    let key = validate_ssh_public_key(public_key.trim())?;
+    Ok(format!(
+        "set -eu\ninstall -d -m 700 \"$HOME/.ssh\"\ntouch \"$HOME/.ssh/authorized_keys\"\nchmod 600 \"$HOME/.ssh/authorized_keys\"\ngrep -Fqx {} \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' {} >> \"$HOME/.ssh/authorized_keys\"\n",
+        shell_quote(&key),
+        shell_quote(&key)
+    ))
+}
+
+fn tempfile_path(prefix: &str) -> PathBuf {
+    let suffix = release_id();
+    std::env::temp_dir().join(format!("{prefix}-{suffix}"))
+}
+
+pub fn tailscale_federated_identity_request(
+    repository: &GitHubRepository,
+) -> Result<serde_json::Value> {
+    if repository.repository_id.is_empty() {
+        return Err(CiaoError::Config(
+            "GitHub repository ID is required to scope Tailscale identity".to_owned(),
+        ));
+    }
+    Ok(serde_json::json!({
+        "keyType": "federated",
+        "description": format!("Ciao GitHub CI - {}", repository.full_name()),
+        "scopes": ["auth_keys"],
+        "tags": ["tag:ciao-ci"],
+        "audience": format!("api.tailscale.com/ciao-{}", repository.repository_id),
+        "issuer": "https://token.actions.githubusercontent.com",
+        "subject": format!("repo:{}:ref:refs/heads/{}", repository.full_name(), repository.default_branch),
+        "customClaimRules": {
+            "repository_id": repository.repository_id,
+            "ref": format!("refs/heads/{}", repository.default_branch)
+        }
+    }))
+}
+
+pub fn tailscale_create_federated_identity(
+    api_token: &str,
+    request: &serde_json::Value,
+) -> Result<TailscaleFederatedIdentity> {
+    validate_tailscale_token(api_token)?;
+    let body = serde_json::to_string(request)
+        .map_err(|error| CiaoError::Serialization(error.to_string()))?;
+    let output = run_tailscale_curl(
+        api_token,
+        "POST",
+        "https://api.tailscale.com/api/v2/tailnet/-/keys",
+        Some("application/json"),
+        Some(&body),
+        "create Tailscale federated identity",
+    )?;
+    serde_json::from_str(output.stdout.trim()).map_err(|error| {
+        CiaoError::Config(format!(
+            "Tailscale returned invalid federated identity metadata: {error}"
+        ))
+    })
+}
+
+pub fn tailscale_delete_federated_identity(api_token: &str, identity_id: &str) -> Result<()> {
+    validate_tailscale_token(api_token)?;
+    validate_tailscale_id(identity_id)?;
+    run_tailscale_curl(
+        api_token,
+        "DELETE",
+        &format!("https://api.tailscale.com/api/v2/tailnet/-/keys/{identity_id}"),
+        None,
+        None,
+        "remove Tailscale federated identity",
+    )?;
+    Ok(())
+}
+
+pub fn tailscale_fetch_policy(api_token: &str) -> Result<String> {
+    validate_tailscale_token(api_token)?;
+    let output = run_tailscale_curl(
+        api_token,
+        "GET",
+        "https://api.tailscale.com/api/v2/tailnet/-/acl",
+        None,
+        None,
+        "read Tailscale policy",
+    )?;
+    Ok(output.stdout)
+}
+
+pub fn tailscale_validate_policy(api_token: &str, policy: &str) -> Result<String> {
+    validate_tailscale_token(api_token)?;
+    if policy.trim().is_empty() {
+        return Err(CiaoError::Config(
+            "Tailscale policy cannot be empty".to_owned(),
+        ));
+    }
+    let output = run_tailscale_curl(
+        api_token,
+        "POST",
+        "https://api.tailscale.com/api/v2/tailnet/-/acl/validate",
+        Some("application/hujson"),
+        Some(policy),
+        "validate Tailscale policy",
+    )?;
+    Ok(output.stdout)
+}
+
+pub fn tailscale_preview_policy(api_token: &str, policy: &str) -> Result<String> {
+    validate_tailscale_token(api_token)?;
+    if policy.trim().is_empty() {
+        return Err(CiaoError::Config(
+            "Tailscale policy cannot be empty".to_owned(),
+        ));
+    }
+    let output = run_tailscale_curl(
+        api_token,
+        "POST",
+        "https://api.tailscale.com/api/v2/tailnet/-/acl/preview",
+        Some("application/hujson"),
+        Some(policy),
+        "preview Tailscale policy",
+    )?;
+    Ok(output.stdout)
+}
+
+pub fn tailscale_apply_policy(api_token: &str, policy: &str) -> Result<()> {
+    validate_tailscale_token(api_token)?;
+    if policy.trim().is_empty() {
+        return Err(CiaoError::Config(
+            "Tailscale policy cannot be empty".to_owned(),
+        ));
+    }
+    run_tailscale_curl(
+        api_token,
+        "POST",
+        "https://api.tailscale.com/api/v2/tailnet/-/acl",
+        Some("application/hujson"),
+        Some(policy),
+        "apply Tailscale policy",
+    )?;
+    Ok(())
+}
+
+fn run_tailscale_curl(
+    api_token: &str,
+    method: &str,
+    url: &str,
+    content_type: Option<&str>,
+    body: Option<&str>,
+    stage: &str,
+) -> Result<CommandOutput> {
+    validate_tailscale_token(api_token)?;
+    let mut config = format!(
+        "fail-with-body\nsilent\nshow-error\nuser = \"{}:\"\nrequest = \"{}\"\nurl = \"{}\"\n",
+        curl_config_quote(api_token),
+        curl_config_quote(method),
+        curl_config_quote(url),
+    );
+    config.push_str("header = \"Accept: application/json\"\n");
+    if let Some(content_type) = content_type {
+        config.push_str(&format!(
+            "header = \"Content-Type: {}\"\n",
+            curl_config_quote(content_type)
+        ));
+    }
+    let mut args = vec!["--config".to_owned(), "-".to_owned()];
+    if let Some(body) = body {
+        args.push("--data-binary".to_owned());
+        args.push(body.to_owned());
+    }
+    run_local_command("curl", &args, Some(config.as_bytes()), stage)
+}
+
+fn curl_config_quote(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+pub fn install_ci_public_key(transport: &OpenSshTransport, public_key: &str) -> Result<()> {
+    let user = ssh_login_user(&transport.target).ok_or_else(|| {
+        CiaoError::Config(
+            "CI SSH key installation requires an explicit user@host SSH target".to_owned(),
+        )
+    })?;
+    let script = install_public_key_script(public_key)?;
+    run_as_user_script(
+        transport,
+        &user,
+        "install CI SSH public key",
+        script.as_bytes(),
+    )
+}
+
+pub fn remove_ci_public_key(transport: &OpenSshTransport, public_key: &str) -> Result<()> {
+    let user = ssh_login_user(&transport.target).ok_or_else(|| {
+        CiaoError::Config("CI SSH key removal requires an explicit user@host SSH target".to_owned())
+    })?;
+    let key = public_key.trim();
+    if key.is_empty() || key.contains(['\n', '\r']) {
+        return Err(CiaoError::Config("SSH public key is invalid".to_owned()));
+    }
+    let script = format!(
+        "set -eu\nfile=\"$HOME/.ssh/authorized_keys\"\nif test -f \"$file\"; then tmp=$(mktemp)\ntrap 'rm -f \"$tmp\"' EXIT\ngrep -Fvx -- {} \"$file\" > \"$tmp\" || true\ncat \"$tmp\" > \"$file\"\nchmod 600 \"$file\"\nfi\n",
+        shell_quote(key)
+    );
+    run_as_user_script(
+        transport,
+        &user,
+        "remove CI SSH public key",
+        script.as_bytes(),
+    )
+}
+
+/// Copy the host key already trusted by the user's OpenSSH configuration to
+/// the Tailscale name used by GitHub Actions. We intentionally do not use
+/// `ssh-keyscan`: it observes an unauthenticated key and would turn a setup
+/// convenience into a silent trust-on-first-use downgrade.
+pub fn capture_known_hosts(transport: &OpenSshTransport, host: &str) -> Result<String> {
+    validate_ssh_target(host)?;
+    let source_host = ssh_host_from_target(&transport.target);
+    let files = ssh_user_known_hosts_files(&transport.target);
+    let mut keys = Vec::new();
+    for candidate in [source_host, host] {
+        if keys.is_empty() {
+            for file in &files {
+                for key in ssh_keygen_find(candidate, file)? {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+        if !keys.is_empty() {
+            break;
+        }
+    }
+    if keys.is_empty() {
+        return Err(CiaoError::Config(format!(
+            "Ciao could not find a trusted OpenSSH host key for `{source_host}`; connect once with `ssh {}` after verifying its fingerprint, then rerun GitHub setup",
+            transport.target
+        )));
+    }
+    Ok(format!(
+        "{}\n",
+        keys.into_iter()
+            .map(|key| format!("{host} {key}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
+fn ssh_user_known_hosts_files(target: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(output) = Command::new("ssh").arg("-G").arg(target).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let Some(value) = line.strip_prefix("userknownhostsfile ") else {
+                    continue;
+                };
+                for path in value.split_whitespace() {
+                    let path = if path == "~" {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from(path))
+                    } else if let Some(path) = path.strip_prefix("~/") {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .map(|home| home.join(path))
+                            .unwrap_or_else(|| PathBuf::from(path))
+                    } else if Path::new(path).is_absolute() {
+                        PathBuf::from(path)
+                    } else if let Some(home) = std::env::var_os("HOME") {
+                        PathBuf::from(home).join(path)
+                    } else {
+                        PathBuf::from(path)
+                    };
+                    if !files.contains(&path) {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let default = PathBuf::from(home).join(".ssh/known_hosts");
+        if !files.contains(&default) {
+            files.push(default);
+        }
+    }
+    files
+}
+
+fn ssh_keygen_find(host: &str, file: &Path) -> Result<Vec<String>> {
+    let output = Command::new("ssh-keygen")
+        .arg("-F")
+        .arg(host)
+        .arg("-f")
+        .arg(file)
+        .output()
+        .map_err(|error| CiaoError::Transport {
+            stage: "read trusted SSH host key".to_owned(),
+            message: error.to_string(),
+            details: String::new(),
+        })?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(trusted_known_host_lines(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn trusted_known_host_lines(found: &str) -> Vec<String> {
+    found
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 3 || fields[0].starts_with('#') || fields[0].starts_with('@') {
+                return None;
+            }
+            let key_type = fields[1];
+            let supported = [
+                "ssh-ed25519",
+                "ssh-rsa",
+                "ecdsa-sha2-nistp256",
+                "ecdsa-sha2-nistp384",
+                "ecdsa-sha2-nistp521",
+                "sk-ssh-ed25519@openssh.com",
+                "sk-ecdsa-sha2-nistp256@openssh.com",
+            ];
+            if !supported.contains(&key_type) {
+                return None;
+            }
+            Some(fields[1..].join(" "))
+        })
+        .collect()
+}
+
+fn validate_tailscale_token(token: &str) -> Result<()> {
+    if token.trim().is_empty() || token.contains(['\n', '\r']) {
+        return Err(CiaoError::Config(
+            "Tailscale bootstrap token must be a single non-empty line".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tailscale_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    {
+        return Err(CiaoError::InvalidIdentifier {
+            field: "Tailscale identity id",
+            value: value.to_owned(),
+            reason: "must contain only letters, numbers, `_` and `-`",
+        });
+    }
+    Ok(())
+}
+
+pub fn tailscale_policy_patch(
+    policy: &serde_json::Value,
+    target: &str,
+) -> Result<serde_json::Value> {
+    validate_ssh_target(target)?;
+    let mut patched = policy.clone();
+    let object = patched
+        .as_object_mut()
+        .ok_or_else(|| CiaoError::Config("Tailscale policy must be a JSON object".to_owned()))?;
+    let grant = serde_json::json!({
+        "src": ["tag:ciao-ci"],
+        "dst": [target],
+        "ip": ["tcp:22"]
+    });
+    let tag_owners = object
+        .entry("tagOwners")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            CiaoError::Config("Tailscale policy tagOwners is not an object".to_owned())
+        })?;
+    let owners = tag_owners
+        .entry("tag:ciao-ci")
+        .or_insert_with(|| serde_json::json!(["autogroup:admin"]));
+    let owners = owners.as_array_mut().ok_or_else(|| {
+        CiaoError::Config("Tailscale policy tag:ciao-ci owners is not an array".to_owned())
+    })?;
+    if !owners
+        .iter()
+        .any(|owner| owner.as_str() == Some("autogroup:admin"))
+    {
+        owners.push(serde_json::json!("autogroup:admin"));
+    }
+    let grants = object
+        .entry("grants")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| CiaoError::Config("Tailscale policy grants is not an array".to_owned()))?;
+    if !grants.iter().any(|value| value == &grant) {
+        grants.push(grant);
+    }
+    Ok(patched)
 }
 
 pub fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
@@ -396,6 +2151,24 @@ pub fn validate_identifier(field: &'static str, value: &str) -> Result<()> {
             field,
             value: value.to_owned(),
             reason: "only letters, numbers, `_` and `-` are allowed and it cannot start with `-`",
+        });
+    }
+    Ok(())
+}
+
+fn validate_github_segment(field: &'static str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 100
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(CiaoError::InvalidIdentifier {
+            field,
+            value: value.to_owned(),
+            reason: "only letters, numbers, `.`, `_` and `-` are allowed",
         });
     }
     Ok(())
@@ -472,7 +2245,7 @@ pub fn validate_profile(profile: &str) -> Result<()> {
 }
 
 pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
-    let config_path = root.join("ciaoship.toml");
+    let config_path = root.join("ciao.toml");
     let config: ProjectConfig = if config_path.exists() {
         toml::from_str(&fs::read_to_string(&config_path)?)
             .map_err(|error| CiaoError::Config(error.to_string()))?
@@ -941,6 +2714,7 @@ pub trait RemoteHost {
 pub struct OpenSshTransport {
     pub target: String,
     pub connect_timeout_seconds: u64,
+    pub identity_file: Option<PathBuf>,
 }
 
 impl OpenSshTransport {
@@ -950,12 +2724,22 @@ impl OpenSshTransport {
         Ok(Self {
             target,
             connect_timeout_seconds: 10,
+            identity_file: None,
         })
+    }
+
+    pub fn with_identity_file(mut self, identity_file: Option<PathBuf>) -> Result<Self> {
+        if let Some(path) = &identity_file {
+            validate_identity_file(path)?;
+        }
+        self.identity_file = identity_file;
+        Ok(self)
     }
 
     fn ssh_command(&self, command: &CommandSpec) -> Command {
         let mut process = Command::new("ssh");
         process
+            .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
@@ -964,6 +2748,16 @@ impl OpenSshTransport {
             .arg("ServerAliveInterval=15")
             .arg("-o")
             .arg("ServerAliveCountMax=2")
+            .args(
+                self.identity_file
+                    .iter()
+                    .flat_map(|_| ["-o".to_owned(), "IdentitiesOnly=yes".to_owned()]),
+            )
+            .args(
+                self.identity_file
+                    .iter()
+                    .flat_map(|path| ["-i".to_owned(), path.display().to_string()]),
+            )
             .arg(&self.target)
             .arg(&command.program);
         for arg in &command.args {
@@ -988,11 +2782,15 @@ impl OpenSshTransport {
             .arg("--create")
             .arg("--file=-")
             .arg("--exclude=.git")
-            .arg("--exclude=.ciaoship")
+            .arg("--exclude=.ciao")
             .arg("--exclude=target")
             .arg("--exclude=node_modules")
             .arg("--exclude=.env")
             .arg("--exclude=.env.*")
+            .arg("--exclude=.envrc")
+            .arg("--exclude=*.pem")
+            .arg("--exclude=*.key")
+            .arg("--exclude=.ssh")
             .args(
                 ignore_patterns(source)
                     .iter()
@@ -1011,26 +2809,29 @@ impl OpenSshTransport {
                 details: String::new(),
             })?;
 
-        let mut remote = Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg(format!("ConnectTimeout={}", self.connect_timeout_seconds))
-            .arg("-o")
-            .arg("ServerAliveInterval=15")
-            .arg("-o")
-            .arg("ServerAliveCountMax=2")
-            .arg(&self.target)
-            .arg("sudo")
-            .arg("-n")
-            .arg("tar")
-            .arg("--extract")
-            .arg("--file=-")
-            .arg("--no-same-owner")
-            .arg("--no-same-permissions")
-            .arg("--no-absolute-names")
-            .arg("--directory")
-            .arg(destination)
+        let remote_spec = CommandSpec::fixed(
+            "sudo",
+            &[
+                "-n",
+                "tar",
+                "--extract",
+                "--file=-",
+                "--no-same-owner",
+                "--no-same-permissions",
+                "--no-absolute-names",
+                "--directory",
+            ],
+            "remote source extraction",
+        );
+        let mut remote = self
+            .ssh_command(&CommandSpec {
+                args: {
+                    let mut args = remote_spec.args;
+                    args.push(destination.to_owned());
+                    args
+                },
+                ..remote_spec
+            })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1076,7 +2877,7 @@ impl OpenSshTransport {
 }
 
 fn ignore_patterns(source: &Path) -> Vec<String> {
-    [".gitignore", ".ciaoshipignore"]
+    [".gitignore", ".ciaoignore"]
         .into_iter()
         .flat_map(|name| fs::read_to_string(source.join(name)).ok())
         .flat_map(|contents| {
@@ -1099,6 +2900,7 @@ impl RemoteHost for OpenSshTransport {
         } else {
             Stdio::null()
         });
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = process.spawn().map_err(|error| CiaoError::Transport {
             stage: command.stage.clone(),
             message: error.to_string(),
@@ -1153,6 +2955,103 @@ impl RemoteHost for OpenSshTransport {
     }
 }
 
+/// Check whether the SSH user can run the administrative commands used by
+/// Ciao without prompting. This is deliberately separate from host
+/// initialization: `host init` has a dedicated one-session TTY path, while
+/// deploy/lifecycle operations use several independent SSH commands.
+pub fn check_remote_sudo(transport: &OpenSshTransport) -> Result<()> {
+    transport
+        .exec(CommandSpec::fixed(
+            "env",
+            &["LC_ALL=C", "sudo", "-n", "true"],
+            "check remote administrator privileges",
+        ))
+        .map(|_| ())
+}
+
+fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
+    let mut process = Command::new("ssh");
+    process
+        .arg("-tt")
+        .arg("-o")
+        .arg(format!(
+            "ConnectTimeout={}",
+            transport.connect_timeout_seconds
+        ))
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2")
+        .args(
+            transport
+                .identity_file
+                .iter()
+                .flat_map(|_| ["-o".to_owned(), "IdentitiesOnly=yes".to_owned()]),
+        )
+        .args(
+            transport
+                .identity_file
+                .iter()
+                .flat_map(|path| ["-i".to_owned(), path.display().to_string()]),
+        )
+        .arg(&transport.target);
+    process
+}
+
+fn run_interactive_ssh_script(
+    transport: &OpenSshTransport,
+    stage: &str,
+    script: &str,
+) -> Result<()> {
+    // OpenSSH joins remote command arguments and lets the login shell parse
+    // them. The script is generated by Ciao from fixed templates; quoting it
+    // as one argument keeps shell syntax inside the `sh -c` payload. Running
+    // the script as the SSH user is important on macOS: Homebrew refuses to
+    // install as root. `sudo -v` and every following `sudo -n` use this same
+    // SSH TTY, so one native password prompt is enough.
+    let mut process = interactive_ssh_command(transport);
+    process
+        .arg("sh")
+        .arg("-c")
+        .arg(shell_quote(&format!("sudo -v\n{script}")))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = process.status().map_err(|error| CiaoError::Transport {
+        stage: stage.to_owned(),
+        message: error.to_string(),
+        details: String::new(),
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CiaoError::LocalCommand {
+            stage: stage.to_owned(),
+            exit: exit_code(status),
+            stdout: String::new(),
+            stderr: "interactive SSH/sudo command was not completed".to_owned(),
+        })
+    }
+}
+
+/// Identify the only remote-sudo failure for which an interactive password
+/// prompt is appropriate. Other failures (missing sudo, policy denial, SSH
+/// errors) should remain actionable errors rather than triggering a prompt.
+pub fn remote_sudo_password_required(error: &CiaoError) -> bool {
+    match error {
+        CiaoError::RemoteCommand {
+            stage,
+            stdout,
+            stderr,
+            ..
+        } if stage == "check remote administrator privileges" => {
+            let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            output.contains("sudo") && output.contains("password")
+        }
+        _ => false,
+    }
+}
+
 pub fn command_script(command: &str, cwd: &str) -> Result<Vec<u8>> {
     if command.trim().is_empty() {
         return Err(CiaoError::Config(
@@ -1171,6 +3070,20 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn env_file_line(key: &str, value: &str) -> String {
+    let escaped = value
+        .chars()
+        .flat_map(|character| {
+            if matches!(character, '\\' | '"' | '$' | '`') {
+                vec!['\\', character]
+            } else {
+                vec![character]
+            }
+        })
+        .collect::<String>();
+    format!(r#"{key}="{escaped}""#)
+}
+
 pub fn run_local_script(script: &[u8]) -> Result<CommandOutput> {
     let output = Command::new("sh")
         .arg("-s")
@@ -1182,6 +3095,32 @@ pub fn run_local_script(script: &[u8]) -> Result<CommandOutput> {
             child.stdin.take().expect("piped stdin").write_all(script)?;
             child.wait_with_output()
         })?;
+    Ok(CommandOutput::from_output(output))
+}
+
+fn run_local_interactive_script(script: &str) -> Result<CommandOutput> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    Ok(CommandOutput {
+        status: status.code().unwrap_or(128),
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+fn run_local_interactive_capture(script: &str) -> Result<CommandOutput> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
     Ok(CommandOutput::from_output(output))
 }
 
@@ -1212,20 +3151,6 @@ fn run_local_command(
             exit: result.status,
             stdout: result.stdout,
             stderr: result.stderr,
-        })
-    }
-}
-
-fn local_admin_session() -> Result<()> {
-    let status = Command::new("sudo").arg("-v").status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CiaoError::LocalCommand {
-            stage: "request local administrator privileges".to_owned(),
-            exit: status.code().unwrap_or(128),
-            stdout: String::new(),
-            stderr: "sudo did not grant administrator privileges".to_owned(),
         })
     }
 }
@@ -1283,7 +3208,7 @@ pub fn local_proxy_paths() -> Result<LocalProxyPaths> {
         Ok(LocalProxyPaths {
             caddy_bin,
             caddyfile: prefix.join("etc/Caddyfile"),
-            fragment_dir: prefix.join("etc/ciaoship"),
+            fragment_dir: prefix.join("etc/ciao"),
         })
     } else if cfg!(target_os = "linux") {
         let caddy_bin = find_executable("caddy")
@@ -1297,7 +3222,7 @@ pub fn local_proxy_paths() -> Result<LocalProxyPaths> {
         Ok(LocalProxyPaths {
             caddy_bin,
             caddyfile: PathBuf::from("/etc/caddy/Caddyfile"),
-            fragment_dir: PathBuf::from("/var/lib/ciaoship/local"),
+            fragment_dir: PathBuf::from("/var/lib/ciao/local"),
         })
     } else {
         Err(CiaoError::Config(
@@ -1359,7 +3284,7 @@ for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.lin
 done
 if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
 if [ -z "$brew_bin" ]; then
-    brew_install_script=$(mktemp -t ciaoship-homebrew)
+    brew_install_script=$(mktemp -t ciao-homebrew)
     trap 'rm -f "$brew_install_script"' EXIT
     curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_install_script"
     NONINTERACTIVE=1 /bin/bash "$brew_install_script"
@@ -1372,31 +3297,31 @@ brew_prefix=$("$brew_bin" --prefix)
 export PATH="$brew_prefix/bin:$brew_prefix/sbin:$PATH"
 if ! "$brew_bin" list --formula caddy >/dev/null 2>&1; then "$brew_bin" install caddy; fi
 if ! "$brew_bin" list --formula dnsmasq >/dev/null 2>&1; then "$brew_bin" install dnsmasq; fi
-loopback_plist='/Library/LaunchDaemons/dev.ciaoship.local-loopback.plist'
+loopback_plist='/Library/LaunchDaemons/dev.ciao.local-loopback.plist'
 sudo -n tee "$loopback_plist" >/dev/null <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>dev.ciaoship.local-loopback</string>
+<key>Label</key><string>dev.ciao.local-loopback</string>
 <key>ProgramArguments</key><array><string>/sbin/ifconfig</string><string>lo0</string><string>alias</string><string>10.0.0.1</string></array>
 <key>RunAtLoad</key><true/>
 </dict></plist>
 PLIST
 sudo -n chown root:wheel "$loopback_plist"
 sudo -n chmod 0644 "$loopback_plist"
-sudo -n launchctl bootout system/dev.ciaoship.local-loopback >/dev/null 2>&1 || true
+sudo -n launchctl bootout system/dev.ciao.local-loopback >/dev/null 2>&1 || true
 sudo -n launchctl bootstrap system "$loopback_plist"
 if ! ifconfig lo0 2>/dev/null | grep -q '10.0.0.1'; then sudo -n ifconfig lo0 alias 10.0.0.1; fi
 dnsmasq_conf="$brew_prefix/etc/dnsmasq.conf"
 sudo -n install -d -m 0755 "$brew_prefix/etc"
 if ! sudo -n test -f "$dnsmasq_conf"; then
-    printf '%s\n' '# CiaoShip .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee "$dnsmasq_conf" >/dev/null
-elif ! sudo -n grep -Fq '# CiaoShip .ciao resolver' "$dnsmasq_conf"; then
-    printf '\n%s\n' '# CiaoShip .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee -a "$dnsmasq_conf" >/dev/null
+    printf '%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee "$dnsmasq_conf" >/dev/null
+elif ! sudo -n grep -Fq '# Ciao .ciao resolver' "$dnsmasq_conf"; then
+    printf '\n%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee -a "$dnsmasq_conf" >/dev/null
 fi
 sudo -n install -d -m 0755 /etc/resolver
 printf '%s\n' 'nameserver 10.0.0.1' 'port 53' | sudo -n tee /etc/resolver/ciao >/dev/null
-fragment_dir="$brew_prefix/etc/ciaoship"
+fragment_dir="$brew_prefix/etc/ciao"
 caddyfile="$brew_prefix/etc/Caddyfile"
 sudo -n install -d -m 0755 "$fragment_dir" "$brew_prefix/etc"
 sudo -n chown "$(id -un)" "$fragment_dir"
@@ -1411,7 +3336,7 @@ sudo -n "$brew_bin" services restart dnsmasq >/dev/null
 sudo -n "$caddy_bin" validate --config "$caddyfile"
 sudo -n "$brew_bin" services restart caddy >/dev/null
 sudo -n "$caddy_bin" reload --config "$caddyfile"
-printf 'ciaoship_local_setup=ready\n'
+printf 'ciao_local_setup=ready\n'
 "#.to_owned())
     } else if cfg!(target_os = "linux") {
         Ok(r#"set -eu
@@ -1430,19 +3355,19 @@ if ! command -v caddy >/dev/null 2>&1 || ! sudo -n systemctl list-unit-files cad
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
 fi
 sudo -n install -d -m 0755 /etc/dnsmasq.d
-printf '%s\n' '# CiaoShip .ciao resolver' 'listen-address=127.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee /etc/dnsmasq.d/ciaoship-ciao.conf >/dev/null
+printf '%s\n' '# Ciao .ciao resolver' 'listen-address=127.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee /etc/dnsmasq.d/ciao-ciao.conf >/dev/null
 sudo -n systemctl enable --now dnsmasq
 if ! command -v resolvectl >/dev/null 2>&1; then
     echo 'systemd-resolved/resolvectl is required for automatic .ciao DNS routing' >&2
     exit 1
 fi
 sudo -n install -d -m 0755 /etc/systemd/resolved.conf.d
-printf '%s\n' '[Resolve]' 'DNS=127.0.0.1' 'Domains=~ciao' | sudo -n tee /etc/systemd/resolved.conf.d/ciaoship-ciao.conf >/dev/null
+printf '%s\n' '[Resolve]' 'DNS=127.0.0.1' 'Domains=~ciao' | sudo -n tee /etc/systemd/resolved.conf.d/ciao-ciao.conf >/dev/null
 sudo -n systemctl enable --now systemd-resolved
 sudo -n systemctl reload-or-restart systemd-resolved
-sudo -n install -d -m 0755 /var/lib/ciaoship/local
-sudo -n chown "$(id -un)" /var/lib/ciaoship/local
-import_line='import /var/lib/ciaoship/local/*.caddy'
+sudo -n install -d -m 0755 /var/lib/ciao/local
+sudo -n chown "$(id -un)" /var/lib/ciao/local
+import_line='import /var/lib/ciao/local/*.caddy'
 if ! sudo -n test -f /etc/caddy/Caddyfile; then
     printf '%s\n' "$import_line" | sudo -n tee /etc/caddy/Caddyfile >/dev/null
 elif ! sudo -n grep -Fqx "$import_line" /etc/caddy/Caddyfile; then
@@ -1451,7 +3376,7 @@ fi
 sudo -n caddy validate --config /etc/caddy/Caddyfile
 sudo -n systemctl enable --now caddy
 sudo -n systemctl reload caddy
-printf 'ciaoship_local_setup=ready\n'
+printf 'ciao_local_setup=ready\n'
 "#.to_owned())
     } else {
         Err(CiaoError::Config(
@@ -1464,8 +3389,10 @@ pub fn local_setup() -> Result<LocalSetupResult> {
     if local_setup_ready() {
         return Ok(local_setup_result());
     }
-    local_admin_session()?;
-    let output = run_local_script(local_setup_script()?.as_bytes())?;
+    let output = run_local_interactive_script(&format!(
+        "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{}",
+        local_setup_script()?
+    ))?;
     if output.status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "configure local .ciao resolver and Caddy".to_owned(),
@@ -1510,8 +3437,8 @@ fn local_setup_ready() -> bool {
                 .output()
                 .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("10.0.0.1"))
     } else {
-        Path::new("/etc/dnsmasq.d/ciaoship-ciao.conf").is_file()
-            && Path::new("/etc/systemd/resolved.conf.d/ciaoship-ciao.conf").is_file()
+        Path::new("/etc/dnsmasq.d/ciao-ciao.conf").is_file()
+            && Path::new("/etc/systemd/resolved.conf.d/ciao-ciao.conf").is_file()
     };
     let services_ready = if cfg!(target_os = "macos") {
         Command::new("pgrep")
@@ -1651,19 +3578,19 @@ pub fn run_local_dev(plan: &LocalDevPlan) -> Result<i32> {
     Ok(output.code().unwrap_or(128))
 }
 
-const CADDY_IMPORT: &str = "import /etc/caddy/ciaoship/*.caddy";
+const CADDY_IMPORT: &str = "import /etc/caddy/ciao/*.caddy";
 
 /// Return the fixed, idempotent host bootstrap script.
 ///
 /// The script deliberately supports only the first-class host families. It
-/// installs CiaoShip's small set of remote prerequisites and Caddy through a
+/// installs Ciao's small set of remote prerequisites and Caddy through a
 /// native package manager, then leaves service supervision to systemd,
 /// launchd, or Homebrew's launchd integration.
 pub fn host_init_script(os: &HostOs) -> Result<String> {
     match os {
         HostOs::Linux => Ok(format!(
             r#"set -eu
-command -v sudo >/dev/null 2>&1 || {{ echo 'CiaoShip requires sudo on the remote host' >&2; exit 1; }}
+command -v sudo >/dev/null 2>&1 || {{ echo 'Ciao requires sudo on the remote host' >&2; exit 1; }}
 command -v apt-get >/dev/null 2>&1 || {{ echo 'automatic host initialization currently supports Debian/Ubuntu hosts with apt-get' >&2; exit 1; }}
 sudo -n true
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
@@ -1679,7 +3606,7 @@ if ! command -v caddy >/dev/null 2>&1 || ! sudo -n systemctl list-unit-files cad
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
 fi
-sudo -n install -d -m 0755 /etc/caddy/ciaoship
+sudo -n install -d -m 0755 /etc/caddy/ciao
 import_line='{CADDY_IMPORT}'
 if ! sudo -n test -f /etc/caddy/Caddyfile; then
     printf '%s\n' "$import_line" | sudo -n tee /etc/caddy/Caddyfile >/dev/null
@@ -1689,7 +3616,7 @@ fi
 sudo -n caddy validate --config /etc/caddy/Caddyfile
 sudo -n systemctl enable --now caddy
 sudo -n systemctl reload caddy
-printf 'ciaoship_host_init=ready\n'
+printf 'ciao_host_init=ready\n'
 "#
         )),
         HostOs::MacOs => Ok(format!(
@@ -1703,7 +3630,7 @@ for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.lin
 done
 if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
 if [ -z "$brew_bin" ]; then
-    brew_install_script=$(mktemp -t ciaoship-homebrew)
+    brew_install_script=$(mktemp -t ciao-homebrew)
     trap 'rm -f "$brew_install_script"' EXIT
     curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_install_script"
     NONINTERACTIVE=1 /bin/bash "$brew_install_script"
@@ -1722,8 +3649,8 @@ if [ -z "$caddy_bin" ]; then
     if ! "$brew_bin" list --formula caddy >/dev/null 2>&1; then "$brew_bin" install caddy; fi
     caddy_bin=$("$brew_bin" --prefix caddy)/bin/caddy
 fi
-[ -x "$caddy_bin" ] || {{ echo 'CiaoShip could not locate the Caddy binary after installation' >&2; exit 1; }}
-sudo -n install -d -m 0755 /etc/caddy/ciaoship
+[ -x "$caddy_bin" ] || {{ echo 'Ciao could not locate the Caddy binary after installation' >&2; exit 1; }}
+sudo -n install -d -m 0755 /etc/caddy/ciao
 sudo -n install -d -m 0755 "$brew_prefix/etc"
 caddyfile="$brew_prefix/etc/Caddyfile"
 import_line='{CADDY_IMPORT}'
@@ -1735,7 +3662,7 @@ fi
 sudo -n "$caddy_bin" validate --config "$caddyfile"
 if ! pgrep -x caddy >/dev/null 2>&1; then sudo -n "$brew_bin" services start caddy >/dev/null; fi
 sudo -n "$caddy_bin" reload --config "$caddyfile"
-printf 'ciaoship_host_init=ready\n'
+printf 'ciao_host_init=ready\n'
 "#
         )),
         HostOs::Unknown(value) => Err(CiaoError::Config(format!(
@@ -1744,13 +3671,20 @@ printf 'ciaoship_host_init=ready\n'
     }
 }
 
-/// Install and configure the dependencies CiaoShip needs on a target host.
+/// Install and configure the dependencies Ciao needs on a target host.
 ///
 /// This is an explicit administrative operation. A deploy that includes a
 /// domain calls it automatically; a domain-less deploy does not touch the
 /// package manager or Caddy.
 pub fn init_host(transport: &OpenSshTransport) -> Result<HostInitResult> {
     let platform = transport.inspect()?;
+    validate_host_init_platform(&platform)?;
+    let script = host_init_script(&platform.os)?;
+    remote_script(transport, "initialize host dependencies", &script)?;
+    Ok(host_init_result(platform))
+}
+
+fn validate_host_init_platform(platform: &HostPlatform) -> Result<()> {
     match (&platform.os, platform.service_manager.as_str()) {
         (HostOs::Linux, "systemd") | (HostOs::MacOs, "launchd") => {}
         (HostOs::Linux, manager) => {
@@ -1769,7 +3703,11 @@ pub fn init_host(transport: &OpenSshTransport) -> Result<HostInitResult> {
             )))
         }
     }
-    let dependencies = match &platform.os {
+    Ok(())
+}
+
+fn host_init_dependencies(os: &HostOs) -> Vec<String> {
+    match os {
         HostOs::Linux => vec![
             "apt-transport-https".to_owned(),
             "ca-certificates".to_owned(),
@@ -1784,17 +3722,27 @@ pub fn init_host(transport: &OpenSshTransport) -> Result<HostInitResult> {
             "Caddy".to_owned(),
         ],
         HostOs::Unknown(_) => Vec::new(),
-    };
-    remote_script(
-        transport,
-        "initialize host dependencies",
-        &host_init_script(&platform.os)?,
-    )?;
-    Ok(HostInitResult {
+    }
+}
+
+fn host_init_result(platform: HostPlatform) -> HostInitResult {
+    HostInitResult {
+        dependencies: host_init_dependencies(&platform.os),
         platform,
-        dependencies,
         message: "host dependencies and Caddy are ready".to_owned(),
-    })
+    }
+}
+
+/// Run the complete host bootstrap in the same SSH pseudo-terminal that
+/// prompts for the user's normal sudo password. This matters on systems with
+/// sudo's default `timestamp_type=tty`: authorizing in one SSH connection and
+/// executing the bootstrap in separate connections is not reliable.
+pub fn init_host_interactively(transport: &OpenSshTransport) -> Result<HostInitResult> {
+    let platform = transport.inspect()?;
+    validate_host_init_platform(&platform)?;
+    let script = host_init_script(&platform.os)?;
+    run_interactive_ssh_script(transport, "initialize host dependencies", &script)?;
+    Ok(host_init_result(platform))
 }
 
 fn runtime_init_script(
@@ -1859,7 +3807,7 @@ fn macos_runtime_script(formula: &str, commands: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(" || ");
     format!(
-        "set -eu\nbrew_bin=''\nfor candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do if [ -x \"$candidate\" ]; then brew_bin=\"$candidate\"; break; fi; done\n[ -n \"$brew_bin\" ] || {{ echo 'Homebrew is missing; run ciaoship host init first' >&2; exit 1; }}\nif {missing}; then \"$brew_bin\" install {formula}; fi\n{checks}\n",
+        "set -eu\nbrew_bin=''\nfor candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do if [ -x \"$candidate\" ]; then brew_bin=\"$candidate\"; break; fi; done\n[ -n \"$brew_bin\" ] || {{ echo 'Homebrew is missing; run ciao host init first' >&2; exit 1; }}\nif {missing}; then \"$brew_bin\" install {formula}; fi\n{checks}\n",
         formula = shell_quote(formula),
         missing = missing,
         checks = checks.join("\n"),
@@ -1999,6 +3947,37 @@ pub fn deploy(
     domain: Option<&str>,
     dry_run: bool,
 ) -> Result<DeployResult> {
+    if dry_run {
+        return deploy_unlocked(transport, source, plan, domain, true);
+    }
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    acquire_deploy_lock(transport, &root, &plan.name)?;
+    let result = deploy_unlocked(transport, source, plan, domain, false);
+    let unlock_result = release_deploy_lock(transport, &root, &plan.name);
+    match (result, unlock_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(CiaoError::Deployment {
+            stage: "release deployment lock".to_owned(),
+            message: error.to_string(),
+            previous_release: "unknown".to_owned(),
+        }),
+        (Err(error), Err(unlock_error)) => Err(CiaoError::Deployment {
+            stage: "deploy".to_owned(),
+            message: format!("{error}; deployment lock cleanup failed: {unlock_error}"),
+            previous_release: "unknown".to_owned(),
+        }),
+    }
+}
+
+fn deploy_unlocked(
+    transport: &OpenSshTransport,
+    source: &Path,
+    plan: &ProjectPlan,
+    domain: Option<&str>,
+    dry_run: bool,
+) -> Result<DeployResult> {
     if let Some(domain) = domain {
         validate_domain(domain)?;
     }
@@ -2063,7 +4042,7 @@ pub fn deploy(
         )?)
     };
     ensure_remote_layout(transport, &platform.os, &plan.name, &release)?;
-    let staging = format!("/tmp/ciaoship-{}-{}", plan.name, release);
+    let staging = format!("/tmp/ciao-{}-{}", plan.name, release);
     let release_path = format!("{root}/{}/releases/{release}", plan.name);
     let user = service_user(transport, &platform.os, &plan.name)?;
     let user_group = match &platform.os {
@@ -2115,18 +4094,18 @@ pub fn deploy(
         manifest.port = port;
         write_remote_file(
             transport,
-            &format!("{release_path}/ciaoship-manifest.toml"),
+            &format!("{release_path}/ciao-manifest.toml"),
             &manifest.to_toml()?,
             &user,
             "write release manifest",
         )?;
         if plan.app_type == AppType::Static {
+            harden_release(transport, &platform.os, &release_path)?;
             remote_script(
                 transport,
                 "activate static release",
                 &switch_current_script(&platform.os, &root, &plan.name, &release_path),
             )?;
-            harden_release(transport, &platform.os, &release_path)?;
         } else {
             let port = port.expect("service plans have a port");
             let start_script = start_script(
@@ -2450,15 +4429,16 @@ pub fn app_logs(
             transport.exec(command.clone())?
         }
         HostOs::MacOs => {
-            if follow {
+            if let Some(since) = since {
+                validate_since(since)?;
                 return Err(CiaoError::Config(
-                    "`logs --follow` is not available over synchronous SSH; omit it for a bounded snapshot".to_owned(),
+                    "`logs --since` is not available for macOS file-backed logs; omit it for a bounded snapshot".to_owned(),
                 ));
             }
             let command = CommandSpec::fixed("sh", &["-s"], "read logs").with_stdin(
                 format!(
-                    "set -eu\nlog show --last 1h --predicate 'process == \"{}\"' --style compact\n",
-                    app
+                    "set -eu\nstdout=/Library/Ciao/logs/{app}.out\nstderr=/Library/Ciao/logs/{app}.err\nif test -f \"$stdout\"; then cat \"$stdout\"; fi\nif test -f \"$stderr\"; then cat \"$stderr\" >&2; fi\n",
+                    app = shell_quote(app),
                 )
                 .into_bytes(),
             );
@@ -2610,13 +4590,13 @@ pub fn set_env(transport: &OpenSshTransport, app: &str, key: &str, value: &str) 
     let root = host_app_root(&platform.os);
     let user = service_user(transport, &platform.os, app)?;
     let path = format!("{root}/{app}/shared/env");
+    let line = env_file_line(key, value);
     let script = format!(
-        "set -eu\nroot={}\nfile={}\nsudo -n install -d -m 0755 \"$root\"\nsudo -n touch \"$file\"\nsudo -n chmod 0600 \"$file\"\nsudo -n sed -i.bak '/^{}=/d' \"$file\"\nprintf '%s=%s\\n' {} {} | sudo -n tee -a \"$file\" >/dev/null\nsudo -n rm -f \"$file.bak\"\nsudo -n chown {} \"$file\"\n",
+        "set -eu\nroot={}\nfile={}\nsudo -n install -d -m 0755 \"$root\"\nsudo -n touch \"$file\"\nsudo -n chmod 0600 \"$file\"\nsudo -n sed -i.bak '/^{}=/d' \"$file\"\nprintf '%s\\n' {} | sudo -n tee -a \"$file\" >/dev/null\nsudo -n rm -f \"$file.bak\"\nsudo -n chown {} \"$file\"\n",
         shell_quote(&format!("{root}/{app}/shared")),
         shell_quote(&path),
         regex_literal(key),
-        shell_quote(key),
-        shell_quote(value),
+        shell_quote(&line),
         shell_quote(&user),
     );
     remote_script(transport, "set environment", &script)
@@ -2659,11 +4639,11 @@ fn configure_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Re
     let release = read_current_release(transport, &root, app)?
         .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let fragment = caddy_fragment(transport, &root, app, &release, domain)?;
-    let fragment_path = format!("/etc/caddy/ciaoship/{app}.caddy");
+    let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
     remote_script(
         transport,
         "prepare Caddy directory",
-        "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciaoship\n",
+        "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
     )?;
     write_remote_file(
         transport,
@@ -2682,7 +4662,7 @@ fn configure_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Re
 
 fn remove_domain_fragment(transport: &OpenSshTransport, app: &str) -> Result<()> {
     validate_identifier("app name", app)?;
-    let path = format!("/etc/caddy/ciaoship/{app}.caddy");
+    let path = format!("/etc/caddy/ciao/{app}.caddy");
     remote_script(
         transport,
         "cleanup Caddy fragment",
@@ -2714,7 +4694,7 @@ fn caddy_fragment(
 
 fn read_existing_domain(transport: &OpenSshTransport, app: &str) -> Result<Option<String>> {
     validate_identifier("app name", app)?;
-    let path = format!("/etc/caddy/ciaoship/{app}.caddy");
+    let path = format!("/etc/caddy/ciao/{app}.caddy");
     let output = remote_script(
         transport,
         "read existing domain",
@@ -2747,7 +4727,7 @@ pub fn remove_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> R
         Some(_) => {}
     }
     let platform = transport.inspect()?;
-    let path = format!("/etc/caddy/ciaoship/{app}.caddy");
+    let path = format!("/etc/caddy/ciao/{app}.caddy");
     remote_script(
         transport,
         "remove Caddy fragment",
@@ -2778,7 +4758,7 @@ caddy_config="$brew_prefix/etc/Caddyfile"
         _ => ("", "/etc/caddy/Caddyfile", "sudo -n systemctl reload caddy"),
     };
     format!(
-        "set -eu\n{setup}sudo -n test -f {config}\nif ! sudo -n grep -Fq 'import /etc/caddy/ciaoship/*.caddy' {config}; then echo 'Caddyfile must import /etc/caddy/ciaoship/*.caddy' >&2; exit 1; fi\ncaddy_bin=$(command -v caddy || true)\nfor candidate in /opt/homebrew/bin/caddy /usr/local/bin/caddy /opt/homebrew/opt/caddy/bin/caddy /usr/bin/caddy; do if [ -z \"$caddy_bin\" ] && [ -x \"$candidate\" ]; then caddy_bin=\"$candidate\"; fi; done\nif [ -z \"$caddy_bin\" ]; then echo 'Caddy is not installed; run host initialization' >&2; exit 1; fi\nsudo -n \"$caddy_bin\" validate --config {config} && {reload}\n",
+        "set -eu\n{setup}sudo -n test -f {config}\nif ! sudo -n grep -Fq 'import /etc/caddy/ciao/*.caddy' {config}; then echo 'Caddyfile must import /etc/caddy/ciao/*.caddy' >&2; exit 1; fi\ncaddy_bin=$(command -v caddy || true)\nfor candidate in /opt/homebrew/bin/caddy /usr/local/bin/caddy /opt/homebrew/opt/caddy/bin/caddy /usr/bin/caddy; do if [ -z \"$caddy_bin\" ] && [ -x \"$candidate\" ]; then caddy_bin=\"$candidate\"; fi; done\nif [ -z \"$caddy_bin\" ]; then echo 'Caddy is not installed; run host initialization' >&2; exit 1; fi\nsudo -n \"$caddy_bin\" validate --config {config} && {reload}\n",
         setup = setup,
         config = config,
         reload = reload,
@@ -2811,7 +4791,7 @@ pub fn validate_domain(domain: &str) -> Result<()> {
 
 fn host_app_root(os: &HostOs) -> String {
     match os {
-        HostOs::MacOs => "/Library/Ciaoship/apps".to_owned(),
+        HostOs::MacOs => "/Library/Ciao/apps".to_owned(),
         _ => APP_ROOT.to_owned(),
     }
 }
@@ -2823,7 +4803,7 @@ fn service_user(transport: &OpenSshTransport, os: &HostOs, app: &str) -> Result<
                 "macOS LaunchDaemon requires an explicit user@host SSH target".to_owned(),
             )
         })?,
-        _ => format!("ciaoship-{app}"),
+        _ => format!("ciao-{app}"),
     };
     validate_owner("service user", &user)?;
     Ok(user)
@@ -2854,6 +4834,33 @@ fn ssh_login_user(target: &str) -> Option<String> {
     }
 }
 
+fn deploy_lock_path(root: &str, app: &str) -> String {
+    format!("{root}/{app}/.deploy-lock")
+}
+
+fn acquire_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
+    validate_identifier("app name", app)?;
+    let lock = deploy_lock_path(root, app);
+    let script = format!(
+        "set -eu\nsudo -n install -d -m 0755 {app_root}\nnow=$(date +%s)\nif sudo -n test -f {started}; then started_value=$(sudo -n cat {started} || true); case \"$started_value\" in ''|*[!0-9]*) ;; *) if [ \"$now\" -ge \"$started_value\" ] && [ $((now - started_value)) -gt 21600 ]; then sudo -n rm -f {started}; sudo -n rmdir {lock} 2>/dev/null || true; fi ;; esac; fi\nif ! sudo -n mkdir -m 0755 {lock} 2>/dev/null; then echo 'another Ciao deployment is already running for this app' >&2; exit 73; fi\nprintf '%s\\n' \"$now\" | sudo -n tee {started} >/dev/null\n",
+        app_root = shell_quote(&format!("{root}/{app}")),
+        lock = shell_quote(&lock),
+        started = shell_quote(&format!("{lock}/started")),
+    );
+    remote_script(transport, "acquire deployment lock", &script).map(|_| ())
+}
+
+fn release_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
+    validate_identifier("app name", app)?;
+    let lock = deploy_lock_path(root, app);
+    let script = format!(
+        "set -eu\nsudo -n rm -f {started}\nsudo -n rmdir {lock}\n",
+        started = shell_quote(&format!("{lock}/started")),
+        lock = shell_quote(&lock),
+    );
+    remote_script(transport, "release deployment lock", &script).map(|_| ())
+}
+
 fn ensure_remote_layout(
     transport: &OpenSshTransport,
     os: &HostOs,
@@ -2873,7 +4880,7 @@ fn ensure_remote_layout(
             app = shell_quote(app),
         ),
         HostOs::MacOs => format!(
-            "set -eu\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared\nsudo -n chown root:wheel {root}/{app} {root}/{app}/releases\nsudo -n chown {user}:staff {root}/{app}/shared\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases\nsudo -n chmod 0750 {root}/{app}/shared\n",
+            "set -eu\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared /Library/Ciao/logs\nsudo -n chown root:wheel {root}/{app} {root}/{app}/releases\nsudo -n chown {user}:staff {root}/{app}/shared\nsudo -n touch /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chown {user}:staff /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0644 /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases\nsudo -n chmod 0750 {root}/{app}/shared\n",
             root = shell_quote(&root),
             app = shell_quote(app),
             user = shell_quote(&user),
@@ -2945,7 +4952,7 @@ fn read_release_manifest(
 ) -> Result<ReleaseManifest> {
     validate_identifier("app name", app)?;
     validate_identifier("release", release)?;
-    let path = format!("{root}/{app}/releases/{release}/ciaoship-manifest.toml");
+    let path = format!("{root}/{app}/releases/{release}/ciao-manifest.toml");
     let output = remote_script(
         transport,
         "read release manifest",
@@ -2986,17 +4993,34 @@ fn allocate_port(
             .flatten()
     });
     let start = match (requested, current_port) {
-        (Some(port), Some(active)) if port == active => port.saturating_add(1),
+        (Some(port), Some(active)) if port == active => {
+            if port >= PORT_END {
+                PORT_START
+            } else {
+                port.saturating_add(1)
+            }
+        }
         (Some(port), _) if (PORT_START..=PORT_END).contains(&port) => port,
         _ => current_port
-            .map(|port| port.saturating_add(1).min(PORT_END))
+            .map(|port| {
+                if port >= PORT_END {
+                    PORT_START
+                } else {
+                    port.saturating_add(1)
+                }
+            })
             .unwrap_or(PORT_START),
     };
+    let port_range = u32::from(PORT_END) - u32::from(PORT_START) + 1;
     let output = remote_script(
         transport,
         "allocate internal port",
         &format!(
-            "set -eu\nif command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{{print $4}}' > /tmp/ciaoship-ports.$$; elif command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {{print $9}}' > /tmp/ciaoship-ports.$$; elif command -v netstat >/dev/null 2>&1; then netstat -ltn 2>/dev/null | awk 'NR > 2 {{print $4}}' > /tmp/ciaoship-ports.$$; else echo 'port allocation requires ss, lsof or netstat' >&2; exit 1; fi\ntrap 'rm -f /tmp/ciaoship-ports.$$' EXIT\nfor port in $(seq {start} {PORT_END}); do\n  if grep -Eq \"([.:])$port$\" /tmp/ciaoship-ports.$$; then continue; fi\n  printf '%s\\n' \"$port\"\n  exit 0\ndone\nexit 1\n"
+            "set -eu\nif command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{{print $4}}' > /tmp/ciao-ports.$$; elif command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {{print $9}}' > /tmp/ciao-ports.$$; elif command -v netstat >/dev/null 2>&1; then netstat -ltn 2>/dev/null | awk 'NR > 2 {{print $4}}' > /tmp/ciao-ports.$$; else echo 'port allocation requires ss, lsof or netstat' >&2; exit 1; fi\ntrap 'rm -f /tmp/ciao-ports.$$' EXIT\nfor offset in $(seq 0 {last_offset}); do\n  port=$(( (({start} - {PORT_START} + offset) % {port_range}) + {PORT_START} ))\n  if grep -Eq \"([.:])$port$\" /tmp/ciao-ports.$$; then continue; fi\n  printf '%s\\n' \"$port\"\n  exit 0\ndone\nexit 1\n",
+            last_offset = port_range - 1,
+            port_range = port_range,
+            PORT_START = PORT_START,
+            start = start,
         ),
     )?;
     output
@@ -3099,9 +5123,9 @@ fn run_macos_candidate(
     health: &HealthConfig,
 ) -> Result<()> {
     validate_owner("service user", user)?;
-    let pid_file = format!("/tmp/ciaoship-candidate-{}.pid", port);
+    let pid_file = format!("/tmp/ciao-candidate-{}.pid", port);
     let script = format!(
-        "set -eu\ncd -- {}\nnohup ./start > /tmp/ciaoship-candidate-{}.log 2>&1 &\nprintf '%s\\n' \"$!\" | tee {} >/dev/null\n",
+        "set -eu\ncd -- {}\nnohup ./start > /tmp/ciao-candidate-{}.log 2>&1 &\nprintf '%s\\n' \"$!\" | tee {} >/dev/null\n",
         shell_quote(release_path),
         port,
         shell_quote(&pid_file)
@@ -3135,12 +5159,12 @@ fn switch_current_script(os: &HostOs, root: &str, app: &str, release_path: &str)
         HostOs::MacOs => "wheel",
         _ => "root",
     };
+    let app_root = format!("{root}/{app}");
     format!(
-        "set -eu\nsudo -n test -d {}\nsudo -n ln -sfn {} {}/current\nsudo -n chown -h root:{group} {}/current\n",
+        "set -eu\napp_root={}\ncurrent=\"$app_root/current\"\ntmp=\"$app_root/.current-$$\"\ntrap 'sudo -n rm -f \"$tmp\"' EXIT\nsudo -n test -d {}\nif sudo -n test -e \"$current\" && ! sudo -n test -L \"$current\"; then echo 'current exists but is not a symlink' >&2; exit 1; fi\nsudo -n rm -f \"$tmp\"\nsudo -n ln -s {} \"$tmp\"\nsudo -n chown -h root:{group} \"$tmp\"\nsudo -n mv -f \"$tmp\" \"$current\"\ntrap - EXIT\n",
+        shell_quote(&app_root),
         shell_quote(release_path),
         shell_quote(release_path),
-        shell_quote(&format!("{root}/{app}")),
-        shell_quote(&format!("{root}/{app}")),
     )
 }
 
@@ -3259,9 +5283,9 @@ fn remote_script(transport: &OpenSshTransport, stage: &str, script: &str) -> Res
 
 fn service_unit_name(app: &str, candidate: bool) -> String {
     if candidate {
-        format!("ciaoship-{app}-candidate.service")
+        format!("ciao-{app}-candidate.service")
     } else {
-        format!("ciaoship-{app}.service")
+        format!("ciao-{app}.service")
     }
 }
 
@@ -3277,14 +5301,14 @@ fn install_service(
     command: &str,
 ) -> Result<()> {
     let app = unit
-        .strip_prefix("ciaoship-")
+        .strip_prefix("ciao-")
         .unwrap_or(unit)
         .trim_end_matches("-candidate.service")
         .trim_end_matches(".service");
     validate_identifier("app name", app)?;
     let unit_contents = match os {
         HostOs::Linux => format!(
-            "[Unit]\nDescription=CiaoShip app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile=-{env_file}\nExecStart=/bin/sh -lc {exec}\nRestart={}\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=Ciao app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile=-{env_file}\nExecStart=/bin/sh -lc {exec}\nRestart={}\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
             if candidate { "no" } else { "on-failure" },
             app = app,
             user = user,
@@ -3305,7 +5329,7 @@ fn install_service(
     let path = match os {
         HostOs::Linux => format!("/etc/systemd/system/{unit}"),
         HostOs::MacOs => format!(
-            "/Library/LaunchDaemons/dev.ciaoship.{}.plist",
+            "/Library/LaunchDaemons/dev.ciao.{}.plist",
             app.trim_end_matches("-candidate")
         ),
         HostOs::Unknown(_) => unreachable!(),
@@ -3376,15 +5400,14 @@ fn service_action(
         HostOs::MacOs => {
             let label = unit
                 .trim_end_matches(".service")
-                .replace("-candidate", ".candidate");
-            let plist = format!(
-                "/Library/LaunchDaemons/dev.ciaoship.{}.plist",
-                label.trim_start_matches("ciaoship-")
-            );
+                .replace("-candidate", ".candidate")
+                .trim_start_matches("ciao-")
+                .to_owned();
+            let plist = format!("/Library/LaunchDaemons/dev.ciao.{}.plist", label);
             let script = match action {
-                LifecycleAction::Start => format!("set -eu\nsudo -n launchctl bootstrap system {} 2>/dev/null || sudo -n launchctl kickstart -k system/dev.ciaoship.{}\n", shell_quote(&plist), shell_quote(&label)),
-                LifecycleAction::Stop => format!("set -eu\nsudo -n launchctl bootout system/dev.ciaoship.{} 2>/dev/null || true\n", shell_quote(&label)),
-                LifecycleAction::Restart => format!("set -eu\nsudo -n launchctl bootout system/dev.ciaoship.{} 2>/dev/null || true\nsudo -n launchctl bootstrap system {}\n", shell_quote(&label), shell_quote(&plist)),
+                LifecycleAction::Start => format!("set -eu\nsudo -n launchctl bootstrap system {} 2>/dev/null || sudo -n launchctl kickstart -k system/dev.ciao.{}\n", shell_quote(&plist), shell_quote(&label)),
+                LifecycleAction::Stop => format!("set -eu\nsudo -n launchctl bootout system/dev.ciao.{} 2>/dev/null || true\n", shell_quote(&label)),
+                LifecycleAction::Restart => format!("set -eu\nsudo -n launchctl bootout system/dev.ciao.{} 2>/dev/null || true\nsudo -n launchctl bootstrap system {}\n", shell_quote(&label), shell_quote(&plist)),
             };
             remote_script(transport, "service lifecycle", &script)?;
         }
@@ -3402,16 +5425,18 @@ fn remove_service(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Resu
         HostOs::MacOs => {
             let label = unit
                 .trim_end_matches(".service")
-                .replace("-candidate", ".candidate");
+                .replace("-candidate", ".candidate")
+                .trim_start_matches("ciao-")
+                .to_owned();
             let plist = format!(
-                "/Library/LaunchDaemons/dev.ciaoship.{}.plist",
-                label.trim_start_matches("ciaoship-")
+                "/Library/LaunchDaemons/dev.ciao.{}.plist",
+                label
             );
             remote_script(
                 transport,
                 "remove candidate service",
                 &format!(
-                    "set -eu\nsudo -n launchctl bootout system/dev.ciaoship.{} 2>/dev/null || true\nsudo -n rm -f {}\n",
+                    "set -eu\nsudo -n launchctl bootout system/dev.ciao.{} 2>/dev/null || true\nsudo -n rm -f {}\n",
                     shell_quote(&label),
                     shell_quote(&plist)
                 ),
@@ -3436,12 +5461,12 @@ fn service_state(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Resul
         HostOs::MacOs => {
             let label = unit
                 .trim_end_matches(".service")
-                .trim_start_matches("ciaoship-");
+                .trim_start_matches("ciao-");
             remote_script(
                 transport,
                 "read service status",
                 &format!(
-                    "set -eu\nif sudo -n launchctl print system/dev.ciaoship.{} >/dev/null 2>&1; then printf 'active\\n'; else printf 'inactive\\n'; fi\n",
+                    "set -eu\nif sudo -n launchctl print system/dev.ciao.{} >/dev/null 2>&1; then printf 'active\\n'; else printf 'inactive\\n'; fi\n",
                     shell_quote(label)
                 ),
             )?
@@ -3489,7 +5514,7 @@ fn cleanup_release(
         transport,
         "cleanup failed release",
         &format!(
-            "set -eu\nsudo -n rm -rf {}/{}/releases/{} /tmp/ciaoship-{}-{}\n",
+            "set -eu\nsudo -n rm -rf {}/{}/releases/{} /tmp/ciao-{}-{}\n",
             shell_quote(&root),
             shell_quote(app),
             shell_quote(release),
@@ -3517,7 +5542,7 @@ fn prune_releases(transport: &OpenSshTransport, root: &str, app: &str, keep: usi
 }
 
 fn validate_service_unit(unit: &str) -> Result<()> {
-    if !unit.starts_with("ciaoship-")
+    if !unit.starts_with("ciao-")
         || !unit.ends_with(".service")
         || unit.contains(['/', ' ', '\n', '\r', ';', '|', '&', '$', '`'])
     {
@@ -3575,7 +5600,7 @@ pub fn systemd_unit(
         return Err(CiaoError::Config("working directory is invalid".to_owned()));
     }
     Ok(format!(
-        "[Unit]\nDescription=CiaoShip app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile={APP_ROOT}/{app}/shared/env\nExecStart=/bin/sh -lc {command}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=Ciao app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile={APP_ROOT}/{app}/shared/env\nExecStart=/bin/sh -lc {command}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
     ))
 }
 
@@ -3590,9 +5615,9 @@ pub fn launchd_plist(
     if !working_directory.starts_with('/') || working_directory.contains(['\n', '\r']) {
         return Err(CiaoError::Config("working directory is invalid".to_owned()));
     }
-    let label = format!("dev.ciaoship.{app}");
+    let label = format!("dev.ciao.{app}");
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>UserName</key><string>{user}</string>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-lc</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{working_directory}</string>\n<key>KeepAlive</key><true/>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>UserName</key><string>{user}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-lc</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{working_directory}</string>\n<key>KeepAlive</key><true/>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
         xml_escape(command),
         label = xml_escape(&label),
         user = xml_escape(user),
@@ -3606,13 +5631,13 @@ pub fn remote_path(app: &str, suffix: &str) -> Result<String> {
         || suffix.contains("..")
         || suffix.contains(['\n', '\r', ';', '|', '&', '$', '`'])
     {
-        return Err(CiaoError::Config("invalid remote CiaoShip path".to_owned()));
+        return Err(CiaoError::Config("invalid remote Ciao path".to_owned()));
     }
     Ok(format!("{APP_ROOT}/{app}{suffix}"))
 }
 
 fn validate_upload_destination(destination: &str) -> Result<()> {
-    if !destination.starts_with("/tmp/ciaoship-")
+    if !destination.starts_with("/tmp/ciao-")
         || destination.contains("..")
         || destination.contains(['\n', '\r', ';', '|', '&', '$', '`', ' '])
         || !destination
@@ -3635,7 +5660,10 @@ pub fn truncate(value: &str) -> String {
     } else {
         format!(
             "{}\n[… output truncated …]",
-            &value[..value.floor_char_boundary(LIMIT)]
+            &value[..(0..=LIMIT)
+                .rev()
+                .find(|index| value.is_char_boundary(*index))
+                .unwrap_or(0)]
         )
     }
 }
@@ -3677,11 +5705,89 @@ mod tests {
     }
 
     #[test]
+    fn remote_sudo_password_detection_only_matches_the_sudo_probe() {
+        let password_error = CiaoError::RemoteCommand {
+            stage: "check remote administrator privileges".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: "sudo: a password is required".to_owned(),
+        };
+        assert!(remote_sudo_password_required(&password_error));
+
+        let ssh_error = CiaoError::RemoteCommand {
+            stage: "remote source extraction".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: "sudo: a password is required".to_owned(),
+        };
+        assert!(!remote_sudo_password_required(&ssh_error));
+
+        let policy_error = CiaoError::RemoteCommand {
+            stage: "check remote administrator privileges".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: "sudo: user is not allowed to run sudo".to_owned(),
+        };
+        assert!(!remote_sudo_password_required(&policy_error));
+    }
+
+    #[test]
+    fn command_output_capture_isolated_from_parent_stdio() {
+        let output =
+            run_local_script(b"printf 'stdout-value\\n'; printf 'stderr-value\\n' >&2").unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.trim(), "stdout-value");
+        assert_eq!(output.stderr.trim(), "stderr-value");
+    }
+
+    #[test]
+    fn host_config_accepts_legacy_entries_without_identity_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        fs::write(file.path(), "[hosts.home]\nssh = \"user@server\"\n").unwrap();
+        file.flush().unwrap();
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hosts["home"].identity_file, None);
+    }
+
+    #[test]
+    fn configured_identity_is_explicit_and_not_a_shell_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = directory.path().join("id_ed25519");
+        let transport = OpenSshTransport::new("user@server")
+            .unwrap()
+            .with_identity_file(Some(identity.clone()))
+            .unwrap();
+        let args = ssh_command_arguments_for_test(&transport);
+        let identity_arg = identity.display().to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1] == identity_arg));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "IdentitiesOnly=yes"]));
+        assert!(!args.iter().any(|arg| arg.contains("ProxyCommand")));
+    }
+
+    #[test]
+    fn trusted_known_host_parser_discards_scan_headers_and_relabels_key() {
+        let found = "# Host server found: line 1\nserver ssh-ed25519 AAAAkey comment\nserver ecdsa-sha2-nistp256 BBBBkey";
+        let keys = trusted_known_host_lines(found);
+        assert_eq!(
+            keys,
+            vec!["ssh-ed25519 AAAAkey comment", "ecdsa-sha2-nistp256 BBBBkey",]
+        );
+        assert_eq!(
+            format!("ts.example {}", keys[0]),
+            "ts.example ssh-ed25519 AAAAkey comment"
+        );
+    }
+
+    #[test]
     fn detection_is_deterministic() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("go.mod"), "module example.com/app\n").unwrap();
         fs::write(
-            directory.path().join("ciaoship.toml"),
+            directory.path().join("ciao.toml"),
             "[app]\nname = \"go-demo\"\n",
         )
         .unwrap();
@@ -3695,7 +5801,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
         fs::write(
-            directory.path().join("ciaoship.toml"),
+            directory.path().join("ciao.toml"),
             "[app]\nname = \"api\"\n[build]\ninstall = \"npm ci --ignore-scripts\"\ncommand = \"npm run compile\"\n[run]\ncommand = \"node server.js\"\nport = 8080\n[health]\npath = \"/health\"\ntimeout = \"3s\"\n",
         )
         .unwrap();
@@ -3711,7 +5817,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
         fs::write(
-            directory.path().join("ciaoship.toml"),
+            directory.path().join("ciao.toml"),
             "[app]\nname = \"api\"\n[dev]\nname = \"admin\"\nport = 41001\ncommand = \"node server.js\"\n",
         )
         .unwrap();
@@ -3781,7 +5887,7 @@ mod tests {
         assert!(!script.contains("/etc/hosts"));
         assert!(script.contains("address=/.ciao/127.0.0.1"));
         if cfg!(target_os = "macos") {
-            assert!(script.contains("dev.ciaoship.local-loopback"));
+            assert!(script.contains("dev.ciao.local-loopback"));
             assert!(script.contains("/Library/LaunchDaemons"));
         }
     }
@@ -3795,7 +5901,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            directory.path().join("ciaoship.toml"),
+            directory.path().join("ciao.toml"),
             "[app]\nname = \"rust-demo\"\n",
         )
         .unwrap();
@@ -3817,16 +5923,60 @@ mod tests {
 
     #[test]
     fn generated_service_rejects_untrusted_identifiers() {
-        assert!(systemd_unit("bad;rm", "ciaoship-bad", "/tmp", "./app").is_err());
-        assert!(launchd_plist("good", "/tmp", "./app", "luca")
-            .unwrap()
-            .contains("KeepAlive"));
+        assert!(systemd_unit("bad;rm", "ciao-bad", "/tmp", "./app").is_err());
+        let plist = launchd_plist("good", "/tmp", "./app", "luca").unwrap();
+        assert!(plist.contains("<key>UserName</key><string>luca</string>"));
+        assert!(plist.contains("<key>PATH</key>"));
+    }
+
+    #[test]
+    fn macos_service_labels_do_not_duplicate_the_ciao_prefix() {
+        let label = "ciao-demo";
+        let normalized = label
+            .trim_end_matches(".service")
+            .replace("-candidate", ".candidate")
+            .trim_start_matches("ciao-")
+            .to_owned();
+        assert_eq!(normalized, "demo");
+        assert_eq!(format!("dev.ciao.{normalized}"), "dev.ciao.demo");
     }
 
     #[test]
     fn shell_script_uses_fixed_cwd_quote() {
         let script = command_script("echo ok", "/tmp/a'b").unwrap();
         assert!(String::from_utf8(script).unwrap().contains("'\\''"));
+    }
+
+    #[test]
+    fn environment_file_line_survives_shell_parsing() {
+        let value = "a'b $HOME \"quoted\" \\ slash `command`";
+        let line = env_file_line("SECRET", value);
+        let script = format!("set -eu\n{line}\nprintf '%s' \"$SECRET\"\n");
+        let output = run_local_script(script.as_bytes()).unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, value);
+    }
+
+    #[test]
+    fn activation_replaces_current_with_a_root_owned_symlink_swap() {
+        let script = switch_current_script(
+            &HostOs::Linux,
+            APP_ROOT,
+            "demo",
+            "/var/lib/ciao/apps/demo/releases/r1",
+        );
+        assert!(script.contains(".current-$$"));
+        assert!(script.contains("mv -f"));
+        assert!(script.contains("chown -h root:root"));
+        assert!(!script.contains("ln -sfn"));
+    }
+
+    #[test]
+    fn truncate_preserves_utf8_at_the_limit() {
+        let value = format!("{}é", "a".repeat(16_383));
+        let truncated = truncate(&value);
+        assert!(truncated.starts_with(&"a".repeat(16_383)));
+        assert!(truncated.contains("output truncated"));
     }
 
     #[test]
@@ -3848,8 +5998,8 @@ mod tests {
         let node = runtime_init_script(
             &HostOs::Linux,
             &Runtime::Node,
-            "ciaoship-demo",
-            "/var/lib/ciaoship/apps/demo",
+            "ciao-demo",
+            "/var/lib/ciao/apps/demo",
         )
         .unwrap()
         .unwrap();
@@ -3859,12 +6009,108 @@ mod tests {
         let bun = runtime_init_script(
             &HostOs::Linux,
             &Runtime::Bun,
-            "ciaoship-demo",
-            "/var/lib/ciaoship/apps/demo",
+            "ciao-demo",
+            "/var/lib/ciao/apps/demo",
         )
         .unwrap()
         .unwrap();
         assert!(bun.contains("https://bun.sh/install"));
         assert!(bun.contains("BUN_INSTALL"));
+    }
+
+    #[test]
+    fn github_remote_detection_supports_common_urls_and_dots() {
+        assert_eq!(
+            parse_github_remote("https://github.com/acme/my.app.git")
+                .unwrap()
+                .unwrap()
+                .full_name(),
+            "acme/my.app"
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:acme/my-app").unwrap(),
+            Some(GitHubRepoRef {
+                owner: "acme".to_owned(),
+                repo: "my-app".to_owned(),
+            })
+        );
+        assert!(parse_github_remote("https://gitlab.com/acme/app")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn ci_environment_requires_only_safe_target_values() {
+        let mut env = BTreeMap::new();
+        env.insert("CIAO_HOST".to_owned(), "target.corp".to_owned());
+        env.insert("CIAO_USER".to_owned(), "deploy".to_owned());
+        env.insert("CIAO_APP".to_owned(), "my-app".to_owned());
+        let target = ci_target_from_env(&env).unwrap();
+        assert_eq!(target.host, "target.corp");
+        env.insert("CIAO_HOST".to_owned(), "target;id".to_owned());
+        assert!(ci_target_from_env(&env).is_err());
+    }
+
+    #[test]
+    fn tailscale_policy_patch_preserves_existing_rules_and_is_idempotent() {
+        let policy = serde_json::json!({
+            "acls": [{"action": "accept", "src": ["autogroup:members"], "dst": ["*:*"]}],
+            "grants": []
+        });
+        let first = tailscale_policy_patch(&policy, "100.64.0.7").unwrap();
+        let second = tailscale_policy_patch(&first, "100.64.0.7").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["acls"], policy["acls"]);
+        assert_eq!(
+            first["tagOwners"]["tag:ciao-ci"],
+            serde_json::json!(["autogroup:admin"])
+        );
+        assert_eq!(first["grants"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tailscale_browser_url_parser_accepts_only_login_origin() {
+        assert_eq!(
+            tailscale_auth_url_from_output(
+                "To authenticate, visit https://login.tailscale.com/a/example?redirect=1."
+            ),
+            Some("https://login.tailscale.com/a/example?redirect=1".to_owned())
+        );
+        assert!(tailscale_auth_url_from_output("https://evil.example/login").is_none());
+    }
+
+    #[test]
+    fn tailscale_preferred_address_uses_magic_dns_before_ip() {
+        let target = TailscaleTarget {
+            hostname: Some("server.example.ts.net".to_owned()),
+            ipv4: Some("100.64.0.7".to_owned()),
+            online: true,
+        };
+        assert_eq!(target.preferred_address().unwrap(), "server.example.ts.net");
+    }
+
+    #[test]
+    fn tailscale_target_detection_recognizes_tailnet_addresses() {
+        assert!(ssh_target_uses_tailscale("deploy@100.121.27.41"));
+        assert!(ssh_target_uses_tailscale("deploy@server.example.ts.net"));
+        assert!(!ssh_target_uses_tailscale("deploy@[fd7a:115c:a1e0::1]"));
+        assert!(!ssh_target_uses_tailscale("deploy@192.168.1.20"));
+    }
+
+    #[test]
+    fn generated_workflow_is_pinned_and_strict() {
+        let workflow = render_github_workflow(&workflow_spec_for(
+            "main",
+            "0123456789012345678901234567890123456789",
+        ))
+        .unwrap();
+        assert!(workflow.contains("id-token: write"));
+        assert!(workflow.contains("tailscale/github-action@v4"));
+        assert!(workflow.contains("ping: ${{ vars.CIAO_HOST }}"));
+        assert!(workflow.contains("dtolnay/rust-toolchain@stable"));
+        assert!(workflow.contains("StrictHostKeyChecking yes"));
+        assert!(workflow.contains("ciao deploy --ci"));
+        assert!(workflow.contains("ref: '0123456789012345678901234567890123456789'"));
+        assert!(!workflow.contains("ref: 'latest'"));
     }
 }

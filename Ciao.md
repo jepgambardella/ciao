@@ -1,14 +1,14 @@
-# Ciaoship
+# Ciao
 
 > **Ship apps. Skip the ops.**
 
-A tiny, fast, open-source deployment tool for running applications on your own Linux or macOS machines without Docker, Kubernetes, or a permanently running control plane.
+A tiny, fast, source-available deployment tool for running applications on your own Linux or macOS machines without Docker, Kubernetes, or a permanently running control plane.
 
-Ciaoship should make this workflow almost trivial:
+Ciao should make this workflow almost trivial:
 
 ```bash
-ciaoship host add home user@192.168.1.50
-ciaoship deploy home --domain app.example.com
+ciao host add home user@192.168.1.50
+ciao deploy home --domain app.example.com
 ```
 
 Expected result:
@@ -32,9 +32,9 @@ The philosophy:
 
 > **Use the operating system. Hide the boring parts.**
 
-Ciaoship must treat **Apple Silicon (`arm64`) as a first-class target**, not as an afterthought.
+Ciao must treat **Apple Silicon (`arm64`) as a first-class target**, not as an afterthought.
 
-Ciaoship is not a PaaS, not a container orchestrator, and not a new server runtime.
+Ciao is not a PaaS, not a container orchestrator, and not a new server runtime.
 
 It is a thin, opinionated deployment layer over mature Linux primitives.
 
@@ -74,13 +74,13 @@ allow rollback
 
 Linux already knows how to do almost all of this.
 
-Ciaoship should combine those primitives behind one coherent UX.
+Ciao should combine those primitives behind one coherent UX.
 
 ---
 
 # 2. Core promise
 
-Ciaoship should feel closer to:
+Ciao should feel closer to:
 
 ```bash
 vercel deploy
@@ -90,30 +90,30 @@ than to a long SSH checklist.
 
 The developer thinks about the application.
 
-Ciaoship handles the operational glue.
+Ciao handles the operational glue.
 
 The happy path must remain one or two commands:
 
 ```bash
-ciaoship host add home user@server
-ciaoship deploy home
+ciao host add home user@server
+ciao deploy home
 ```
 
 Optional public exposure:
 
 ```bash
-ciaoship deploy home --domain app.example.com
+ciao deploy home --domain app.example.com
 ```
 
 If ordinary deployments routinely need more than this, the UX is drifting.
 
 ---
 
-# 3. What Ciaoship is not
+# 3. What Ciao is not
 
 This is the main anti-derailment constraint.
 
-Do not slowly turn Ciaoship into:
+Do not slowly turn Ciao into:
 
 ```text
 mini Kubernetes
@@ -125,7 +125,7 @@ mini Terraform
 mini Nomad
 ```
 
-Ciaoship should remain:
+Ciao should remain:
 
 > **A very small deployment manager for individual Linux servers.**
 
@@ -150,7 +150,7 @@ No Docker dependency in the core architecture.
 The first version should integrate mature system components instead of replacing them.
 
 ```text
-                    CIAOSHIP CLI
+                    CIAO CLI
                          │
                          │ SSH
                          ▼
@@ -181,13 +181,13 @@ Cloudflare Tunnel
 application on localhost
 ```
 
-Ciaoship is the orchestration and UX layer.
+Ciao is the orchestration and UX layer.
 
 ---
 
 # 5. Design principle: use boring infrastructure
 
-Ciaoship should deliberately rely on boring, well-understood primitives.
+Ciao should deliberately rely on boring, well-understood primitives.
 
 ## Process lifecycle
 
@@ -222,9 +222,9 @@ journald
 Application stdout/stderr naturally becomes:
 
 ```bash
-ciaoship logs myapp
-ciaoship logs myapp --follow
-ciaoship logs myapp --since 10m
+ciao logs myapp
+ciao logs myapp --follow
+ciao logs myapp --since 10m
 ```
 
 Do not build a logging database.
@@ -299,20 +299,20 @@ project detection
 
 # 6. systemd integration
 
-A Ciaoship-managed app should ultimately be a normal Linux service.
+A Ciao-managed app should ultimately be a normal Linux service.
 
 Conceptually:
 
 ```ini
 [Unit]
-Description=Ciaoship app myapp
+Description=Ciao app myapp
 After=network.target
 
 [Service]
-User=ciaoship-myapp
-WorkingDirectory=/var/lib/ciaoship/apps/myapp/current
-EnvironmentFile=/var/lib/ciaoship/apps/myapp/shared/env
-ExecStart=/var/lib/ciaoship/apps/myapp/current/start
+User=ciao-myapp
+WorkingDirectory=/var/lib/ciao/apps/myapp/current
+EnvironmentFile=/var/lib/ciao/apps/myapp/shared/env
+ExecStart=/var/lib/ciao/apps/myapp/current/start
 Restart=on-failure
 RestartSec=2
 
@@ -322,10 +322,10 @@ WantedBy=multi-user.target
 
 Users should never need to write this manually.
 
-Ciaoship must only manage its own units:
+Ciao must only manage its own units:
 
 ```text
-/etc/systemd/system/ciaoship-*.service
+/etc/systemd/system/ciao-*.service
 ```
 
 Never modify unrelated services.
@@ -337,23 +337,23 @@ Never modify unrelated services.
 
 macOS is an official deployment target.
 
-For machines used as always-on servers, Ciaoship should prefer **LaunchDaemons** so applications can start at boot without requiring a logged-in desktop session.
+For machines used as always-on servers, Ciao should prefer **LaunchDaemons** so applications can start at boot without requiring a logged-in desktop session.
 
-Conceptually, Ciaoship generates a plist like:
+Conceptually, Ciao generates a plist like:
 
 ```xml
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>dev.ciaoship.myapp</string>
+    <string>dev.ciao.myapp</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/Ciaoship/apps/myapp/current/start</string>
+        <string>/Library/Ciao/apps/myapp/current/start</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Library/Ciaoship/apps/myapp/current</string>
+    <string>/Library/Ciao/apps/myapp/current</string>
 
     <key>KeepAlive</key>
     <true/>
@@ -367,8 +367,8 @@ Conceptually, Ciaoship generates a plist like:
 Suggested managed paths:
 
 ```text
-/Library/Ciaoship/apps/
-/Library/LaunchDaemons/dev.ciaoship.*.plist
+/Library/Ciao/apps/
+/Library/LaunchDaemons/dev.ciao.*.plist
 ```
 
 For user-scoped setups, a future mode may use:
@@ -395,19 +395,19 @@ The codebase must never assume x86_64 when generating paths, binaries, build com
 
 # 7. Caddy integration
 
-Ciaoship should manage only its own generated fragments.
+Ciao should manage only its own generated fragments.
 
 Example:
 
 ```text
-/etc/caddy/ciaoship/
+/etc/caddy/ciao/
   myapp.caddy
 ```
 
 Main Caddy configuration can import:
 
 ```text
-import /etc/caddy/ciaoship/*.caddy
+import /etc/caddy/ciao/*.caddy
 ```
 
 Architecture:
@@ -425,7 +425,7 @@ app.example.com
 Command:
 
 ```bash
-ciaoship domain add home myapp app.example.com
+ciao domain add home myapp app.example.com
 ```
 
 DNS remains the user's responsibility unless a provider adapter is explicitly configured.
@@ -439,7 +439,7 @@ Cloudflare Tunnel should be a first-class optional exposure method for homeserve
 Example:
 
 ```bash
-ciaoship expose home myapp --cloudflare app.example.com
+ciao expose home myapp --cloudflare app.example.com
 ```
 
 Architecture:
@@ -458,14 +458,14 @@ homeserver
 
 The server does not need a publicly reachable IP.
 
-Ciaoship should support both:
+Ciao should support both:
 
 ```text
 normal public VPS → Caddy
 homeserver/private network → Cloudflare Tunnel
 ```
 
-Do not turn Ciaoship into a full Cloudflare administration client.
+Do not turn Ciao into a full Cloudflare administration client.
 
 Keep the adapter narrow.
 
@@ -474,7 +474,7 @@ Keep the adapter narrow.
 # 9. First server registration
 
 ```bash
-ciaoship host add home luca@192.168.1.50
+ciao host add home luca@192.168.1.50
 ```
 
 Expected output on Linux:
@@ -484,7 +484,7 @@ Expected output on Linux:
 ✓ OS: Linux
 ✓ service manager: systemd
 ✓ architecture: x86_64
-✓ Ciaoship directories ready
+✓ Ciao directories ready
 
 Host `home` ready.
 ```
@@ -496,7 +496,7 @@ Expected output on Apple Silicon:
 ✓ OS: macOS
 ✓ service manager: launchd
 ✓ architecture: arm64 (Apple Silicon)
-✓ Ciaoship directories ready
+✓ Ciao directories ready
 
 Host `studio` ready.
 ```
@@ -504,12 +504,12 @@ Host `studio` ready.
 Remote layout should remain understandable:
 
 ```text
-/var/lib/ciaoship/
-/etc/ciaoship/
+/var/lib/ciao/
+/etc/ciao/
 /etc/systemd/system/
 ```
 
-No Ciaoship daemon is required on the remote machine in v0.1.
+No Ciao daemon is required on the remote machine in v0.1.
 
 ---
 
@@ -536,7 +536,7 @@ small attack surface
 easy debugging
 ```
 
-Ciaoship should reuse normal OpenSSH configuration:
+Ciao should reuse normal OpenSSH configuration:
 
 ```text
 ~/.ssh/config
@@ -552,6 +552,21 @@ Pragmatic v0.1 recommendation:
 
 > Use the installed OpenSSH client instead of implementing SSH cryptography.
 
+When the first SSH login is not ready, `ciao host add` may guide the user
+through a one-time key bootstrap. It creates a standard Ed25519 identity in
+the user's local `~/.ssh/ciao/` directory, opens one normal OpenSSH session so
+the user can approve the host key and enter the server password, installs only
+the public key in `authorized_keys`, and verifies a subsequent key-only login.
+The password is handled by OpenSSH; Ciao never receives or stores it. The
+normal OpenSSH path remains the default, and `--non-interactive` disables the
+prompt for automation.
+
+Privileged CLI operations follow the same boundary. `ciao host init` opens one
+`ssh -tt host sh -c ...` session, runs `sudo -v` and the complete bootstrap
+under the same remote sudo TTY, so the password stays inside OpenSSH. Deploy and lifecycle
+operations use independent non-interactive SSH commands and therefore require
+`sudo -n`; CI and MCP require it as well because they cannot safely prompt.
+
 A native SSH transport can be reconsidered later.
 
 ---
@@ -561,10 +576,10 @@ A native SSH transport can be reconsidered later.
 Inside a repository:
 
 ```bash
-ciaoship deploy home
+ciao deploy home
 ```
 
-Ciaoship should infer:
+Ciao should infer:
 
 ```text
 runtime
@@ -621,7 +636,7 @@ Use a tiny config when necessary.
 Example:
 
 ```toml
-# ciaoship.toml
+# ciao.toml
 
 [app]
 name = "my-api"
@@ -658,7 +673,7 @@ Deployments should be immutable releases.
 Remote layout:
 
 ```text
-/var/lib/ciaoship/apps/myapp/
+/var/lib/ciao/apps/myapp/
   releases/
     20260812-103012-a81cd2/
     20260812-111411-c194ff/
@@ -773,7 +788,7 @@ A candidate does not become active until the health check passes.
 Rollback is a first-class operation:
 
 ```bash
-ciaoship rollback home myapp
+ciao rollback home myapp
 ```
 
 No rebuild.
@@ -800,7 +815,7 @@ A deploy system without trivial rollback is incomplete.
 
 Apps should bind to localhost by default.
 
-Ciaoship assigns and tracks internal ports:
+Ciao assigns and tracks internal ports:
 
 ```text
 myapp
@@ -837,7 +852,7 @@ build/
 public/
 ```
 
-Ciaoship should serve the files directly through Caddy.
+Ciao should serve the files directly through Caddy.
 
 Result:
 
@@ -870,7 +885,7 @@ The resulting process should be executed directly by systemd.
 
 No wrapper runtime.
 
-This is the ideal Ciaoship workload:
+This is the ideal Ciao workload:
 
 ```text
 binary
@@ -884,7 +899,7 @@ Caddy
 
 # 21. Bun / Node applications
 
-For JS applications Ciaoship does not alter runtime semantics.
+For JS applications Ciao does not alter runtime semantics.
 
 Example:
 
@@ -902,7 +917,7 @@ npm run build
 node server.js
 ```
 
-Ciaoship manages:
+Ciao manages:
 
 ```text
 release
@@ -945,7 +960,7 @@ Support:
 
 ```text
 .gitignore
-.ciaoshipignore
+.ciaoignore
 ```
 
 Avoid requiring `rsync`.
@@ -971,7 +986,7 @@ simple mental model
 Later:
 
 ```bash
-ciaoship deploy --build-local
+ciao deploy --build-local
 ```
 
 may be useful for CI or compiled binaries.
@@ -985,9 +1000,9 @@ Do not add artifact registries in v0.1.
 Commands:
 
 ```bash
-ciaoship env set home myapp DATABASE_URL
-ciaoship env set home myapp API_KEY
-ciaoship env unset home myapp API_KEY
+ciao env set home myapp DATABASE_URL
+ciao env set home myapp API_KEY
+ciao env unset home myapp API_KEY
 ```
 
 Never print secret values by default.
@@ -995,7 +1010,7 @@ Never print secret values by default.
 Remote file:
 
 ```text
-/var/lib/ciaoship/apps/myapp/shared/env
+/var/lib/ciao/apps/myapp/shared/env
 ```
 
 Permissions:
@@ -1030,7 +1045,7 @@ one Unix user per application
 Example:
 
 ```text
-ciaoship-myapp
+ciao-myapp
 ```
 
 Benefits:
@@ -1042,7 +1057,7 @@ clear ownership
 smaller blast radius
 ```
 
-A shared `ciaoship` user may be acceptable in an early prototype, but per-app users are the better target.
+A shared `ciao` user may be acceptable in an early prototype, but per-app users are the better target.
 
 ---
 
@@ -1127,7 +1142,7 @@ dirty state
 
 But do not require Git.
 
-Ciaoship deploys the current project snapshot, not necessarily a remote repository.
+Ciao deploys the current project snapshot, not necessarily a remote repository.
 
 ---
 
@@ -1171,7 +1186,7 @@ Failures are part of the UX.
 Support:
 
 ```bash
-ciaoship deploy home --dry-run
+ciao deploy home --dry-run
 ```
 
 Output:
@@ -1206,7 +1221,7 @@ coding agent
     │
     │ MCP
     ▼
-ciaoship mcp
+ciao mcp
 on developer machine
     │
     │ SSH
@@ -1214,7 +1229,7 @@ on developer machine
 remote server
 ```
 
-This avoids exposing a Ciaoship management API on the homeserver.
+This avoids exposing a Ciao management API on the homeserver.
 
 ---
 
@@ -1249,7 +1264,7 @@ expose_cloudflare
 remove_cloudflare_exposure
 ```
 
-The agent should operate in terms of Ciaoship concepts.
+The agent should operate in terms of Ciao concepts.
 
 Do not give MCP arbitrary shell execution by default.
 
@@ -1378,7 +1393,7 @@ CLI, MCP and dashboard must share the same Rust core.
 Correct:
 
 ```text
-             ciaoship_core
+             ciao_core
             /      |      \
            /       |       \
         CLI       MCP       UI
@@ -1407,7 +1422,7 @@ Every important CLI command should support:
 Example:
 
 ```bash
-ciaoship status home myapp --json
+ciao status home myapp --json
 ```
 
 ```json
@@ -1438,7 +1453,7 @@ The dashboard is useful but must not create a mandatory remote control plane.
 Command:
 
 ```bash
-ciaoship ui home
+ciao ui home
 ```
 
 starts a temporary local interface:
@@ -1452,18 +1467,18 @@ Architecture:
 ```text
 browser
    ↓
-local Ciaoship UI
+local Ciao UI
    ↓
-Ciaoship core
+Ciao core
    ↓
 SSH
    ↓
 server
 ```
 
-When `ciaoship ui` exits, the dashboard is gone.
+When `ciao ui` exits, the dashboard is gone.
 
-No always-on Ciaoship web service is required remotely.
+No always-on Ciao web service is required remotely.
 
 ---
 
@@ -1549,7 +1564,7 @@ No enterprise audit subsystem is needed.
 
 # 42. Rust implementation
 
-Ciaoship should be implemented primarily in Rust.
+Ciao should be implemented primarily in Rust.
 
 Reasons:
 
@@ -1567,19 +1582,19 @@ Suggested workspace:
 
 ```text
 crates/
-  ciaoship_cli/
-  ciaoship_core/
-  ciaoship_config/
-  ciaoship_host/
-  ciaoship_detect/
-  ciaoship_transport/
-  ciaoship_deploy/
-  ciaoship_release/
-  ciaoship_systemd/
-  ciaoship_proxy/
-  ciaoship_cloudflare/
-  ciaoship_mcp/
-  ciaoship_ui/
+  ciao_cli/
+  ciao_core/
+  ciao_config/
+  ciao_host/
+  ciao_detect/
+  ciao_transport/
+  ciao_deploy/
+  ciao_release/
+  ciao_systemd/
+  ciao_proxy/
+  ciao_cloudflare/
+  ciao_mcp/
+  ciao_ui/
 ```
 
 Keep boundaries explicit.
@@ -1724,7 +1739,7 @@ Commands should be safe to repeat.
 Example:
 
 ```bash
-ciaoship host init home
+ciao host init home
 ```
 
 second run:
@@ -1744,7 +1759,7 @@ This is especially important for agents.
 Use:
 
 ```text
-~/.config/ciaoship/config.toml
+~/.config/ciao/config.toml
 ```
 
 Example:
@@ -1752,12 +1767,18 @@ Example:
 ```toml
 [hosts.home]
 ssh = "luca@192.168.1.50"
+# Optional; created by the guided `ciao host add` bootstrap:
+# identity_file = "/Users/me/.ssh/ciao/home_ed25519"
 
 [hosts.vps]
 ssh = "root@vps.example.com"
 ```
 
-Never store private SSH keys.
+Do not maintain a private-key database. Ciao normally reuses the user's
+OpenSSH config, agent and keys. When the user explicitly approves the guided
+bootstrap, Ciao may create a standard user-owned Ed25519 identity locally;
+its config stores only the path, the private key never crosses to the host,
+and the password remains inside OpenSSH.
 
 ---
 
@@ -1768,7 +1789,7 @@ Only create global remote configuration when actually needed.
 Possible:
 
 ```text
-/etc/ciaoship/config.toml
+/etc/ciao/config.toml
 ```
 
 Example:
@@ -1803,7 +1824,7 @@ Cleanup must never break rollback unexpectedly.
 
 # 50. Recoverability
 
-Ciaoship-managed servers must remain understandable without Ciaoship.
+Ciao-managed servers must remain understandable without Ciao.
 
 An app is still:
 
@@ -1814,45 +1835,45 @@ environment file
 Caddy route
 ```
 
-If Ciaoship local state disappears, recover as much as possible from the server.
+If Ciao local state disappears, recover as much as possible from the server.
 
 This is a major product principle:
 
-> **Ciaoship manages Linux. It does not replace Linux.**
+> **Ciao manages Linux. It does not replace Linux.**
 
 ---
 
 # 51. Uninstallability
 
-Removing Ciaoship locally must not stop applications.
+Removing Ciao locally must not stop applications.
 
 Deployed apps remain standard system services.
 
 A future uninstall command may remove:
 
 ```text
-Ciaoship-managed units
+Ciao-managed units
 proxy fragments
 release directories
 ```
 
 but only explicitly.
 
-No hidden dependency on the Ciaoship executable should exist remotely for ordinary app runtime.
+No hidden dependency on the Ciao executable should exist remotely for ordinary app runtime.
 
 ---
 
 # 52. CI use
 
-Ciaoship should work naturally from CI:
+Ciao should work naturally from CI:
 
 ```bash
-ciaoship deploy production --non-interactive
+ciao deploy production --non-interactive
 ```
 
 Use normal SSH credentials injected by the CI provider.
 
-No Ciaoship cloud account.
+No Ciao cloud account.
 
 No special CI architecture.
 
@@ -1869,7 +1890,7 @@ Optional:
 migrate = "bun run migrate"
 ```
 
-Ciaoship can run it at a defined phase.
+Ciao can run it at a defined phase.
 
 But database rollback semantics belong to the application.
 
@@ -1891,7 +1912,7 @@ type = "worker"
 command = "./worker"
 ```
 
-Ciaoship still provides:
+Ciao still provides:
 
 ```text
 deploy
@@ -1945,7 +1966,7 @@ Kafka
 
 in v0.1.
 
-Ciaoship deploys applications.
+Ciao deploys applications.
 
 Infrastructure provisioning is a separate problem and a fast route toward becoming a platform.
 
@@ -1984,15 +2005,15 @@ Windows is explicitly out of scope for the initial versions.
 
 # 58. Installation
 
-Ciaoship uses one Rust codebase but distributes platform-specific binaries.
+Ciao uses one Rust codebase but distributes platform-specific binaries.
 
 Initial release artifacts:
 
 ```text
-ciaoship-linux-x86_64
-ciaoship-linux-arm64
-ciaoship-macos-x86_64
-ciaoship-macos-arm64
+ciao-linux-x86_64
+ciao-linux-arm64
+ciao-macos-x86_64
+ciao-macos-arm64
 ```
 
 Rust targets:
@@ -2016,7 +2037,7 @@ and downloads the correct artifact.
 For the user there is still only:
 
 ```bash
-ciaoship
+ciao
 ```
 
 Apple Silicon (`aarch64-apple-darwin`) must be published and tested from the first public release.
@@ -2037,7 +2058,7 @@ AUR
 deb/rpm
 ```
 
-Do not require Node, Python or Docker to run Ciaoship itself.
+Do not require Node, Python or Docker to run Ciao itself.
 
 ---
 
@@ -2069,7 +2090,9 @@ cloudflared
 application runtime
 ```
 
-Install optional dependencies only with explicit permission.
+The normal deploy path installs only the native dependencies it needs. Optional
+integrations remain opt-in, and Ciao asks before changing external account
+policy or other operator-owned configuration.
 
 ---
 
@@ -2111,7 +2134,7 @@ macOS + launchd
 Apple Silicon arm64
 ```
 
-Containers are perfectly acceptable for Ciaoship's own CI tests.
+Containers are perfectly acceptable for Ciao's own CI tests.
 
 The product simply does not require containers for user deployments.
 
@@ -2119,7 +2142,7 @@ The product simply does not require containers for user deployments.
 
 # 61. Performance goals
 
-Ciaoship itself should be almost invisible.
+Ciao itself should be almost invisible.
 
 Measure:
 
@@ -2134,7 +2157,7 @@ remote deployment overhead
 
 The most important property:
 
-> **When Ciaoship is not actively deploying, remote Ciaoship overhead should be effectively zero.**
+> **When Ciao is not actively deploying, remote Ciao overhead should be effectively zero.**
 
 No remote daemon makes this naturally achievable.
 
@@ -2145,8 +2168,8 @@ No remote daemon makes this naturally achievable.
 Defaults:
 
 ```text
-no Ciaoship management port
-no SSH private-key storage
+no Ciao management port
+no SSH private-key database or remote private-key copy
 no application running as root
 no public app port by default
 no secret logging
@@ -2181,7 +2204,7 @@ Do not require it for the core product.
 The separate “localhost done well” idea can later become:
 
 ```bash
-ciaoship dev
+ciao dev
 ```
 
 with:
@@ -2193,7 +2216,7 @@ admin.project.localhost
 
 But do not build this first.
 
-Deployment is Ciaoship's initial identity.
+Deployment is Ciao's initial identity.
 
 ---
 
@@ -2202,7 +2225,7 @@ Deployment is Ciaoship's initial identity.
 Later:
 
 ```bash
-ciaoship deploy home --preview
+ciao deploy home --preview
 ```
 
 could produce:
@@ -2222,30 +2245,30 @@ Interesting, but not core MVP.
 Recommended:
 
 ```bash
-ciaoship host add
-ciaoship host list
-ciaoship host inspect
+ciao host add
+ciao host list
+ciao host inspect
 
-ciaoship inspect
-ciaoship deploy
-ciaoship apps
-ciaoship status
-ciaoship logs
-ciaoship restart
-ciaoship start
-ciaoship stop
-ciaoship rollback
+ciao inspect
+ciao deploy
+ciao apps
+ciao status
+ciao logs
+ciao restart
+ciao start
+ciao stop
+ciao rollback
 
-ciaoship domain add
-ciaoship domain remove
+ciao domain add
+ciao domain remove
 
-ciaoship expose
+ciao expose
 
-ciaoship env set
-ciaoship env unset
+ciao env set
+ciao env unset
 
-ciaoship mcp
-ciaoship ui
+ciao mcp
+ciao ui
 ```
 
 Avoid command explosion.
@@ -2257,11 +2280,11 @@ Avoid command explosion.
 The first public MVP should make this work reliably:
 
 ```bash
-ciaoship host add home user@server
+ciao host add home user@server
 
 cd my-project
 
-ciaoship deploy home
+ciao deploy home
 ```
 
 Supported:
@@ -2313,8 +2336,8 @@ host inspection
 Goal:
 
 ```bash
-ciaoship host add
-ciaoship host inspect
+ciao host add
+ciao host inspect
 ```
 
 ---
@@ -2334,7 +2357,7 @@ static
 Goal:
 
 ```bash
-ciaoship inspect
+ciao inspect
 ```
 
 returns a deployment plan.
@@ -2423,7 +2446,7 @@ Cloudflare Tunnel adapter
 Build:
 
 ```text
-ciaoship mcp
+ciao mcp
 shared core API
 structured tools
 permission profiles
@@ -2441,7 +2464,7 @@ Goal:
 Build:
 
 ```text
-ciaoship ui
+ciao ui
 small local Rust HTTP server
 embedded frontend
 SSH-backed state
@@ -2456,23 +2479,23 @@ Only after CLI and MCP are solid.
 Suggested monorepo:
 
 ```text
-ciaoship/
+ciao/
   Cargo.toml
 
   crates/
-    ciaoship_cli/
-    ciaoship_core/
-    ciaoship_config/
-    ciaoship_host/
-    ciaoship_detect/
-    ciaoship_transport/
-    ciaoship_deploy/
-    ciaoship_release/
-    ciaoship_systemd/
-    ciaoship_proxy/
-    ciaoship_cloudflare/
-    ciaoship_mcp/
-    ciaoship_ui/
+    ciao_cli/
+    ciao_core/
+    ciao_config/
+    ciao_host/
+    ciao_detect/
+    ciao_transport/
+    ciao_deploy/
+    ciao_release/
+    ciao_systemd/
+    ciao_proxy/
+    ciao_cloudflare/
+    ciao_mcp/
+    ciao_ui/
 
   examples/
     rust-app/
@@ -2508,7 +2531,7 @@ Use this order:
 7. feature breadth
 ```
 
-Ciaoship touches real servers.
+Ciao touches real servers.
 
 A clever deployment system that occasionally destroys state is useless.
 
@@ -2538,11 +2561,11 @@ If not, probably skip it.
 
 Integrate rather than replace.
 
-### Does it require a permanent Ciaoship daemon?
+### Does it require a permanent Ciao daemon?
 
 Require strong justification.
 
-### Does it move Ciaoship toward container orchestration?
+### Does it move Ciao toward container orchestration?
 
 Stop and reconsider.
 
@@ -2596,20 +2619,20 @@ The project should stay small enough that a developer can understand the archite
 # 73. Example README opening
 
 ```text
-Ciaoship
+Ciao
 ========
 
 Ship apps. Skip the ops.
 
-Ciaoship deploys applications to your own Linux servers without Docker,
+Ciao deploys applications to your own Linux servers without Docker,
 Kubernetes, or a permanent control plane.
 
-$ ciaoship host add home user@192.168.1.50
-$ ciaoship deploy home --domain app.example.com
+$ ciao host add home user@192.168.1.50
+$ ciao deploy home --domain app.example.com
 
 That's it.
 
-Ciaoship uploads your app, builds it, runs it under systemd, keeps it alive,
+Ciao uploads your app, builds it, runs it under systemd, keeps it alive,
 stores logs in journald, configures HTTPS through Caddy, performs health
 checks, and keeps previous releases ready for rollback.
 
@@ -2620,7 +2643,7 @@ Your server remains a normal Linux server.
 
 # 74. Product positioning
 
-Do not pitch Ciaoship as:
+Do not pitch Ciao as:
 
 ```text
 Docker replacement
@@ -2631,7 +2654,7 @@ DevOps platform
 
 Better:
 
-> **Ciaoship is the fastest way to turn a Linux server into a place where your apps just run.**
+> **Ciao is the fastest way to turn a Linux server into a place where your apps just run.**
 
 Alternative:
 
@@ -2645,7 +2668,7 @@ Main claim:
 
 # 75. Final thesis
 
-Ciaoship should make a plain Linux server or Mac feel modern without hiding it behind another platform.
+Ciao should make a plain Linux server or Mac feel modern without hiding it behind another platform.
 
 The infrastructure is intentionally boring:
 
@@ -2662,8 +2685,8 @@ The product value is making these pieces feel like one tool.
 Human workflow:
 
 ```bash
-ciaoship host add home user@server
-ciaoship deploy home --domain app.example.com
+ciao host add home user@server
+ciao deploy home --domain app.example.com
 ```
 
 Agent workflow:
@@ -2671,12 +2694,12 @@ Agent workflow:
 ```text
 coding agent
     ↓ MCP
-Ciaoship local
+Ciao local
     ↓ SSH
 homeserver
 ```
 
-When Ciaoship is idle:
+When Ciao is idle:
 
 ```text
 no remote daemon

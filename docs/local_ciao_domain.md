@@ -1,12 +1,12 @@
-Aggiungi a CiaoShip una modalità di sviluppo locale integrata basata su domini **`.ciao`** e porte automatiche.
+Aggiungi a Ciao una modalità di sviluppo locale integrata basata su domini **`.ciao`** e porte automatiche.
 
 La UX desiderata è:
 
 ```bash
-ciaoship dev
+ciao dev
 ```
 
-CiaoShip rileva automaticamente il nome del progetto dalla cartella, dai metadata del progetto o da `ciaoship.toml` e lo espone come:
+Ciao rileva automaticamente il nome del progetto dalla cartella, dai metadata del progetto o da `ciao.toml` e lo espone come:
 
 ```text
 my-api.ciao
@@ -17,7 +17,7 @@ blog.ciao
 Deve essere possibile fare override:
 
 ```bash
-ciaoship dev --name admin
+ciao dev --name admin
 ```
 
 ottenendo:
@@ -37,7 +37,7 @@ command = "bun run dev"
 
 ## Resolver `.ciao`
 
-CiaoShip deve configurare automaticamente il sistema locale affinché:
+Ciao deve configurare automaticamente il sistema locale affinché:
 
 ```text
 *.ciao → 127.0.0.1
@@ -53,7 +53,7 @@ macOS Intel
 Linux
 ```
 
-Dopo il setup iniziale, `ciaoship dev` non deve richiedere ulteriori configurazioni DNS.
+Dopo il setup iniziale, `ciao dev` non deve richiedere ulteriori configurazioni DNS.
 
 Non modificare `/etc/hosts` per ogni progetto: il resolver deve gestire l'intero namespace `*.ciao`.
 
@@ -63,7 +63,7 @@ Principio:
 
 > **Stable names. Disposable ports.**
 
-CiaoShip mantiene stabile il dominio e considera la porta un dettaglio interno.
+Ciao mantiene stabile il dominio e considera la porta un dettaglio interno.
 
 Esempio:
 
@@ -77,11 +77,11 @@ La porta deve essere scelta automaticamente.
 
 Se il progetto indica una porta preferita e quella porta è libera, può essere utilizzata.
 
-Se è occupata, **non deve mai essere un errore bloccante**: CiaoShip cerca automaticamente la successiva porta libera o un'altra porta disponibile nel range gestito.
+Se è occupata, **non deve mai essere un errore bloccante**: Ciao cerca automaticamente la successiva porta libera o un'altra porta disponibile nel range gestito.
 
 Più progetti devono poter girare contemporaneamente senza conflitti.
 
-CiaoShip mantiene internamente il mapping:
+Ciao mantiene internamente il mapping:
 
 ```text
 project name → internal port
@@ -100,7 +100,7 @@ Il mapping deve poter cambiare tra esecuzioni senza cambiare l'URL pubblico loca
 
 ```bash
 cd my-api
-ciaoship dev
+ciao dev
 ```
 
 ```text
@@ -114,7 +114,7 @@ http://my-api.ciao
 Ready.
 ```
 
-Riusa il più possibile il core esistente di CiaoShip:
+Riusa il più possibile il core esistente di Ciao:
 
 ```text
 project detection
@@ -126,13 +126,13 @@ logging
 
 Non creare un secondo sistema parallelo.
 
-La feature deve rimanere piccola, automatica e coerente con la filosofia di CiaoShip:
+La feature deve rimanere piccola, automatica e coerente con la filosofia di Ciao:
 
 > **Ship apps. Skip the ops.**
 
 L'implementazione usa dnsmasq per il resolver e Caddy per il reverse proxy,
 installandoli automaticamente con il package manager nativo al primo
-`ciaoship dev`. Su macOS viene rilevato Homebrew nelle posizioni standard Apple
+`ciao dev`. Su macOS viene rilevato Homebrew nelle posizioni standard Apple
 Silicon e Intel e viene installato se assente; inoltre un piccolo job launchd
 ripristina l'alias loopback usato dal resolver dopo il reboot. Su Linux sono
 supportati apt e systemd-resolved. Il setup è idempotente e non modifica

@@ -1,12 +1,13 @@
 [workspace]
-members = ["crates/ciaoship-core", "crates/ciaoship"]
+members = ["crates/ciao-core", "crates/ciao"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-authors = ["CiaoShip contributors"]
+rust-version = "1.80"
+license-file = "LICENSE"
+authors = ["Luca La Barbera"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }

@@ -9,7 +9,7 @@ quoting. The local setup script is inspected for native dependencies and for
 the absence of per-project `/etc/hosts` edits; tests do not mutate the
 developer's DNS or service manager.
 
-CI adds a small vertical smoke test: it builds the `ciaoship` binary, detects a
+CI adds a small vertical smoke test: it builds the `ciao` binary, detects a
 temporary project through the CLI, then sends `initialize` and `tools/call`
 (`inspect_app`) requests through the real MCP stdio process. This checks the
 CLI/core/MCP wiring without mutating a host. CI runs these checks on Ubuntu and
@@ -30,6 +30,12 @@ state after every operation and clean up only the fixture application.
 For a temporary manual test, grant only the fixture account a short-lived
 `NOPASSWD` rule, verify `sudo -n true`, run the vertical slice, then revoke the
 rule. Do not paste passwords or private keys into the repository or test logs.
+
+The guided `ciao host add` SSH bootstrap is tested separately from deployment:
+it must use the installed OpenSSH client, keep the private identity local with
+mode `0600`, install only the public key, and verify a subsequent
+non-interactive connection. Tests must use a disposable account and must never
+capture or print the password.
 
 Live tests must not reboot, shut down, suspend, or otherwise disrupt the host.
 Reboot persistence is intentionally not exercised by the repository’s live
