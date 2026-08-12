@@ -36,9 +36,10 @@ host initialization installs Caddy through the native package manager and
 configures only CiaoShip's fragment import; a deploy with `--domain` invokes
 that initialization automatically.
 
-For local `.ciao` development, macOS uses Homebrew's Caddy/dnsmasq services
-and `/etc/resolver/ciao`; Linux uses dnsmasq plus systemd-resolved's `~ciao`
-routing domain. No per-project `/etc/hosts` entries are created.
+For local `.ciao` development, macOS uses Homebrew's Caddy/dnsmasq services,
+`/etc/resolver/ciao`, and a tiny launchd job to restore its loopback alias;
+Linux uses dnsmasq plus systemd-resolved's `~ciao` routing domain. No
+per-project `/etc/hosts` entries are created.
 
 `ciaoship apps`, `ciaoship releases` and the temporary `ciaoship ui` view read
 this same filesystem/service state through the shared core. The UI binds only

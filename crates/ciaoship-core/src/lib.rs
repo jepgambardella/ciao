@@ -1276,8 +1276,12 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 pub fn local_proxy_paths() -> Result<LocalProxyPaths> {
     if cfg!(target_os = "macos") {
         let prefix = local_brew_prefix();
+        let caddy_bin = [prefix.join("bin/caddy"), prefix.join("opt/caddy/bin/caddy")]
+            .into_iter()
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| prefix.join("bin/caddy"));
         Ok(LocalProxyPaths {
-            caddy_bin: prefix.join("bin/caddy"),
+            caddy_bin,
             caddyfile: prefix.join("etc/Caddyfile"),
             fragment_dir: prefix.join("etc/ciaoship"),
         })
@@ -1368,6 +1372,20 @@ brew_prefix=$("$brew_bin" --prefix)
 export PATH="$brew_prefix/bin:$brew_prefix/sbin:$PATH"
 if ! "$brew_bin" list --formula caddy >/dev/null 2>&1; then "$brew_bin" install caddy; fi
 if ! "$brew_bin" list --formula dnsmasq >/dev/null 2>&1; then "$brew_bin" install dnsmasq; fi
+loopback_plist='/Library/LaunchDaemons/dev.ciaoship.local-loopback.plist'
+sudo -n tee "$loopback_plist" >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.ciaoship.local-loopback</string>
+<key>ProgramArguments</key><array><string>/sbin/ifconfig</string><string>lo0</string><string>alias</string><string>10.0.0.1</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+sudo -n chown root:wheel "$loopback_plist"
+sudo -n chmod 0644 "$loopback_plist"
+sudo -n launchctl bootout system/dev.ciaoship.local-loopback >/dev/null 2>&1 || true
+sudo -n launchctl bootstrap system "$loopback_plist"
 if ! ifconfig lo0 2>/dev/null | grep -q '10.0.0.1'; then sudo -n ifconfig lo0 alias 10.0.0.1; fi
 dnsmasq_conf="$brew_prefix/etc/dnsmasq.conf"
 sudo -n install -d -m 0755 "$brew_prefix/etc"
@@ -1487,6 +1505,10 @@ fn local_setup_ready() -> bool {
     };
     let resolver_ready = if cfg!(target_os = "macos") {
         Path::new("/etc/resolver/ciao").is_file()
+            && Command::new("ifconfig")
+                .args(["lo0"])
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("10.0.0.1"))
     } else {
         Path::new("/etc/dnsmasq.d/ciaoship-ciao.conf").is_file()
             && Path::new("/etc/systemd/resolved.conf.d/ciaoship-ciao.conf").is_file()
@@ -3758,6 +3780,10 @@ mod tests {
         assert!(script.contains("Caddy"));
         assert!(!script.contains("/etc/hosts"));
         assert!(script.contains("address=/.ciao/127.0.0.1"));
+        if cfg!(target_os = "macos") {
+            assert!(script.contains("dev.ciaoship.local-loopback"));
+            assert!(script.contains("/Library/LaunchDaemons"));
+        }
     }
 
     #[test]

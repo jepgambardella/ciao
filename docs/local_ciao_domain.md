@@ -133,6 +133,7 @@ La feature deve rimanere piccola, automatica e coerente con la filosofia di Ciao
 L'implementazione usa dnsmasq per il resolver e Caddy per il reverse proxy,
 installandoli automaticamente con il package manager nativo al primo
 `ciaoship dev`. Su macOS viene rilevato Homebrew nelle posizioni standard Apple
-Silicon e Intel e viene installato se assente; su Linux sono supportati apt e
-systemd-resolved. Il setup è idempotente e non modifica `/etc/hosts` per
-progetto.
+Silicon e Intel e viene installato se assente; inoltre un piccolo job launchd
+ripristina l'alias loopback usato dal resolver dopo il reboot. Su Linux sono
+supportati apt e systemd-resolved. Il setup è idempotente e non modifica
+`/etc/hosts` per progetto.

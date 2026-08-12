@@ -13,8 +13,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
-      - run: cargo build --target aarch64-apple-darwin --package ciaoship --locked
-        if: runner.os == 'macOS'
       - name: CLI and MCP vertical smoke test
         shell: bash
         run: |
@@ -33,6 +31,10 @@ jobs:
           grep -q '"name": "vertical-demo"' inspect.json
           grep -q '"app_type": "Static"' inspect.json
 
+          CIAOSHIP_CONFIG="$fixture/config.toml" ./target/debug/ciaoship --json dev --dry-run "$fixture" > dev.json
+          grep -q '"domain": "vertical-demo.ciao"' dev.json
+          grep -q '"dry_run": true' dev.json
+
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"inspect_app\",\"arguments\":{\"path\":\"$fixture\"}}}" \
@@ -46,5 +48,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-targets
-      - run: cargo build -p ciaoship
+      - run: cargo build --target aarch64-apple-darwin --package ciaoship --locked
+      - run: cargo build -p ciaoship --locked
       - run: ./target/debug/ciaoship --version

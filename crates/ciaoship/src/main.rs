@@ -328,7 +328,7 @@ fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
     let setup = local_setup()?;
     let paths = write_local_caddy_fragment(&plan)?;
     if let Err(error) = reload_local_caddy(&paths) {
-        let _ = remove_local_caddy_fragment(&plan.name);
+        let _ = remove_local_caddy_fragment(&plan.name).and_then(|_| reload_local_caddy(&paths));
         return Err(error);
     }
     config.local.projects.insert(
@@ -345,7 +345,7 @@ fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
         },
     );
     if let Err(error) = config.save(&config_path) {
-        let _ = remove_local_caddy_fragment(&plan.name);
+        let _ = remove_local_caddy_fragment(&plan.name).and_then(|_| reload_local_caddy(&paths));
         return Err(error);
     }
     if json_output {

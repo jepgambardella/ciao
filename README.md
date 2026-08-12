@@ -39,7 +39,7 @@ remain ordinary system services when the local binary is not running.
   standard Apple Silicon/Intel locations and installs it when missing. A deploy
   with `--domain` performs this initialization automatically.
 - The detected Rust, Go, Node or Bun runtime is installed only when that
-  runtime is needed by a deploy. Static deployments do not install a runtime. 
+  runtime is needed by a deploy. Static deployments do not install a runtime.
 
 ## Configuration
 
