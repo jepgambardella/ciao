@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo build --target aarch64-apple-darwin --package ciaoship --locked
+        if: runner.os == 'macOS'
+      - name: CLI and MCP vertical smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p ciaoship
+          fixture="$(mktemp -d)"
+          trap 'rm -rf "$fixture"' EXIT
+          mkdir -p "$fixture/dist"
+          cat > "$fixture/ciaoship.toml" <<'EOF'
+          [app]
+          name = "vertical-demo"
+          EOF
+          printf '%s\n' '<h1>vertical smoke</h1>' > "$fixture/dist/index.html"
+
+          ./target/debug/ciaoship --json inspect "$fixture" > inspect.json
+          grep -q '"name": "vertical-demo"' inspect.json
+          grep -q '"app_type": "Static"' inspect.json
+
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"inspect_app\",\"arguments\":{\"path\":\"$fixture\"}}}" \
+            | ./target/debug/ciaoship mcp > mcp.json
+          grep -q '"id":1' mcp.json
+          grep -q 'vertical-demo' mcp.json
+
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --all-targets
+      - run: cargo build -p ciaoship
+      - run: ./target/debug/ciaoship --version

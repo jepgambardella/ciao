@@ -1,0 +1,45 @@
+# Testing
+
+`cargo test --workspace --all-targets` is the repository’s current automated
+test suite. It runs locally and in Ubuntu CI without a remote host, covering
+identifier and SSH validation, project detection and configuration overrides,
+local `.ciao` name/port/proxy planning, release manifests, config
+round-tripping, generated systemd/launchd definitions, and shell-script
+quoting. The local setup script is inspected for native dependencies and for
+the absence of per-project `/etc/hosts` edits; tests do not mutate the
+developer's DNS or service manager.
+
+CI adds a small vertical smoke test: it builds the `ciaoship` binary, detects a
+temporary project through the CLI, then sends `initialize` and `tools/call`
+(`inspect_app`) requests through the real MCP stdio process. This checks the
+CLI/core/MCP wiring without mutating a host. CI runs these checks on Ubuntu and
+runs the workspace tests natively on an arm64 macOS runner. The local UI is a
+thin read-only view over `list_apps`; it is intentionally not a second control
+plane.
+
+## Live SSH tests
+
+Live deployment tests are opt-in and require a separately provisioned,
+disposable host. The fixture should provide an SSH account with passwordless
+`sudo -n`, `systemd` or `launchd`, `tar`, `curl` or `wget`, and the toolchain
+for the fixture application. Exercise first deploy, a second immutable
+release, failed build and health-check preservation, status/logs, restart
+after killing the process, rollback, and release pruning. Verify the host
+state after every operation and clean up only the fixture application.
+
+For a temporary manual test, grant only the fixture account a short-lived
+`NOPASSWD` rule, verify `sudo -n true`, run the vertical slice, then revoke the
+rule. Do not paste passwords or private keys into the repository or test logs.
+
+Live tests must not reboot, shut down, suspend, or otherwise disrupt the host.
+Reboot persistence is intentionally not exercised by the repository’s live
+test contract: the test must verify `systemctl enable`/LaunchDaemon
+configuration, but must not reboot the host. Do not add a reboot step to CI or
+a manual fixture.
+
+If a required host or service manager is unavailable, report
+`skipped: <reason>`; a green local or CI unit run is not evidence that remote
+systemd, journald, launchd, or SSH behavior was exercised. The repository does
+not start Docker or install a remote daemon as part of its tests. A host with
+`cloudflared` but without an explicitly provisioned tunnel is not evidence for
+Cloudflare exposure; report that feature as skipped.
