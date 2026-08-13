@@ -326,6 +326,9 @@ fn run(cli: Cli) -> Result<()> {
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
             }
+            if interactive_output && !args.dry_run {
+                offer_passwordless_sudo_setup(&transport)?;
+            }
             let result = deploy_with_mode(
                 &transport,
                 &path,
@@ -1179,6 +1182,43 @@ fn actionable_deploy_error(error: CiaoError, host: &str) -> CiaoError {
             format!("{message}\n\nThen retry on this computer:\n  ciao deploy {host}"),
         ),
         other => other,
+    }
+}
+
+fn offer_passwordless_sudo_setup(transport: &OpenSshTransport) -> Result<()> {
+    match check_remote_sudo(transport) {
+        Ok(()) => Ok(()),
+        Err(error) if remote_sudo_password_required(&error) => {
+            eprintln!();
+            eprintln!(
+                "Ciao needs passwordless sudo for the SSH user to finish this deploy and future deploys."
+            );
+            eprintln!(
+                "It will ask for the host password once and configure the policy automatically."
+            );
+            eprintln!("This grants that SSH account full administrator access without a password.");
+            eprint!("Enable it now? [Y/n] ");
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "" | "y" | "yes"
+            ) {
+                eprintln!(
+                    "Opening one SSH session; enter the host password at the remote sudo prompt."
+                );
+                configure_passwordless_sudo_interactively(transport)?;
+                eprintln!("✓ passwordless sudo configured");
+                Ok(())
+            } else {
+                Err(CiaoError::Config(format!(
+                    "deployment needs passwordless sudo; rerun from a terminal and accept the one-time setup, or configure it manually.\n\n{}",
+                    passwordless_sudo_instructions(transport)
+                )))
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

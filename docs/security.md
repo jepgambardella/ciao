@@ -15,7 +15,8 @@ it opens one standard OpenSSH session with `ssh -tt host sh -c ...`, where
 password never enters Ciao.
 CI and MCP have no terminal by design, so they also require passwordless
 `sudo -n`; when this policy is missing, Ciao prints a concrete `visudo`
-remediation for the configured SSH user and retry guidance. Ciao does not
+remediation for the configured SSH user. A human terminal deploy can apply the
+same policy automatically only after explicit confirmation; CI and MCP never
 modify sudoers.
 The automatic bootstrap installs only the documented native prerequisites and
 Caddy; the explicit `ciao host init` command invokes the same idempotent

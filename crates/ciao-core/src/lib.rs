@@ -3009,7 +3009,8 @@ pub fn check_remote_sudo(transport: &OpenSshTransport) -> Result<()> {
 
 /// Human-readable, one-time remediation for hosts whose SSH user can use
 /// sudo interactively but not from the independent sessions used by Ciao.
-/// This is deliberately guidance only: Ciao never edits sudoers itself.
+/// This is deliberately guidance only: the actual policy change is a separate
+/// interactive operation that requires explicit user confirmation.
 pub fn passwordless_sudo_instructions(transport: &OpenSshTransport) -> String {
     let user = ssh_login_user(&transport.target).unwrap_or_else(|| "<ssh-user>".to_owned());
     format!(
@@ -3021,10 +3022,11 @@ pub fn passwordless_sudo_instructions(transport: &OpenSshTransport) -> String {
 \nSave and exit the editor, then validate the policy:\n\
   sudo visudo -c\n\
   exit\n\
-Back on this computer, retry the same Ciao command. Ciao never reads or stores\
-the password and never edits sudoers automatically. This simple policy grants\
-the SSH account full passwordless administrator access; use a narrower policy\
-if your environment requires least privilege.",
+\nBack on this computer, retry the same Ciao command.\n\
+Ciao never reads or stores the password. The automatic setup changes sudoers\n\
+only after your explicit confirmation. This simple policy grants the SSH account\n\
+full passwordless administrator access; use a narrower policy if your environment\n\
+requires least privilege.",
         target = transport.target,
         user = user,
     )
@@ -3921,6 +3923,55 @@ pub fn init_host_interactively(transport: &OpenSshTransport) -> Result<HostInitR
     let script = host_init_script(&platform.os)?;
     run_interactive_ssh_script(transport, "initialize host dependencies", &script)?;
     Ok(host_init_result(platform))
+}
+
+fn passwordless_sudo_script(os: &HostOs, user: &str) -> Result<String> {
+    validate_owner("SSH user", user)?;
+    let rule = shell_quote(&format!("{user} ALL=(ALL) NOPASSWD: ALL"));
+    match os {
+        HostOs::Linux | HostOs::MacOs => Ok(format!(
+            r#"set -eu
+policy_line={rule}
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+if sudo grep -Eq '^[[:space:]]*(@|#)includedir[[:space:]]+.*sudoers[.]d' /etc/sudoers 2>/dev/null; then
+    printf '%s\n' "$policy_line" >"$tmp"
+    sudo visudo -cf "$tmp"
+    sudo install -d -m 0755 /etc/sudoers.d
+    sudo install -m 0440 "$tmp" /etc/sudoers.d/ciao
+else
+    sudo cat /etc/sudoers >"$tmp"
+    if ! grep -Fqx "$policy_line" "$tmp"; then
+        printf '\n%s\n' "$policy_line" >>"$tmp"
+    fi
+    sudo visudo -cf "$tmp"
+    sudo sh -c 'cat "$1" > /etc/sudoers' sh "$tmp"
+    sudo chmod 0440 /etc/sudoers
+fi
+sudo visudo -c
+sudo -n true
+printf 'ciao_passwordless_sudo=ready\n'
+"#,
+            rule = rule
+        )),
+        HostOs::Unknown(value) => Err(CiaoError::Config(format!(
+            "cannot configure passwordless sudo on unsupported OS `{value}`"
+        ))),
+    }
+}
+
+/// Configure the deploy SSH user's passwordless sudo policy after the user
+/// has approved it in the terminal. The password stays inside OpenSSH/sudo.
+pub fn configure_passwordless_sudo_interactively(transport: &OpenSshTransport) -> Result<()> {
+    let user = ssh_login_user(&transport.target).ok_or_else(|| {
+        CiaoError::Config(
+            "passwordless sudo setup needs an explicit user@host SSH target".to_owned(),
+        )
+    })?;
+    let platform = transport.inspect()?;
+    validate_host_init_platform(&platform)?;
+    let script = passwordless_sudo_script(&platform.os, &user)?;
+    run_interactive_ssh_script(transport, "configure passwordless sudo", &script)
 }
 
 fn runtime_init_script(
@@ -5982,7 +6033,19 @@ mod tests {
         assert!(instructions.contains("luca ALL=(ALL) NOPASSWD: ALL"));
         assert!(instructions.contains("sudo visudo"));
         assert!(instructions.contains("sudo visudo -c"));
-        assert!(instructions.contains("never edits sudoers automatically"));
+        assert!(instructions.contains("explicit confirmation"));
+    }
+
+    #[test]
+    fn passwordless_sudo_script_validates_before_installing_on_both_host_families() {
+        let linux = passwordless_sudo_script(&HostOs::Linux, "luca").unwrap();
+        assert!(linux.contains("sudo visudo -cf \"$tmp\""));
+        assert!(linux.contains("/etc/sudoers.d/ciao"));
+        assert!(linux.contains("sudo -n true"));
+
+        let macos = passwordless_sudo_script(&HostOs::MacOs, "luca").unwrap();
+        assert!(macos.contains("/etc/sudoers"));
+        assert!(macos.contains("sudo visudo -c"));
     }
 
     #[test]

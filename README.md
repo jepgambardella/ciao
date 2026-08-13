@@ -42,22 +42,22 @@ remain ordinary system services when the local binary is not running.
   deploy home` opens one standard interactive SSH session when preparation is
   needed and runs the complete bootstrap under that remote sudo TTY; type the
   host password at that prompt. `ciao host init` uses the same path explicitly.
-  Ciao never reads, stores or forwards that password. macOS hosts use
-  `launchd` and the same flow. Later deploy/lifecycle commands use several
-  non-interactive SSH sessions, so the SSH user must allow `sudo -n` (or an
-  equivalent administrator policy). GitHub Actions and MCP always require
-  passwordless `sudo -n`.
+  Ciao never reads, stores or forwards that password. If the SSH user does not
+  yet allow `sudo -n`, interactive `ciao deploy` asks once whether it should
+  configure that policy automatically, then asks for the host password in the
+  same standard SSH prompt. macOS hosts use `launchd` and the same flow. Later
+  deploy/lifecycle commands use several non-interactive SSH sessions, so the
+  SSH user must allow `sudo -n` (or an equivalent administrator policy).
+  GitHub Actions and MCP always require passwordless `sudo -n`.
 - `ciao deploy home` first performs a read-only host readiness check and, when
   needed, runs the same idempotent bootstrap as `ciao host init` before
   uploading the application. It installs Ciao's native prerequisites and Caddy
   on the target. On macOS it detects Homebrew in the standard Apple
   Silicon/Intel locations and installs it when missing. `ciao host init` remains
   available when you want to prepare a host explicitly.
-- If deploy reports that passwordless sudo is missing, follow the commands
-  printed by Ciao: open the sudo policy with `sudo visudo`, add the exact
-  SSH-user rule shown there, validate it with `visudo -c`, then rerun the
-  printed `ciao deploy ...` command. Ciao never asks for, stores or edits the
-  sudo policy automatically.
+- Non-interactive deploys (`--ci`, JSON and MCP) cannot ask for approval or a
+  password. Configure `sudo -n` once on those hosts, or run one normal
+  interactive deploy first.
 - The detected Rust, Go, Node or Bun runtime is installed only when that
   runtime is needed by a deploy. Static deployments do not install a runtime.
 
