@@ -137,6 +137,7 @@ pub struct HostInitResult {
 /// no-op implementation.
 pub trait ProgressReporter {
     fn started(&self, _step: &str) {}
+    fn updated(&self, _message: &str) {}
     fn finished(&self, _step: &str) {}
     fn failed(&self, _step: &str) {}
 }
@@ -2808,6 +2809,15 @@ impl OpenSshTransport {
     /// The local tar and remote extractor are separate processes; no shell
     /// pipeline is constructed from user input.
     pub fn upload_tar(&self, source: &Path, destination: &str) -> Result<()> {
+        self.upload_tar_with_progress(source, destination, &NoopProgressReporter)
+    }
+
+    pub fn upload_tar_with_progress(
+        &self,
+        source: &Path,
+        destination: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         if !source.is_dir() {
             return Err(CiaoError::Config(format!(
                 "project path `{}` is not a directory",
@@ -2889,7 +2899,8 @@ impl OpenSshTransport {
             message: "SSH stdin was not available".to_owned(),
             details: String::new(),
         })?;
-        let copy_result = io::copy(&mut tar_stdout, &mut remote_stdin);
+        reporter.updated("upload source (starting SSH transfer) ");
+        let copy_result = copy_upload_stream(&mut tar_stdout, &mut remote_stdin, reporter);
         drop(remote_stdin);
         let tar_output = tar.wait_with_output()?;
         let remote_output = remote.wait_with_output()?;
@@ -2901,7 +2912,12 @@ impl OpenSshTransport {
                 stderr: truncate(&String::from_utf8_lossy(&remote_output.stderr)),
             });
         }
-        copy_result?;
+        let transferred = copy_result.map_err(|error| CiaoError::Transport {
+            stage: "upload source over SSH".to_owned(),
+            message: error.to_string(),
+            details: "the local archive or the remote SSH extractor stopped accepting data"
+                .to_owned(),
+        })?;
         if !tar_output.status.success() {
             return Err(CiaoError::RemoteCommand {
                 stage: "local source archive".to_owned(),
@@ -2910,7 +2926,50 @@ impl OpenSshTransport {
                 stderr: truncate(&String::from_utf8_lossy(&tar_output.stderr)),
             });
         }
+        reporter.updated(&format!("upload source ({})", format_bytes(transferred)));
         Ok(())
+    }
+}
+
+fn copy_upload_stream(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    reporter: &dyn ProgressReporter,
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut transferred = 0_u64;
+    let mut last_update = Instant::now();
+    reporter.updated("upload source (0 B via SSH)");
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        transferred += read as u64;
+        if last_update.elapsed() >= Duration::from_millis(250) {
+            reporter.updated(&format!(
+                "upload source ({} via SSH)",
+                format_bytes(transferred)
+            ));
+            last_update = Instant::now();
+        }
+    }
+    Ok(transferred)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -4368,7 +4427,7 @@ fn deploy_unlocked(
                     shell_quote(&staging)
                 ),
             )?;
-            transport.upload_tar(source, &staging)?;
+            transport.upload_tar_with_progress(source, &staging, reporter)?;
             remote_script(
                 transport,
                 "finalize release",
@@ -6074,6 +6133,34 @@ mod tests {
         let macos = passwordless_sudo_script(&HostOs::MacOs, "luca").unwrap();
         assert!(macos.contains("/etc/sudoers"));
         assert!(macos.contains("sudo visudo -c"));
+    }
+
+    #[test]
+    fn upload_stream_reports_progress_and_preserves_bytes() {
+        let input = vec![b'x'; 150_000];
+        let mut reader = io::Cursor::new(input.clone());
+        let mut output = Vec::new();
+        let reporter = RecordingReporter::default();
+        let copied = copy_upload_stream(&mut reader, &mut output, &reporter).unwrap();
+        assert_eq!(copied, input.len() as u64);
+        assert_eq!(output, input);
+        assert!(reporter
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.contains("upload source")));
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ProgressReporter for RecordingReporter {
+        fn updated(&self, message: &str) {
+            self.messages.lock().unwrap().push(message.to_owned());
+        }
     }
 
     #[test]

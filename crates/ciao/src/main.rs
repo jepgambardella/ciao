@@ -263,6 +263,14 @@ impl ProgressReporter for TerminalProgress {
         self.finish(step, true);
     }
 
+    fn updated(&self, message: &str) {
+        if let Ok(current) = self.current.lock() {
+            if let Some(bar) = current.as_ref() {
+                bar.set_message(message.to_owned());
+            }
+        }
+    }
+
     fn failed(&self, step: &str) {
         self.finish(step, false);
     }
