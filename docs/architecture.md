@@ -29,17 +29,18 @@ The remote layout is intentionally ordinary:
 ```
 
 Linux uses a generated `ciao-<app>.service` and journald. macOS uses a
-generated LaunchDaemon plist. `ciao host init` runs its complete native
-bootstrap through one `ssh -tt host sh -c ...` session; the password stays
+generated LaunchDaemon plist. `ciao deploy` runs the complete native bootstrap
+when the readiness check finds missing prerequisites, through one
+`ssh -tt host sh -c ...` session; the password stays
 inside OpenSSH and the SSH user is preserved for Homebrew. Deploy/lifecycle, CI
 and MCP use independent non-interactive SSH commands and therefore require
 `sudo -n`. Ciao never stores or asks for a private key
 passphrase in its state. If the user opts into guided host linking, Ciao
 creates a standard local OpenSSH identity and stores only its path. There is
-no resident Ciao process on the remote host. Explicit
-host initialization installs Caddy through the native package manager and
-configures only Ciao's fragment import; a deploy with `--domain` invokes
-that initialization automatically.
+no resident Ciao process on the remote host. Host initialization installs Caddy
+through the native package manager and configures only Ciao's fragment import;
+the normal deploy path invokes that same idempotent initialization automatically
+when the host is not ready.
 
 For local `.ciao` development, macOS uses Homebrew's Caddy/dnsmasq services,
 `/etc/resolver/ciao`, and a tiny launchd job to restore its loopback alias;

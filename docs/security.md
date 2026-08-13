@@ -9,14 +9,15 @@ locally. Ciao stores only its path, never the private material in Ciao state,
 and never copies it to the target.
 Deploy/lifecycle operations use several independent SSH commands and therefore
 probe non-interactive `sudo -n`; they require the SSH user to allow it. The
-explicit `ciao host init` path is different: it opens one standard OpenSSH
-session with `ssh -tt host sh -c ...`, where `sudo -v` and the complete
-bootstrap share the same remote sudo TTY while the password never enters Ciao.
+automatic deploy bootstrap (and explicit `ciao host init` path) is different:
+it opens one standard OpenSSH session with `ssh -tt host sh -c ...`, where
+`sudo -v` and the complete bootstrap share the same remote sudo TTY while the
+password never enters Ciao.
 CI and MCP have no terminal by design, so they also require passwordless
 `sudo -n`; Ciao does not modify sudoers.
-The explicit `ciao host init` operation installs only the documented native
-prerequisites and Caddy; a domain deploy invokes the same idempotent operation
-before writing a Ciao-owned fragment.
+The automatic bootstrap installs only the documented native prerequisites and
+Caddy; the explicit `ciao host init` command invokes the same idempotent
+operation.
 
 The first host link reuses `~/.ssh/config`, the agent and existing keys. When
 those are not usable, the guided bootstrap asks OpenSSH to perform one normal

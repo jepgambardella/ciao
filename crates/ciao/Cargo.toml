@@ -13,3 +13,4 @@ ciao-core = { path = "../ciao-core" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+indicatif = "0.17"

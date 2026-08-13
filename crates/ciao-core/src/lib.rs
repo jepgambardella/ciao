@@ -132,6 +132,44 @@ pub struct HostInitResult {
     pub message: String,
 }
 
+/// Receives coarse-grained lifecycle events without coupling the core to a
+/// terminal UI. The CLI renders these as spinners; MCP, JSON and CI use the
+/// no-op implementation.
+pub trait ProgressReporter {
+    fn started(&self, _step: &str) {}
+    fn finished(&self, _step: &str) {}
+    fn failed(&self, _step: &str) {}
+}
+
+fn progress_step<T>(
+    reporter: &dyn ProgressReporter,
+    name: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    reporter.started(name);
+    match action() {
+        Ok(value) => {
+            reporter.finished(name);
+            Ok(value)
+        }
+        Err(error) => {
+            reporter.failed(name);
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopProgressReporter;
+
+impl ProgressReporter for NoopProgressReporter {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployHostMode {
+    NonInteractive,
+    Interactive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Runtime {
     Rust,
@@ -2969,6 +3007,117 @@ pub fn check_remote_sudo(transport: &OpenSshTransport) -> Result<()> {
         .map(|_| ())
 }
 
+/// Read-only check used by the normal deploy path. It deliberately does not
+/// use sudo: a host that needs bootstrap must still be able to reach the
+/// interactive one-session initializer before Ciao asks for a password.
+pub fn host_needs_initialization(transport: &OpenSshTransport) -> Result<bool> {
+    let platform = transport.inspect()?;
+    validate_host_init_platform(&platform)?;
+    let output = remote_script(
+        transport,
+        "check host readiness",
+        r#"set -eu
+missing=0
+for command in sudo tar curl; do
+    command -v "$command" >/dev/null 2>&1 || missing=1
+done
+case "$(uname -s)" in
+Linux)
+    command -v apt-get >/dev/null 2>&1 || missing=1
+    command -v gpg >/dev/null 2>&1 || missing=1
+    command -v caddy >/dev/null 2>&1 || missing=1
+    test -f /etc/caddy/Caddyfile || missing=1
+    grep -Fqx 'import /etc/caddy/ciao/*.caddy' /etc/caddy/Caddyfile 2>/dev/null || missing=1
+    ;;
+Darwin)
+    brew_ready=0
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+        if [ -x "$candidate" ]; then brew_ready=1; break; fi
+    done
+    [ "$brew_ready" -eq 1 ] || missing=1
+    command -v caddy >/dev/null 2>&1 || missing=1
+    ;;
+*) missing=1 ;;
+esac
+printf 'missing=%s\n' "$missing"
+"#,
+    )?;
+    Ok(output
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("missing=")?.parse::<u8>().ok())
+        .unwrap_or(1)
+        != 0)
+}
+
+/// Run host readiness and, when needed, the one-session interactive bootstrap
+/// before a normal terminal deployment. JSON, CI and MCP deliberately use the
+/// non-interactive deploy path in the CLI instead.
+pub fn prepare_host_for_deploy(
+    transport: &OpenSshTransport,
+    reporter: &dyn ProgressReporter,
+) -> Result<()> {
+    let needs_initialization = progress_step(reporter, "check host dependencies", || {
+        host_needs_initialization(transport)
+    })?;
+    if needs_initialization {
+        check_remote_sudo(transport).map_err(|error| {
+            if remote_sudo_password_required(&error) {
+                CiaoError::Config(
+                    "host dependencies are missing and this operation has no interactive terminal; configure passwordless sudo (`sudo -n`) for the SSH user"
+                        .to_owned(),
+                )
+            } else {
+                error
+            }
+        })?;
+        progress_step(reporter, "initialize host dependencies", || {
+            init_host(transport).map(|_| ())
+        })?;
+    }
+    match check_remote_sudo(transport) {
+        Ok(()) => Ok(()),
+        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
+            "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions; configure that policy for the SSH user and rerun `ciao deploy`"
+                .to_owned(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Interactive counterpart used only by the human-facing terminal command.
+/// The password remains inside OpenSSH/sudo; it is never passed through this
+/// API or retained by Ciao.
+pub fn prepare_host_for_deploy_interactive(
+    transport: &OpenSshTransport,
+    reporter: &dyn ProgressReporter,
+) -> Result<()> {
+    let needs_initialization = progress_step(reporter, "check host dependencies", || {
+        host_needs_initialization(transport)
+    })?;
+    if needs_initialization {
+        match check_remote_sudo(transport) {
+            Ok(()) => progress_step(reporter, "initialize host dependencies", || {
+                init_host(transport).map(|_| ())
+            })?,
+            Err(error) if remote_sudo_password_required(&error) => {
+                progress_step(reporter, "initialize host dependencies", || {
+                    init_host_interactively(transport).map(|_| ())
+                })?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match check_remote_sudo(transport) {
+        Ok(()) => Ok(()),
+        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
+            "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions; configure that policy for the SSH user and rerun `ciao deploy`"
+                .to_owned(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
     let mut process = Command::new("ssh");
     process
@@ -3010,10 +3159,13 @@ fn run_interactive_ssh_script(
     // install as root. `sudo -v` and every following `sudo -n` use this same
     // SSH TTY, so one native password prompt is enough.
     let mut process = interactive_ssh_command(transport);
+    let quiet_script = format!(
+        "log=$(mktemp /tmp/ciao-host-init.XXXXXX)\ntrap 'rm -f \"$log\"' EXIT\n{{\n{script}\n}} >\"$log\" 2>&1 || {{ status=$?; cat \"$log\" >&2; exit \"$status\"; }}\n"
+    );
     process
         .arg("sh")
         .arg("-c")
-        .arg(shell_quote(&format!("sudo -v\n{script}")))
+        .arg(shell_quote(&format!("sudo -v\n{quiet_script}")))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -3673,9 +3825,8 @@ printf 'ciao_host_init=ready\n'
 
 /// Install and configure the dependencies Ciao needs on a target host.
 ///
-/// This is an explicit administrative operation. A deploy that includes a
-/// domain calls it automatically; a domain-less deploy does not touch the
-/// package manager or Caddy.
+/// This remains available as an explicit idempotent operation; the normal
+/// terminal deploy path invokes the same bootstrap when readiness fails.
 pub fn init_host(transport: &OpenSshTransport) -> Result<HostInitResult> {
     let platform = transport.inspect()?;
     validate_host_init_platform(&platform)?;
@@ -3947,14 +4098,62 @@ pub fn deploy(
     domain: Option<&str>,
     dry_run: bool,
 ) -> Result<DeployResult> {
+    deploy_with_reporter(
+        transport,
+        source,
+        plan,
+        domain,
+        dry_run,
+        &NoopProgressReporter,
+    )
+}
+
+pub fn deploy_with_reporter(
+    transport: &OpenSshTransport,
+    source: &Path,
+    plan: &ProjectPlan,
+    domain: Option<&str>,
+    dry_run: bool,
+    reporter: &dyn ProgressReporter,
+) -> Result<DeployResult> {
+    deploy_with_mode(
+        transport,
+        source,
+        plan,
+        domain,
+        dry_run,
+        reporter,
+        DeployHostMode::NonInteractive,
+    )
+}
+
+pub fn deploy_with_mode(
+    transport: &OpenSshTransport,
+    source: &Path,
+    plan: &ProjectPlan,
+    domain: Option<&str>,
+    dry_run: bool,
+    reporter: &dyn ProgressReporter,
+    host_mode: DeployHostMode,
+) -> Result<DeployResult> {
     if dry_run {
-        return deploy_unlocked(transport, source, plan, domain, true);
+        return deploy_unlocked(transport, source, plan, domain, true, reporter);
     }
-    let platform = transport.inspect()?;
+    let platform = progress_step(reporter, "inspect host", || transport.inspect())?;
+    // A new host cannot acquire Ciao's root-owned deployment lock yet. Prepare
+    // it first, then serialize the release transaction with the normal lock.
+    match host_mode {
+        DeployHostMode::NonInteractive => prepare_host_for_deploy(transport, reporter)?,
+        DeployHostMode::Interactive => prepare_host_for_deploy_interactive(transport, reporter)?,
+    }
     let root = host_app_root(&platform.os);
-    acquire_deploy_lock(transport, &root, &plan.name)?;
-    let result = deploy_unlocked(transport, source, plan, domain, false);
-    let unlock_result = release_deploy_lock(transport, &root, &plan.name);
+    progress_step(reporter, "acquire deployment lock", || {
+        acquire_deploy_lock(transport, &root, &plan.name)
+    })?;
+    let result = deploy_unlocked(transport, source, plan, domain, false, reporter);
+    let unlock_result = progress_step(reporter, "release deployment lock", || {
+        release_deploy_lock(transport, &root, &plan.name)
+    });
     match (result, unlock_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), Ok(())) => Err(error),
@@ -3977,6 +4176,7 @@ fn deploy_unlocked(
     plan: &ProjectPlan,
     domain: Option<&str>,
     dry_run: bool,
+    reporter: &dyn ProgressReporter,
 ) -> Result<DeployResult> {
     if let Some(domain) = domain {
         validate_domain(domain)?;
@@ -4014,20 +4214,9 @@ fn deploy_unlocked(
             ),
         });
     }
-    let platform = transport.inspect()?;
+    let platform = progress_step(reporter, "prepare deployment", || transport.inspect())?;
     let root = host_app_root(&platform.os);
     let previous_release = read_current_release(transport, &root, &plan.name)?;
-    if domain.is_some() {
-        if let Err(error) = init_host(transport) {
-            return Err(CiaoError::Deployment {
-                stage: "host initialization".to_owned(),
-                message: error.to_string(),
-                previous_release: previous_release
-                    .clone()
-                    .unwrap_or_else(|| "none".to_owned()),
-            });
-        }
-    }
     let retained_domain = read_existing_domain(transport, &plan.name)?;
     let effective_domain = domain.or(retained_domain.as_deref());
     let port = if plan.app_type == AppType::Static {
@@ -4041,7 +4230,9 @@ fn deploy_unlocked(
             plan.port,
         )?)
     };
-    ensure_remote_layout(transport, &platform.os, &plan.name, &release)?;
+    progress_step(reporter, "prepare remote layout", || {
+        ensure_remote_layout(transport, &platform.os, &plan.name, &release)
+    })?;
     let staging = format!("/tmp/ciao-{}-{}", plan.name, release);
     let release_path = format!("{root}/{}/releases/{release}", plan.name);
     let user = service_user(transport, &platform.os, &plan.name)?;
@@ -4049,13 +4240,15 @@ fn deploy_unlocked(
         HostOs::MacOs => "staff".to_owned(),
         _ => user.clone(),
     };
-    if let Err(error) = ensure_runtime(
-        transport,
-        &platform.os,
-        &plan.runtime,
-        &user,
-        &format!("{root}/{}", plan.name),
-    ) {
+    if let Err(error) = progress_step(reporter, "prepare runtime", || {
+        ensure_runtime(
+            transport,
+            &platform.os,
+            &plan.runtime,
+            &user,
+            &format!("{root}/{}", plan.name),
+        )
+    }) {
         return Err(CiaoError::Deployment {
             stage: "runtime initialization".to_owned(),
             message: error.to_string(),
@@ -4065,47 +4258,55 @@ fn deploy_unlocked(
         });
     }
     let result = (|| {
-        remote_script(
-            transport,
-            "prepare upload staging",
-            &format!(
-                "set -eu\nsudo -n rm -rf {}\nsudo -n install -d -m 0755 {}\nsudo -n chown {}:{} {}\n",
-                shell_quote(&staging),
-                shell_quote(&staging),
-                shell_quote(&user),
-                shell_quote(&user_group),
-                shell_quote(&staging)
-            ),
-        )?;
-        transport.upload_tar(source, &staging)?;
-        remote_script(
-            transport,
-            "finalize release",
-            &format!(
-                "set -eu\nsudo -n install -d -m 0755 {}\nsudo -n mv {} {}\nsudo -n chown -R {} {}\n",
-                shell_quote(&format!("{root}/{}/releases", plan.name)),
-                shell_quote(&staging),
-                shell_quote(&release_path),
-                shell_quote(&user),
-                shell_quote(&release_path)
-            ),
-        )?;
-        let mut manifest = ReleaseManifest::from_plan(release.clone(), source, plan);
-        manifest.port = port;
-        write_remote_file(
-            transport,
-            &format!("{release_path}/ciao-manifest.toml"),
-            &manifest.to_toml()?,
-            &user,
-            "write release manifest",
-        )?;
-        if plan.app_type == AppType::Static {
-            harden_release(transport, &platform.os, &release_path)?;
+        progress_step(reporter, "upload source", || {
             remote_script(
                 transport,
-                "activate static release",
-                &switch_current_script(&platform.os, &root, &plan.name, &release_path),
+                "prepare upload staging",
+                &format!(
+                    "set -eu\nsudo -n rm -rf {}\nsudo -n install -d -m 0755 {}\nsudo -n chown {}:{} {}\n",
+                    shell_quote(&staging),
+                    shell_quote(&staging),
+                    shell_quote(&user),
+                    shell_quote(&user_group),
+                    shell_quote(&staging)
+                ),
             )?;
+            transport.upload_tar(source, &staging)?;
+            remote_script(
+                transport,
+                "finalize release",
+                &format!(
+                    "set -eu\nsudo -n install -d -m 0755 {}\nsudo -n mv {} {}\nsudo -n chown -R {} {}\n",
+                    shell_quote(&format!("{root}/{}/releases", plan.name)),
+                    shell_quote(&staging),
+                    shell_quote(&release_path),
+                    shell_quote(&user),
+                    shell_quote(&release_path)
+                ),
+            )?;
+            Ok::<(), CiaoError>(())
+        })?;
+        let mut manifest = ReleaseManifest::from_plan(release.clone(), source, plan);
+        manifest.port = port;
+        progress_step(reporter, "write release manifest", || {
+            write_remote_file(
+                transport,
+                &format!("{release_path}/ciao-manifest.toml"),
+                &manifest.to_toml()?,
+                &user,
+                "write release manifest",
+            )
+        })?;
+        if plan.app_type == AppType::Static {
+            progress_step(reporter, "activate static release", || {
+                harden_release(transport, &platform.os, &release_path)?;
+                remote_script(
+                    transport,
+                    "activate static release",
+                    &switch_current_script(&platform.os, &root, &plan.name, &release_path),
+                )
+                .map(|_| ())
+            })?;
         } else {
             let port = port.expect("service plans have a port");
             let start_script = start_script(
@@ -4114,96 +4315,111 @@ fn deploy_unlocked(
                 port,
                 &format!("{root}/{}/shared/env", plan.name),
             )?;
-            write_remote_file(
-                transport,
-                &format!("{release_path}/start"),
-                &start_script,
-                &user,
-                "write release start script",
-            )?;
-            remote_script(
-                transport,
-                "make release executable",
-                &format!(
-                    "set -eu\nsudo -n chmod 0755 {}\n",
-                    shell_quote(&format!("{release_path}/start"))
-                ),
-            )?;
-            if let Some(install) = plan.install_command.as_deref() {
-                run_as_user_script(
+            progress_step(reporter, "prepare service release", || {
+                write_remote_file(
                     transport,
+                    &format!("{release_path}/start"),
+                    &start_script,
                     &user,
-                    "install dependencies",
-                    &command_script(install, &release_path)?,
+                    "write release start script",
                 )?;
+                remote_script(
+                    transport,
+                    "make release executable",
+                    &format!(
+                        "set -eu\nsudo -n chmod 0755 {}\n",
+                        shell_quote(&format!("{release_path}/start"))
+                    ),
+                )
+                .map(|_| ())
+            })?;
+            if let Some(install) = plan.install_command.as_deref() {
+                progress_step(reporter, "install dependencies", || {
+                    run_as_user_script(
+                        transport,
+                        &user,
+                        "install dependencies",
+                        &command_script(install, &release_path)?,
+                    )
+                })?;
             }
             if let Some(build) = plan.build_command.as_deref() {
-                run_as_user_script(
-                    transport,
-                    &user,
-                    "build",
-                    &command_script(build, &release_path)?,
-                )?;
+                progress_step(reporter, "build", || {
+                    run_as_user_script(
+                        transport,
+                        &user,
+                        "build",
+                        &command_script(build, &release_path)?,
+                    )
+                })?;
             }
             let candidate_unit = service_unit_name(&plan.name, true);
-            if platform.os == HostOs::MacOs {
-                run_macos_candidate(transport, &user, &release_path, port, &plan.health)?;
-            } else {
+            progress_step(reporter, "candidate healthcheck", || {
+                if platform.os == HostOs::MacOs {
+                    run_macos_candidate(transport, &user, &release_path, port, &plan.health)
+                } else {
+                    install_service(
+                        transport,
+                        &platform.os,
+                        &candidate_unit,
+                        &user,
+                        &release_path,
+                        &format!("{root}/{}/shared/env", plan.name),
+                        true,
+                        "./start",
+                    )?;
+                    service_action(
+                        transport,
+                        &platform.os,
+                        &candidate_unit,
+                        LifecycleAction::Start,
+                    )?;
+                    remote_healthcheck(transport, port, &plan.health)?;
+                    service_action(
+                        transport,
+                        &platform.os,
+                        &candidate_unit,
+                        LifecycleAction::Stop,
+                    )?;
+                    remove_service(transport, &platform.os, &candidate_unit)
+                }
+            })?;
+            progress_step(reporter, "activate service release", || {
+                harden_release(transport, &platform.os, &release_path)?;
+                let stable_unit = service_unit_name(&plan.name, false);
                 install_service(
                     transport,
                     &platform.os,
-                    &candidate_unit,
+                    &stable_unit,
                     &user,
-                    &release_path,
+                    &format!("{root}/{}/current", plan.name),
                     &format!("{root}/{}/shared/env", plan.name),
-                    true,
+                    false,
                     "./start",
                 )?;
+                remote_script(
+                    transport,
+                    "activate release",
+                    &switch_current_script(&platform.os, &root, &plan.name, &release_path),
+                )?;
+                enable_service(transport, &platform.os, &stable_unit)?;
                 service_action(
                     transport,
                     &platform.os,
-                    &candidate_unit,
-                    LifecycleAction::Start,
+                    &stable_unit,
+                    LifecycleAction::Restart,
                 )?;
-                remote_healthcheck(transport, port, &plan.health)?;
-                service_action(
-                    transport,
-                    &platform.os,
-                    &candidate_unit,
-                    LifecycleAction::Stop,
-                )?;
-                remove_service(transport, &platform.os, &candidate_unit)?;
-            }
-            harden_release(transport, &platform.os, &release_path)?;
-            let stable_unit = service_unit_name(&plan.name, false);
-            install_service(
-                transport,
-                &platform.os,
-                &stable_unit,
-                &user,
-                &format!("{root}/{}/current", plan.name),
-                &format!("{root}/{}/shared/env", plan.name),
-                false,
-                "./start",
-            )?;
-            remote_script(
-                transport,
-                "activate release",
-                &switch_current_script(&platform.os, &root, &plan.name, &release_path),
-            )?;
-            enable_service(transport, &platform.os, &stable_unit)?;
-            service_action(
-                transport,
-                &platform.os,
-                &stable_unit,
-                LifecycleAction::Restart,
-            )?;
-            remote_healthcheck(transport, port, &plan.health)?;
+                remote_healthcheck(transport, port, &plan.health)
+            })?;
         }
         if let Some(domain) = effective_domain {
-            configure_domain(transport, &plan.name, domain)?;
+            progress_step(reporter, "configure domain", || {
+                configure_domain(transport, &plan.name, domain)
+            })?;
         }
-        prune_releases(transport, &root, &plan.name, 5)?;
+        progress_step(reporter, "prune old releases", || {
+            prune_releases(transport, &root, &plan.name, 5)
+        })?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = result {

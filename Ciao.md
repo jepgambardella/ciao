@@ -561,11 +561,13 @@ The password is handled by OpenSSH; Ciao never receives or stores it. The
 normal OpenSSH path remains the default, and `--non-interactive` disables the
 prompt for automation.
 
-Privileged CLI operations follow the same boundary. `ciao host init` opens one
-`ssh -tt host sh -c ...` session, runs `sudo -v` and the complete bootstrap
-under the same remote sudo TTY, so the password stays inside OpenSSH. Deploy and lifecycle
-operations use independent non-interactive SSH commands and therefore require
-`sudo -n`; CI and MCP require it as well because they cannot safely prompt.
+Privileged CLI operations follow the same boundary. `ciao deploy` performs a
+read-only readiness check and, when needed, opens one `ssh -tt host sh -c ...`
+session that runs `sudo -v` and the complete bootstrap under the same remote
+sudo TTY, so the password stays inside OpenSSH. `ciao host init` invokes the
+same bootstrap explicitly. The remaining deploy and lifecycle operations then use independent
+non-interactive SSH commands and therefore require `sudo -n`; CI and MCP
+require it as well because they cannot safely prompt.
 
 A native SSH transport can be reconsidered later.
 
@@ -1739,7 +1741,7 @@ Commands should be safe to repeat.
 Example:
 
 ```bash
-ciao host init home
+ciao deploy home
 ```
 
 second run:

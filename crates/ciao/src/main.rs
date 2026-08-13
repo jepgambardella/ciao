@@ -1,5 +1,6 @@
 use ciao_core::*;
 use clap::{Args, Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -7,6 +8,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -220,6 +222,52 @@ enum DomainCommand {
     },
 }
 
+struct TerminalProgress {
+    current: Mutex<Option<ProgressBar>>,
+}
+
+impl TerminalProgress {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
+    fn finish(&self, step: &str, success: bool) {
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(bar) = current.take() {
+                bar.finish_with_message(format!("{} {step}", if success { "✓" } else { "✗" }));
+            }
+        }
+    }
+}
+
+impl ProgressReporter for TerminalProgress {
+    fn started(&self, step: &str) {
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(previous) = current.take() {
+                previous.finish_and_clear();
+            }
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner:.green} {msg}")
+                    .expect("static progress template"),
+            );
+            bar.enable_steady_tick(Duration::from_millis(90));
+            bar.set_message(step.to_owned());
+            *current = Some(bar);
+        }
+    }
+
+    fn finished(&self, step: &str) {
+        self.finish(step, true);
+    }
+
+    fn failed(&self, step: &str) {
+        self.finish(step, false);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let json_output = cli.json;
@@ -272,20 +320,32 @@ fn run(cli: Cli) -> Result<()> {
                 validate_identifier("app name", &app)?;
                 plan.name = app;
             }
-            if !args.dry_run {
-                if args.ci {
-                    require_noninteractive_sudo(&transport, "CI deployment")?;
-                } else {
-                    ensure_remote_sudo(&transport, cli.json, "deploying the application")?;
-                }
+            let progress = TerminalProgress::new();
+            let interactive_output =
+                !cli.json && !args.ci && io::stdin().is_terminal() && io::stderr().is_terminal();
+            if !args.dry_run && args.ci {
+                require_noninteractive_sudo(&transport, "CI deployment")?;
             }
-            let result = deploy(
+            let result = deploy_with_mode(
                 &transport,
                 &path,
                 &plan,
                 args.domain.as_deref(),
                 args.dry_run,
+                if !interactive_output {
+                    &NoopProgressReporter
+                } else {
+                    &progress
+                },
+                if interactive_output {
+                    DeployHostMode::Interactive
+                } else {
+                    DeployHostMode::NonInteractive
+                },
             )?;
+            if !cli.json && !args.ci && args.dry_run {
+                eprintln!("✓ dry-run complete");
+            }
             output(&result, cli.json, || result.message.clone());
             if !args.ci && !args.dry_run {
                 if let Err(error) = offer_github_setup(&path, &args.host, &result.app, cli.json) {
@@ -552,7 +612,7 @@ fn github_command(command: GithubCommand, json_output: bool) -> Result<()> {
 }
 
 fn offer_github_setup(path: &Path, host: &str, app: &str, json_output: bool) -> Result<()> {
-    if json_output || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if json_output || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Ok(());
     }
     let Some(repository) = detect_github_repository(path)? else {
@@ -1118,7 +1178,7 @@ fn ensure_remote_sudo(
         Ok(()) => Ok(()),
         Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
             format!(
-                "{operation} needs sudo without a prompt across multiple SSH commands; run `ciao host init <host>` for the guided one-session bootstrap, then configure passwordless sudo (`sudo -n`) for this SSH user (Ciao never stores the password or edits sudoers)"
+                    "{operation} needs sudo without a prompt across multiple SSH commands; configure passwordless sudo (`sudo -n`) for this SSH user (Ciao never stores the password or edits sudoers)"
             ),
         )),
         Err(error) => Err(error),
@@ -1132,7 +1192,7 @@ fn init_host_from_terminal(
     match check_remote_sudo(transport) {
         Ok(()) => init_host(transport),
         Err(error) if remote_sudo_password_required(&error) => {
-            if json_output || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            if json_output || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
                 return Err(CiaoError::Config(
                     "host initialization needs the remote administrator password; run it from a terminal so Ciao can open one standard SSH sudo prompt"
                         .to_owned(),
@@ -1499,10 +1559,15 @@ fn mcp_call(name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
             if !dry_run {
                 require_noninteractive_sudo(&transport, "MCP deploy_app")?;
             }
-            Ok(
-                serde_json::to_value(deploy(&transport, &path, &plan, domain, dry_run)?)
-                    .map_err(ser_error)?,
-            )
+            Ok(serde_json::to_value(deploy_with_reporter(
+                &transport,
+                &path,
+                &plan,
+                domain,
+                dry_run,
+                &NoopProgressReporter,
+            )?)
+            .map_err(ser_error)?)
         }
         "get_status" => {
             let transport = mcp_transport_for(required_string(args, "host")?, "MCP get_status")?;
