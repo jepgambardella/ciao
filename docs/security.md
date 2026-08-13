@@ -21,6 +21,10 @@ modify sudoers.
 The automatic bootstrap installs only the documented native prerequisites and
 Caddy; the explicit `ciao host init` command invokes the same idempotent
 operation.
+If a terminal deploy is interrupted, Ciao may find its deployment marker on
+the next run. It asks before removing only that marker; it never kills remote
+processes and never removes a marker based only on its age. An actually active
+deployment must be allowed to finish.
 
 The first host link reuses `~/.ssh/config`, the agent and existing keys. When
 those are not usable, the guided bootstrap asks OpenSSH to perform one normal

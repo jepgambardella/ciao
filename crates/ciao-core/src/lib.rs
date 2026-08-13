@@ -4248,6 +4248,25 @@ pub fn deploy_with_mode(
     }
 }
 
+/// Remove only an interrupted deployment marker. This never stops processes;
+/// callers must ask the human to confirm that no other deployment is active.
+pub fn recover_deploy_lock(transport: &OpenSshTransport, app: &str) -> Result<()> {
+    validate_identifier("app name", app)?;
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    let lock = deploy_lock_path(&root, app);
+    remote_script(
+        transport,
+        "recover interrupted deployment lock",
+        &format!(
+            "set -eu\nif sudo -n test -d {lock}; then sudo -n rm -f {started}; sudo -n rmdir {lock}; fi\n",
+            lock = shell_quote(&lock),
+            started = shell_quote(&format!("{lock}/started")),
+        ),
+    )
+    .map(|_| ())
+}
+
 fn deploy_unlocked(
     transport: &OpenSshTransport,
     source: &Path,
@@ -5134,14 +5153,23 @@ fn deploy_lock_path(root: &str, app: &str) -> String {
 
 fn acquire_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
     validate_identifier("app name", app)?;
+    remote_script(
+        transport,
+        "acquire deployment lock",
+        &deploy_lock_script(root, app)?,
+    )
+    .map(|_| ())
+}
+
+fn deploy_lock_script(root: &str, app: &str) -> Result<String> {
+    validate_identifier("app name", app)?;
     let lock = deploy_lock_path(root, app);
-    let script = format!(
-        "set -eu\nsudo -n install -d -m 0755 {app_root}\nnow=$(date +%s)\nif sudo -n test -f {started}; then started_value=$(sudo -n cat {started} || true); case \"$started_value\" in ''|*[!0-9]*) ;; *) if [ \"$now\" -ge \"$started_value\" ] && [ $((now - started_value)) -gt 21600 ]; then sudo -n rm -f {started}; sudo -n rmdir {lock} 2>/dev/null || true; fi ;; esac; fi\nif ! sudo -n mkdir -m 0755 {lock} 2>/dev/null; then echo 'another Ciao deployment is already running for this app' >&2; exit 73; fi\nprintf '%s\\n' \"$now\" | sudo -n tee {started} >/dev/null\n",
+    Ok(format!(
+        "set -eu\nsudo -n install -d -m 0755 {app_root}\nnow=$(date +%s)\nstarted_value=''\nif sudo -n test -f {started}; then started_value=$(sudo -n cat {started} || true); fi\nif ! sudo -n mkdir -m 0755 {lock} 2>/dev/null; then age='unknown'; case \"$started_value\" in ''|*[!0-9]*) ;; *) age=$((now - started_value));; esac; echo \"another Ciao deployment is already running for this app (lock age: $age seconds)\" >&2; exit 73; fi\nprintf '%s\\n' \"$now\" | sudo -n tee {started} >/dev/null\n",
         app_root = shell_quote(&format!("{root}/{app}")),
         lock = shell_quote(&lock),
         started = shell_quote(&format!("{lock}/started")),
-    );
-    remote_script(transport, "acquire deployment lock", &script).map(|_| ())
+    ))
 }
 
 fn release_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
@@ -6046,6 +6074,16 @@ mod tests {
         let macos = passwordless_sudo_script(&HostOs::MacOs, "luca").unwrap();
         assert!(macos.contains("/etc/sudoers"));
         assert!(macos.contains("sudo visudo -c"));
+    }
+
+    #[test]
+    fn deploy_lock_script_reports_lock_age_without_automatic_removal() {
+        let script = deploy_lock_script("/var/lib/ciao/apps", "demo").unwrap();
+        assert!(script.contains("started_value=''"));
+        assert!(script.contains("lock age: $age seconds"));
+        assert!(script.contains("exit 73"));
+        assert!(script.contains("tee '/var/lib/ciao/apps/demo/.deploy-lock/started'"));
+        assert!(!script.contains("21600"));
     }
 
     #[test]

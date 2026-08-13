@@ -329,23 +329,32 @@ fn run(cli: Cli) -> Result<()> {
             if interactive_output && !args.dry_run {
                 offer_passwordless_sudo_setup(&transport)?;
             }
-            let result = deploy_with_mode(
-                &transport,
-                &path,
-                &plan,
-                args.domain.as_deref(),
-                args.dry_run,
-                if !interactive_output {
-                    &NoopProgressReporter
-                } else {
-                    &progress
-                },
-                if interactive_output {
-                    DeployHostMode::Interactive
-                } else {
-                    DeployHostMode::NonInteractive
-                },
-            )
+            let deploy = || {
+                deploy_with_mode(
+                    &transport,
+                    &path,
+                    &plan,
+                    args.domain.as_deref(),
+                    args.dry_run,
+                    if !interactive_output {
+                        &NoopProgressReporter
+                    } else {
+                        &progress
+                    },
+                    if interactive_output {
+                        DeployHostMode::Interactive
+                    } else {
+                        DeployHostMode::NonInteractive
+                    },
+                )
+            };
+            let result = match deploy() {
+                Err(error) if interactive_output && is_deploy_lock_error(&error) => {
+                    recover_interrupted_deploy(&transport, &plan.name)?;
+                    deploy()
+                }
+                result => result,
+            }
             .map_err(|error| actionable_deploy_error(error, &args.host))?;
             if !cli.json && !args.ci && args.dry_run {
                 eprintln!("✓ dry-run complete");
@@ -1183,6 +1192,41 @@ fn actionable_deploy_error(error: CiaoError, host: &str) -> CiaoError {
         ),
         other => other,
     }
+}
+
+fn is_deploy_lock_error(error: &CiaoError) -> bool {
+    matches!(
+        error,
+        CiaoError::RemoteCommand {
+            stage,
+            exit: 73,
+            ..
+        } if stage == "acquire deployment lock"
+    )
+}
+
+fn recover_interrupted_deploy(transport: &OpenSshTransport, app: &str) -> Result<()> {
+    eprintln!();
+    eprintln!("Ciao found an existing deployment lock for `{app}`.");
+    eprintln!(
+        "Ciao cannot tell whether another deployment is still active. If you started one, wait for it; otherwise this lock was probably left by an interrupted deploy."
+    );
+    eprint!("Remove the lock and resume this deploy? [Y/n] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ) {
+        return Err(CiaoError::Config(
+            "deployment lock kept; retry after the other deployment finishes, or run this deploy from a terminal to recover an interrupted lock"
+                .to_owned(),
+        ));
+    }
+    recover_deploy_lock(transport, app)?;
+    eprintln!("✓ interrupted deployment lock removed; resuming deploy");
+    Ok(())
 }
 
 fn offer_passwordless_sudo_setup(transport: &OpenSshTransport) -> Result<()> {
