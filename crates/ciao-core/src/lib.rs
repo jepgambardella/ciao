@@ -14,6 +14,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -2899,17 +2900,40 @@ impl OpenSshTransport {
             message: "SSH stdin was not available".to_owned(),
             details: String::new(),
         })?;
+        let tar_stderr = tar.stderr.take().ok_or_else(|| CiaoError::Transport {
+            stage: "upload".to_owned(),
+            message: "tar stderr was not available".to_owned(),
+            details: String::new(),
+        })?;
+        let remote_stdout = remote.stdout.take().ok_or_else(|| CiaoError::Transport {
+            stage: "upload".to_owned(),
+            message: "SSH stdout was not available".to_owned(),
+            details: String::new(),
+        })?;
+        let remote_stderr = remote.stderr.take().ok_or_else(|| CiaoError::Transport {
+            stage: "upload".to_owned(),
+            message: "SSH stderr was not available".to_owned(),
+            details: String::new(),
+        })?;
+        // Drain every child output while stdin is being copied. Waiting until
+        // after the upload can deadlock when tar or ssh fills a pipe buffer.
+        let tar_stderr_reader = spawn_pipe_reader(tar_stderr);
+        let remote_stdout_reader = spawn_pipe_reader(remote_stdout);
+        let remote_stderr_reader = spawn_pipe_reader(remote_stderr);
         reporter.updated("upload source (starting SSH transfer) ");
         let copy_result = copy_upload_stream(&mut tar_stdout, &mut remote_stdin, reporter);
         drop(remote_stdin);
-        let tar_output = tar.wait_with_output()?;
-        let remote_output = remote.wait_with_output()?;
-        if !remote_output.status.success() {
+        let tar_status = tar.wait()?;
+        let remote_status = remote.wait()?;
+        let tar_stderr = join_pipe_reader(tar_stderr_reader, "tar stderr")?;
+        let remote_stdout = join_pipe_reader(remote_stdout_reader, "SSH stdout")?;
+        let remote_stderr = join_pipe_reader(remote_stderr_reader, "SSH stderr")?;
+        if !remote_status.success() {
             return Err(CiaoError::RemoteCommand {
                 stage: "remote source extraction".to_owned(),
-                exit: exit_code(remote_output.status),
-                stdout: truncate(&String::from_utf8_lossy(&remote_output.stdout)),
-                stderr: truncate(&String::from_utf8_lossy(&remote_output.stderr)),
+                exit: exit_code(remote_status),
+                stdout: truncate(&String::from_utf8_lossy(&remote_stdout)),
+                stderr: truncate(&String::from_utf8_lossy(&remote_stderr)),
             });
         }
         let transferred = copy_result.map_err(|error| CiaoError::Transport {
@@ -2918,17 +2942,43 @@ impl OpenSshTransport {
             details: "the local archive or the remote SSH extractor stopped accepting data"
                 .to_owned(),
         })?;
-        if !tar_output.status.success() {
+        if !tar_status.success() {
             return Err(CiaoError::RemoteCommand {
                 stage: "local source archive".to_owned(),
-                exit: exit_code(tar_output.status),
+                exit: exit_code(tar_status),
                 stdout: String::new(),
-                stderr: truncate(&String::from_utf8_lossy(&tar_output.stderr)),
+                stderr: truncate(&String::from_utf8_lossy(&tar_stderr)),
             });
         }
         reporter.updated(&format!("upload source ({})", format_bytes(transferred)));
         Ok(())
     }
+}
+
+fn spawn_pipe_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>, stream: &str) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| CiaoError::Transport {
+            stage: "upload".to_owned(),
+            message: format!("{stream} reader thread panicked"),
+            details: String::new(),
+        })?
+        .map_err(|error| CiaoError::Transport {
+            stage: "upload".to_owned(),
+            message: format!("could not read {stream}: {error}"),
+            details: String::new(),
+        })
 }
 
 fn copy_upload_stream(
