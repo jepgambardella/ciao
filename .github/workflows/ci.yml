@@ -13,6 +13,7 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - run: cargo fmt --all -- --check
+      - run: sh -n install.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
       - name: CLI and MCP vertical smoke test

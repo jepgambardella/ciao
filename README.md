@@ -1,219 +1,141 @@
-# Ciao
+<div align="center">
+  <h1>Ciao</h1>
+  <p><strong>Write apps. Ship it. Ciao.</strong></p>
+  <p>
+    <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584?logo=rust&logoColor=white" alt="Built with Rust"></a>
+    <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-supported-111111?logo=apple&logoColor=white" alt="macOS supported"></a>
+    <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black" alt="Linux supported"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-personal_use_only-5c6ac4" alt="Personal use only"></a>
+  </p>
+</div>
 
-> Ship apps. Skip the ops.
+Ciao deploys your app from your computer to your server.
 
-Ciao is a local CLI and stdio MCP server for deploying small Rust, Go,
-Bun, Node and static applications to a Linux or macOS host over the installed
-OpenSSH client. Service releases are immutable and run as ordinary systemd or
-launchd services; Ciao does not leave a daemon on the host.
-
-The intended workflow is:
+One command:
 
 ```bash
-cargo install --path crates/ciao
-ciao host add home user@server
-cd my-project
-ciao inspect
+cd my-app
 ciao deploy home
-ciao status home my-project
-ciao logs home my-project
-ciao rollback home my-project
-ciao apps home
-ciao releases home my-project
 ```
 
-No Ciao daemon, management port, private-key database, container runtime or
-remote database is installed. Applications run as a dedicated Unix user and
-remain ordinary system services when the local binary is not running.
+Ciao uses SSH. It uses systemd on Linux and launchd on macOS. It installs the
+needed host tools. It keeps the old release active until the new release is
+ready.
 
-## Requirements
+## Install
 
-- Rust 1.80 or newer to build Ciao.
-- An OpenSSH client locally and an SSH account on the target.
-- `ciao host add` first reuses the normal OpenSSH configuration, agent and
-  existing keys. If that login is not ready, run it from a terminal and Ciao
-  offers a one-time guided bootstrap: it creates a standard Ed25519 identity
-  under `~/.ssh/ciao/`, asks OpenSSH to authenticate once with the server
-  password, installs only the public key, and verifies key-only access. The
-  password is handled by OpenSSH and is never read or stored by Ciao. Use
-  `--non-interactive` to fail instead of prompting, or `--setup-key` to force
-  the guided identity for a host.
-- Linux hosts need `systemd` and an SSH account allowed to use `sudo`. `ciao
-  deploy home` opens one standard interactive SSH session when preparation is
-  needed and runs the complete bootstrap under that remote sudo TTY; type the
-  host password at that prompt. `ciao host init` uses the same path explicitly.
-  Ciao never reads, stores or forwards that password. If the SSH user does not
-  yet allow `sudo -n`, interactive `ciao deploy` asks once whether it should
-  configure that policy automatically, then asks for the host password in the
-  same standard SSH prompt. macOS hosts use `launchd` and the same flow. Later
-  deploy/lifecycle commands use several non-interactive SSH sessions, so the
-  SSH user must allow `sudo -n` (or an equivalent administrator policy).
-  GitHub Actions and MCP always require passwordless `sudo -n`.
-- `ciao deploy home` first performs a read-only host readiness check and, when
-  needed, runs the same idempotent bootstrap as `ciao host init` before
-  uploading the application. It installs Ciao's native prerequisites and Caddy
-  on the target. On macOS it detects Homebrew in the standard Apple
-  Silicon/Intel locations and installs it when missing. `ciao host init` remains
-  available when you want to prepare a host explicitly.
-- Non-interactive deploys (`--ci`, JSON and MCP) cannot ask for approval or a
-  password. Configure `sudo -n` once on those hosts, or run one normal
-  interactive deploy first.
-- The detected Rust, Go, Node or Bun runtime is installed only when that
-  runtime is needed by a deploy. Static deployments do not install a runtime.
+The public installer will be:
 
-## Configuration
-
-Hosts are stored in `~/.config/ciao/config.toml`:
-
-```toml
-[hosts.home]
-ssh = "user@server"
-# Added only when the guided SSH bootstrap is used:
-# identity_file = "/Users/me/.ssh/ciao/home_ed25519"
-
-[mcp]
-profile = "operator"
+```bash
+curl -fsSL https://raw.githubusercontent.com/jepgambardella/ciao/main/install.sh | sh
 ```
 
-The project can opt into a small `ciao.toml` when detection is not enough:
+The GitHub repository is private during development. From this checkout, use:
 
-```toml
-[app]
-name = "my-api"
-
-[build]
-install = "bun install --frozen-lockfile"
-command = "bun run build"
-
-[run]
-command = "bun start"
-
-[health]
-path = "/health"
-expected_status = 200
-timeout = "10s"
+```bash
+./install.sh --local
 ```
 
-For local development, the same file can customize only what is needed:
+The installer puts Ciao in `~/.local/bin` and adds that directory to your
+shell path. It works on macOS and Linux. It does not need Homebrew.
 
-```toml
-[dev]
-name = "admin"
-port = 41001
-command = "bun run dev"
+## First deploy
+
+Add a host once:
+
+```bash
+ciao host add home user@server
 ```
 
-`[build]` and `[run]` commands are application commands. They are sent to the
-host as stdin to a fixed `sh -s` invocation; Ciao never builds an SSH
-command by concatenating host or application identifiers.
+Then deploy:
+
+```bash
+cd my-app
+ciao deploy home
+```
+
+The first deploy checks the host. It installs missing tools, including Caddy.
+If SSH needs a password, Ciao opens the normal SSH prompt. Ciao does not read
+or save the password.
+
+Use a normal SSH key for later commands. Ciao can create the key and install
+the public key during the guided host setup.
+
+## Daily commands
+
+```bash
+ciao status home my-app
+ciao logs home my-app
+ciao restart home my-app
+ciao rollback home my-app
+```
+
+Deploys are immutable. A failed build or health check does not replace the
+active release. If a deploy is interrupted, Ciao removes its temporary state
+or offers a safe lock recovery on the next deploy.
+
+## Supported apps
+
+- Rust
+- Go
+- Bun
+- Node
+- Static sites
+
+Ciao detects the project. Add `ciao.toml` only when you need custom build,
+run, health check, domain or environment settings.
 
 ## Local development
 
-Run this from a supported project:
+Run an app locally with a stable `.ciao` address:
 
 ```bash
 ciao dev
 ```
 
-Ciao installs and configures Homebrew (macOS when absent), dnsmasq and
-Caddy on the first run. It creates one resolver for the whole namespace:
-`*.ciao -> 127.0.0.1`. There is no per-project `/etc/hosts` edit. The project
-name becomes a stable URL such as `http://my-api.ciao`; an internal port is
-chosen and persisted in the local configuration. If a preferred port is
-occupied, Ciao selects another free port automatically.
-`ciao dev --name admin` overrides the local name without changing project
-metadata.
+Ciao configures the local DNS and Caddy setup. A project named `my-app` uses
+`http://my-app.ciao`. The setup is automatic and can be customized later.
 
-The local process runs in the foreground. Caddy owns the HTTP entrypoint and
-routes the Host header to the selected loopback port. Static projects keep
-their Caddy route after the command exits; service routes are removed when the
-process stops. The local setup uses native OS services and is safe to repeat.
+## GitHub and Tailscale
 
-## Safety model
-
-- Host and application identifiers are validated before becoming paths or
-  service names.
-- SSH options are fixed. Ciao does not keep a private-key store or copy
-  private keys to a target; an optional guided bootstrap creates a normal
-  user-owned OpenSSH key locally and stores only its path in Ciao config.
-- Deployments upload to a new staging directory, build there, health-check a
-  candidate service, and only then replace `current`. Build and package-manager
-  caches live in the host cache hierarchy, separate from releases and user
-  home directories. If a domain is supplied,
-  Ciao initializes Caddy before writing its own fragment.
-- Failed builds and health checks remove only the new release and leave the
-  previous service active.
-- A normal Ctrl-C cancels the current operation, terminates its local upload
-  children, releases the remote deployment lock, and removes the incomplete
-  candidate. A forced process kill cannot run cleanup; the next deploy offers
-  a safe lock-recovery prompt.
-- Secrets set with `env set` are sent over stdin, written with mode `0600`, and
-  are not printed.
-- MCP exposes deploy/status/log/restart/rollback concepts, never arbitrary
-  shell execution.
-
-## Current scope
-
-The implemented path is project detection, SSH host inspection, automatic host
-bootstrap, immutable release deployment, health checking, service lifecycle,
-rollback, environment updates, Caddy domain fragments, app/release listing, a
-local `.ciao` development resolver and proxy, a temporary localhost dashboard,
-and the local MCP surface. Static deployments produce an immutable release and
-manifest. Cloudflare Tunnel provisioning is not implemented in v0.1: point an
-existing `cloudflared` tunnel configuration at the managed localhost port, or
-add that narrow adapter separately. Ciao does not manage Cloudflare
-accounts, DNS, tunnel credentials or the remote `cloudflared` service.
-
-Run the local checks with `cargo fmt --all -- --check`, `cargo clippy
---workspace --all-targets -- -D warnings`, and `cargo test --workspace
---all-targets`. CI also builds the CLI, exercises project detection plus the
-MCP stdio handshake against a temporary fixture, and tests natively on
-Apple Silicon. SSH deployment tests require a separately provisioned
-disposable host; see [TESTING.md](TESTING.md). Live tests must never reboot a
-host.
-
-See [docs/architecture.md](docs/architecture.md), [docs/security.md](docs/security.md),
-[docs/local_ciao_domain.md](docs/local_ciao_domain.md),
-[GitHub/Tailscale auto-deploy](docs/Ciao_GitHub_Tailscale_Autodeploy.md), and the
-product source of truth in [Ciao.md](Ciao.md).
-
-## GitHub auto-deploy
-
-After a successful manual deploy, configure the optional GitHub Actions path
-explicitly from the project directory:
+After a manual deploy, enable optional private-network auto-deploy:
 
 ```bash
 ciao github setup --host home
 ```
 
-The setup detects the GitHub repository, reuses Tailscale when it is already
-installed, installs it when it is missing, and reads the target's Tailscale
-address. If the local or target node needs sign-in, Ciao starts the login,
-opens the Tailscale page in the browser, and waits for completion; the user
-does not need to type `tailscale up`. It then installs a repository-specific
-Ed25519 deploy key, copies the already trusted OpenSSH `known_hosts` entry,
-creates a
-repository-scoped Tailscale OIDC identity and writes
-`.github/workflows/ciao-deploy.yml`. It never stores the Tailscale bootstrap
-token or the private key in Ciao state. Use `ciao github status` to inspect the
-link and `ciao github regenerate` after an explicit Ciao upgrade.
+Ciao reuses Tailscale when it exists. Otherwise it installs it and guides the
+sign-in in a browser. GitHub Actions then runs the same deploy engine over
+Tailscale and SSH.
 
-Because this repository is private, setup also needs a read-only GitHub token
-with read access to `jepgambardella/ciao`, supplied through
-`CIAO_GITHUB_TOKEN` (or `--ciao-github-token-stdin`). The token is stored only
-as the target repository's Actions secret so the runner can checkout the pinned
-Ciao source; it is never written to the generated workflow.
+See [the GitHub and Tailscale guide](docs/Ciao_GitHub_Tailscale_Autodeploy.md).
 
-The generated workflow runs `ciao deploy --ci` with the same deploy engine as a
-manual deployment. It uses GitHub OIDC plus Tailscale, strict host-key checking,
-GitHub concurrency and Ciao's remote deployment lock. See
-[the integration design](docs/Ciao_GitHub_Tailscale_Autodeploy.md) for the
-security model and manual recovery paths.
+## Safety
+
+Ciao does not install a remote daemon. It does not store private SSH keys. It
+does not expose app ports by default. It does not offer a generic remote shell
+through MCP. Secrets are sent over SSH and are not printed.
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Security](docs/security.md)
+- [Local `.ciao` domains](docs/local_ciao_domain.md)
+- [Testing](TESTING.md)
+- [Product source of truth](Ciao.md)
+
+Run the checks:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+```
 
 ## License
 
-Copyright © 2026 Luca La Barbera. Ciao is source-available for
-non-commercial use under the [PolyForm Noncommercial License 1.0.0](LICENSE)
-(see [NOTICE](NOTICE) for copyright attribution).
-Commercial use requires a separate written license from Luca La Barbera;
-contact the author through the project repository.
+Copyright © 2026 Luca La Barbera.
+
+Ciao is available for personal, non-commercial use under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use needs a
+separate written license from Luca La Barbera. See [NOTICE](NOTICE).
