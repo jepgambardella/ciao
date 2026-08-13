@@ -53,6 +53,11 @@ remain ordinary system services when the local binary is not running.
   on the target. On macOS it detects Homebrew in the standard Apple
   Silicon/Intel locations and installs it when missing. `ciao host init` remains
   available when you want to prepare a host explicitly.
+- If deploy reports that passwordless sudo is missing, follow the commands
+  printed by Ciao: open the sudo policy with `sudo visudo`, add the exact
+  SSH-user rule shown there, validate it with `visudo -c`, then rerun the
+  printed `ciao deploy ...` command. Ciao never asks for, stores or edits the
+  sudo policy automatically.
 - The detected Rust, Go, Node or Bun runtime is installed only when that
   runtime is needed by a deploy. Static deployments do not install a runtime.
 

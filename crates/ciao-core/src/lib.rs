@@ -3007,6 +3007,29 @@ pub fn check_remote_sudo(transport: &OpenSshTransport) -> Result<()> {
         .map(|_| ())
 }
 
+/// Human-readable, one-time remediation for hosts whose SSH user can use
+/// sudo interactively but not from the independent sessions used by Ciao.
+/// This is deliberately guidance only: Ciao never edits sudoers itself.
+pub fn passwordless_sudo_instructions(transport: &OpenSshTransport) -> String {
+    let user = ssh_login_user(&transport.target).unwrap_or_else(|| "<ssh-user>".to_owned());
+    format!(
+        "Simple one-time fix on the target host ({target}):\n\
+  ssh {target}\n\
+  sudo visudo\n\
+\nAdd this line in the editor:\n\
+  {user} ALL=(ALL) NOPASSWD: ALL\n\
+\nSave and exit the editor, then validate the policy:\n\
+  sudo visudo -c\n\
+  exit\n\
+Back on this computer, retry the same Ciao command. Ciao never reads or stores\
+the password and never edits sudoers automatically. This simple policy grants\
+the SSH account full passwordless administrator access; use a narrower policy\
+if your environment requires least privilege.",
+        target = transport.target,
+        user = user,
+    )
+}
+
 /// Read-only check used by the normal deploy path. It deliberately does not
 /// use sudo: a host that needs bootstrap must still be able to reach the
 /// interactive one-session initializer before Ciao asks for a password.
@@ -3063,10 +3086,10 @@ pub fn prepare_host_for_deploy(
     if needs_initialization {
         check_remote_sudo(transport).map_err(|error| {
             if remote_sudo_password_required(&error) {
-                CiaoError::Config(
-                    "host dependencies are missing and this operation has no interactive terminal; configure passwordless sudo (`sudo -n`) for the SSH user"
-                        .to_owned(),
-                )
+                CiaoError::Config(format!(
+                    "host dependencies are missing and this operation has no interactive terminal.\n\n{}",
+                    passwordless_sudo_instructions(transport)
+                ))
             } else {
                 error
             }
@@ -3078,8 +3101,10 @@ pub fn prepare_host_for_deploy(
     match check_remote_sudo(transport) {
         Ok(()) => Ok(()),
         Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
-            "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions; configure that policy for the SSH user and rerun `ciao deploy`"
-                .to_owned(),
+            format!(
+                "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions.\n\n{}",
+                passwordless_sudo_instructions(transport)
+            ),
         )),
         Err(error) => Err(error),
     }
@@ -3111,8 +3136,10 @@ pub fn prepare_host_for_deploy_interactive(
     match check_remote_sudo(transport) {
         Ok(()) => Ok(()),
         Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
-            "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions; configure that policy for the SSH user and rerun `ciao deploy`"
-                .to_owned(),
+            format!(
+                "host preparation completed, but deployment needs passwordless sudo (`sudo -n`) across multiple SSH sessions.\n\n{}",
+                passwordless_sudo_instructions(transport)
+            ),
         )),
         Err(error) => Err(error),
     }
@@ -5945,6 +5972,17 @@ mod tests {
             stderr: "sudo: user is not allowed to run sudo".to_owned(),
         };
         assert!(!remote_sudo_password_required(&policy_error));
+    }
+
+    #[test]
+    fn passwordless_sudo_instructions_name_the_target_user_and_validation_steps() {
+        let transport = OpenSshTransport::new("luca@example.test").unwrap();
+        let instructions = passwordless_sudo_instructions(&transport);
+        assert!(instructions.contains("ssh luca@example.test"));
+        assert!(instructions.contains("luca ALL=(ALL) NOPASSWD: ALL"));
+        assert!(instructions.contains("sudo visudo"));
+        assert!(instructions.contains("sudo visudo -c"));
+        assert!(instructions.contains("never edits sudoers automatically"));
     }
 
     #[test]

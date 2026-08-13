@@ -342,7 +342,8 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     DeployHostMode::NonInteractive
                 },
-            )?;
+            )
+            .map_err(|error| actionable_deploy_error(error, &args.host))?;
             if !cli.json && !args.ci && args.dry_run {
                 eprintln!("✓ dry-run complete");
             }
@@ -1162,10 +1163,22 @@ fn transport_for(name: &str) -> Result<OpenSshTransport> {
 fn require_noninteractive_sudo(transport: &OpenSshTransport, operation: &str) -> Result<()> {
     match check_remote_sudo(transport) {
         Ok(()) => Ok(()),
-        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(format!(
-            "{operation} needs remote administrator privileges, but sudo requires a password; configure passwordless sudo for the SSH user (required by CI/MCP)"
-        ))),
+        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
+            format!(
+                "{operation} needs remote administrator privileges, but sudo requires a password.\n\n{}",
+                passwordless_sudo_instructions(transport)
+            ),
+        )),
         Err(error) => Err(error),
+    }
+}
+
+fn actionable_deploy_error(error: CiaoError, host: &str) -> CiaoError {
+    match error {
+        CiaoError::Config(message) if message.contains("passwordless sudo") => CiaoError::Config(
+            format!("{message}\n\nThen retry on this computer:\n  ciao deploy {host}"),
+        ),
+        other => other,
     }
 }
 
@@ -1176,11 +1189,10 @@ fn ensure_remote_sudo(
 ) -> Result<()> {
     match check_remote_sudo(transport) {
         Ok(()) => Ok(()),
-        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(
-            format!(
-                    "{operation} needs sudo without a prompt across multiple SSH commands; configure passwordless sudo (`sudo -n`) for this SSH user (Ciao never stores the password or edits sudoers)"
-            ),
-        )),
+        Err(error) if remote_sudo_password_required(&error) => Err(CiaoError::Config(format!(
+            "{operation} needs sudo without a prompt across multiple SSH commands.\n\n{}",
+            passwordless_sudo_instructions(transport)
+        ))),
         Err(error) => Err(error),
     }
 }
