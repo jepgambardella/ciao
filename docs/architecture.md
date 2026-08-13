@@ -26,7 +26,14 @@ The remote layout is intentionally ordinary:
   releases/<release>/
   current -> releases/<release>
   shared/env
+
+/var/cache/ciao/<app>/
+  build and package-manager cache (owned by the app user)
 ```
+
+On macOS the corresponding cache is `/Library/Caches/Ciao/<app>/`. Build and
+install commands use that directory as `HOME`; release contents remain
+immutable and the user's personal home directory is never used.
 
 Linux uses a generated `ciao-<app>.service` and journald. macOS uses a
 generated LaunchDaemon plist. `ciao deploy` runs the complete native bootstrap

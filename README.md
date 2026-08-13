@@ -137,10 +137,16 @@ process stops. The local setup uses native OS services and is safe to repeat.
   private keys to a target; an optional guided bootstrap creates a normal
   user-owned OpenSSH key locally and stores only its path in Ciao config.
 - Deployments upload to a new staging directory, build there, health-check a
-  candidate service, and only then replace `current`. If a domain is supplied,
+  candidate service, and only then replace `current`. Build and package-manager
+  caches live in the host cache hierarchy, separate from releases and user
+  home directories. If a domain is supplied,
   Ciao initializes Caddy before writing its own fragment.
 - Failed builds and health checks remove only the new release and leave the
   previous service active.
+- A normal Ctrl-C cancels the current operation, terminates its local upload
+  children, releases the remote deployment lock, and removes the incomplete
+  candidate. A forced process kill cannot run cleanup; the next deploy offers
+  a safe lock-recovery prompt.
 - Secrets set with `env set` are sent over stdin, written with mode `0600`, and
   are not printed.
 - MCP exposes deploy/status/log/restart/rollback concepts, never arbitrary

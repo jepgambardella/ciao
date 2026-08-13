@@ -687,6 +687,17 @@ Remote layout:
     data/
 ```
 
+Build and package-manager caches are kept outside releases:
+
+```text
+Linux   /var/cache/ciao/<app>/
+macOS   /Library/Caches/Ciao/<app>/
+```
+
+The cache is owned by the per-app service user and is used as `HOME` only
+during install/build. Ciao never uses `/dev` or the operator's personal home
+directory for deployment state.
+
 Never overwrite the active release in place.
 
 This makes rollback simple and safe.

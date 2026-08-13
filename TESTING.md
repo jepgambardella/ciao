@@ -26,6 +26,11 @@ for the fixture application. Exercise first deploy, a second immutable
 release, failed build and health-check preservation, status/logs, restart
 after killing the process, rollback, and release pruning. Verify the host
 state after every operation and clean up only the fixture application.
+Also interrupt one deploy with a normal Ctrl-C during upload or install and
+verify that local `ciao`/`tar`/`ssh` children, remote upload/build processes,
+the deployment lock, and the candidate staging/release directory are gone.
+Do not use SIGKILL for this check; a forced kill cannot execute cleanup and is
+covered by the next-deploy lock recovery prompt.
 
 For a temporary manual test, grant only the fixture account a short-lived
 `NOPASSWD` rule, verify `sudo -n true`, run the vertical slice, then revoke the

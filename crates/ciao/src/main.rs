@@ -277,6 +277,13 @@ impl ProgressReporter for TerminalProgress {
 }
 
 fn main() {
+    if let Err(error) = ctrlc::set_handler(|| {
+        ciao_core::request_cancellation();
+    }) {
+        eprintln!("✗ could not install the Ctrl-C handler: {error}");
+        std::process::exit(1);
+    }
+    ciao_core::reset_cancellation();
     let cli = Cli::parse();
     let json_output = cli.json;
     if let Err(error) = run(cli) {

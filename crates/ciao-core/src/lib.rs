@@ -13,7 +13,8 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -75,6 +76,20 @@ pub enum CiaoError {
 }
 
 pub type Result<T> = std::result::Result<T, CiaoError>;
+
+static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_cancellation() {
+    CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn cancellation_requested() -> bool {
+    CANCELLATION_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub fn reset_cancellation() {
+    CANCELLATION_REQUESTED.store(false, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
@@ -141,9 +156,42 @@ pub trait ProgressReporter {
     fn updated(&self, _message: &str) {}
     fn finished(&self, _step: &str) {}
     fn failed(&self, _step: &str) {}
+    fn cancelled(&self) -> bool {
+        cancellation_requested()
+    }
 }
 
 fn progress_step<T>(
+    reporter: &dyn ProgressReporter,
+    name: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if reporter.cancelled() {
+        reporter.failed(name);
+        return Err(CiaoError::Config(
+            "operation interrupted by user".to_owned(),
+        ));
+    }
+    reporter.started(name);
+    match action() {
+        Ok(value) => {
+            reporter.finished(name);
+            Ok(value)
+        }
+        Err(error) => {
+            reporter.failed(name);
+            if reporter.cancelled() {
+                Err(CiaoError::Config(format!(
+                    "operation interrupted by user during {name}: {error}"
+                )))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn progress_step_uncancellable<T>(
     reporter: &dyn ProgressReporter,
     name: &str,
     action: impl FnOnce() -> Result<T>,
@@ -2831,17 +2879,35 @@ impl OpenSshTransport {
             .arg("--create")
             .arg("--file=-")
             .arg("--exclude=.git")
+            .arg("--exclude=./.git")
             .arg("--exclude=.ciao")
+            .arg("--exclude=./.ciao")
             .arg("--exclude=target")
+            .arg("--exclude=./target")
+            .arg("--exclude=./target/*")
             .arg("--exclude=node_modules")
+            .arg("--exclude=./node_modules")
+            .arg("--exclude=./node_modules/*")
             .arg("--exclude=.env")
+            .arg("--exclude=./.env")
             .arg("--exclude=.env.*")
+            .arg("--exclude=./.env.*")
             .arg("--exclude=.envrc")
+            .arg("--exclude=./.envrc")
+            .arg("--exclude=.dev.vars")
+            .arg("--exclude=./.dev.vars")
             .arg("--exclude=*.pem")
+            .arg("--exclude=./*.pem")
             .arg("--exclude=*.key")
+            .arg("--exclude=./*.key")
             .arg("--exclude=.ssh")
+            .arg("--exclude=./.ssh")
+            .arg("--exclude=._*")
+            .arg("--exclude=./._*")
+            .arg("--exclude=.DS_Store")
+            .arg("--exclude=./.DS_Store")
             .args(
-                ignore_patterns(source)
+                upload_ignore_patterns(source)
                     .iter()
                     .map(|pattern| format!("--exclude={pattern}")),
             )
@@ -2849,6 +2915,10 @@ impl OpenSshTransport {
             .arg(source)
             .arg(".");
         let mut tar = tar_command
+            // macOS' BSD tar otherwise emits AppleDouble metadata entries
+            // when archiving files with Finder metadata. The env var is
+            // harmless on Linux and keeps the remote release platform-neutral.
+            .env("COPYFILE_DISABLE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -2867,12 +2937,11 @@ impl OpenSshTransport {
                 "--file=-",
                 "--no-same-owner",
                 "--no-same-permissions",
-                "--no-absolute-names",
                 "--directory",
             ],
             "remote source extraction",
         );
-        let mut remote = self
+        let remote = match self
             .ssh_command(&CommandSpec {
                 args: {
                     let mut args = remote_spec.args;
@@ -2885,36 +2954,64 @@ impl OpenSshTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| CiaoError::Transport {
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                terminate_child(&mut tar);
+                return Err(CiaoError::Transport {
+                    stage: "upload".to_owned(),
+                    message: error.to_string(),
+                    details: String::new(),
+                });
+            }
+        };
+        let mut children = UploadChildren::new(tar, remote);
+        let mut tar_stdout = children
+            .tar
+            .stdout
+            .take()
+            .ok_or_else(|| CiaoError::Transport {
                 stage: "upload".to_owned(),
-                message: error.to_string(),
+                message: "tar stdout was not available".to_owned(),
                 details: String::new(),
             })?;
-        let mut tar_stdout = tar.stdout.take().ok_or_else(|| CiaoError::Transport {
-            stage: "upload".to_owned(),
-            message: "tar stdout was not available".to_owned(),
-            details: String::new(),
-        })?;
-        let mut remote_stdin = remote.stdin.take().ok_or_else(|| CiaoError::Transport {
-            stage: "upload".to_owned(),
-            message: "SSH stdin was not available".to_owned(),
-            details: String::new(),
-        })?;
-        let tar_stderr = tar.stderr.take().ok_or_else(|| CiaoError::Transport {
-            stage: "upload".to_owned(),
-            message: "tar stderr was not available".to_owned(),
-            details: String::new(),
-        })?;
-        let remote_stdout = remote.stdout.take().ok_or_else(|| CiaoError::Transport {
-            stage: "upload".to_owned(),
-            message: "SSH stdout was not available".to_owned(),
-            details: String::new(),
-        })?;
-        let remote_stderr = remote.stderr.take().ok_or_else(|| CiaoError::Transport {
-            stage: "upload".to_owned(),
-            message: "SSH stderr was not available".to_owned(),
-            details: String::new(),
-        })?;
+        let mut remote_stdin =
+            children
+                .remote
+                .stdin
+                .take()
+                .ok_or_else(|| CiaoError::Transport {
+                    stage: "upload".to_owned(),
+                    message: "SSH stdin was not available".to_owned(),
+                    details: String::new(),
+                })?;
+        let tar_stderr = children
+            .tar
+            .stderr
+            .take()
+            .ok_or_else(|| CiaoError::Transport {
+                stage: "upload".to_owned(),
+                message: "tar stderr was not available".to_owned(),
+                details: String::new(),
+            })?;
+        let remote_stdout = children
+            .remote
+            .stdout
+            .take()
+            .ok_or_else(|| CiaoError::Transport {
+                stage: "upload".to_owned(),
+                message: "SSH stdout was not available".to_owned(),
+                details: String::new(),
+            })?;
+        let remote_stderr = children
+            .remote
+            .stderr
+            .take()
+            .ok_or_else(|| CiaoError::Transport {
+                stage: "upload".to_owned(),
+                message: "SSH stderr was not available".to_owned(),
+                details: String::new(),
+            })?;
         // Drain every child output while stdin is being copied. Waiting until
         // after the upload can deadlock when tar or ssh fills a pipe buffer.
         let tar_stderr_reader = spawn_pipe_reader(tar_stderr);
@@ -2923,11 +3020,26 @@ impl OpenSshTransport {
         reporter.updated("upload source (starting SSH transfer) ");
         let copy_result = copy_upload_stream(&mut tar_stdout, &mut remote_stdin, reporter);
         drop(remote_stdin);
-        let tar_status = tar.wait()?;
-        let remote_status = remote.wait()?;
+        if copy_result.is_err() {
+            // If either side stops consuming the stream, terminate both
+            // children before waiting. This also covers a failed remote tar
+            // without leaving a local tar/ssh pair behind.
+            children.kill_all();
+        }
+        let tar_status = children.tar.wait();
+        if tar_status.is_err() {
+            children.remote.kill().ok();
+        }
+        let remote_status = children.remote.wait();
+        if remote_status.is_err() {
+            children.tar.kill().ok();
+        }
         let tar_stderr = join_pipe_reader(tar_stderr_reader, "tar stderr")?;
         let remote_stdout = join_pipe_reader(remote_stdout_reader, "SSH stdout")?;
         let remote_stderr = join_pipe_reader(remote_stderr_reader, "SSH stderr")?;
+        let tar_status = tar_status.map_err(CiaoError::Io)?;
+        let remote_status = remote_status.map_err(CiaoError::Io)?;
+        children.disarm();
         if !remote_status.success() {
             return Err(CiaoError::RemoteCommand {
                 stage: "remote source extraction".to_owned(),
@@ -2952,6 +3064,49 @@ impl OpenSshTransport {
         }
         reporter.updated(&format!("upload source ({})", format_bytes(transferred)));
         Ok(())
+    }
+}
+
+struct UploadChildren {
+    tar: Child,
+    remote: Child,
+    armed: bool,
+}
+
+impl UploadChildren {
+    fn new(tar: Child, remote: Child) -> Self {
+        Self {
+            tar,
+            remote,
+            armed: true,
+        }
+    }
+
+    fn kill_all(&mut self) {
+        terminate_child(&mut self.tar);
+        terminate_child(&mut self.remote);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UploadChildren {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill_all();
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -2991,6 +3146,12 @@ fn copy_upload_stream(
     let mut last_update = Instant::now();
     reporter.updated("upload source (0 B via SSH)");
     loop {
+        if reporter.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "operation interrupted by user",
+            ));
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -3039,6 +3200,19 @@ fn ignore_patterns(source: &Path) -> Vec<String> {
         .collect()
 }
 
+fn upload_ignore_patterns(source: &Path) -> Vec<String> {
+    ignore_patterns(source)
+        .into_iter()
+        .flat_map(|pattern| {
+            if pattern.starts_with("./") {
+                vec![pattern]
+            } else {
+                vec![pattern.clone(), format!("./{pattern}")]
+            }
+        })
+        .collect()
+}
+
 impl RemoteHost for OpenSshTransport {
     fn exec(&self, command: CommandSpec) -> Result<CommandOutput> {
         let mut process = self.ssh_command(&command);
@@ -3054,15 +3228,21 @@ impl RemoteHost for OpenSshTransport {
             details: String::new(),
         })?;
         if let Some(stdin) = command.stdin {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| CiaoError::Transport {
-                    stage: command.stage.clone(),
-                    message: "SSH stdin was not available".to_owned(),
-                    details: String::new(),
-                })?
-                .write_all(&stdin)?;
+            let mut child_stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    terminate_child(&mut child);
+                    return Err(CiaoError::Transport {
+                        stage: command.stage.clone(),
+                        message: "SSH stdin was not available".to_owned(),
+                        details: String::new(),
+                    });
+                }
+            };
+            if let Err(error) = child_stdin.write_all(&stdin) {
+                terminate_child(&mut child);
+                return Err(CiaoError::Io(error));
+            }
         }
         let output = child.wait_with_output()?;
         let result = CommandOutput::from_output(output);
@@ -3354,6 +3534,35 @@ pub fn command_script(command: &str, cwd: &str) -> Result<Vec<u8>> {
         ));
     }
     Ok(format!("set -eu\ncd -- {}\nexec {}\n", shell_quote(cwd), command).into_bytes())
+}
+
+fn command_script_with_home(
+    command: &str,
+    cwd: &str,
+    home: &str,
+    env_file: &str,
+) -> Result<Vec<u8>> {
+    if home.is_empty()
+        || !home.starts_with('/')
+        || home.contains(['\n', '\r'])
+        || env_file.is_empty()
+        || !env_file.starts_with('/')
+        || env_file.contains(['\n', '\r'])
+    {
+        return Err(CiaoError::Config(
+            "build home or environment directory is invalid".to_owned(),
+        ));
+    }
+    let command = command_script(command, cwd)?;
+    let command = String::from_utf8(command)
+        .map_err(|_| CiaoError::Config("application command is not valid UTF-8".to_owned()))?;
+    Ok(format!(
+        "set -eu\nexport HOME={}\nexport npm_config_cache=\"$HOME/.npm\"\nif test -f {}; then set -a; . {}; set +a; fi\n{command}",
+        shell_quote(home),
+        shell_quote(env_file),
+        shell_quote(env_file),
+    )
+    .into_bytes())
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -4334,12 +4543,20 @@ pub fn deploy_with_mode(
         DeployHostMode::Interactive => prepare_host_for_deploy_interactive(transport, reporter)?,
     }
     let root = host_app_root(&platform.os);
-    progress_step(reporter, "acquire deployment lock", || {
-        acquire_deploy_lock(transport, &root, &plan.name)
-    })?;
+    let lock_owner = release_id();
+    if let Err(error) = progress_step(reporter, "acquire deployment lock", || {
+        acquire_deploy_lock(transport, &root, &plan.name, &lock_owner)
+    }) {
+        if cancellation_requested() {
+            let _ = progress_step_uncancellable(reporter, "release deployment lock", || {
+                release_deploy_lock(transport, &root, &plan.name, &lock_owner)
+            });
+        }
+        return Err(error);
+    }
     let result = deploy_unlocked(transport, source, plan, domain, false, reporter);
-    let unlock_result = progress_step(reporter, "release deployment lock", || {
-        release_deploy_lock(transport, &root, &plan.name)
+    let unlock_result = progress_step_uncancellable(reporter, "release deployment lock", || {
+        release_deploy_lock(transport, &root, &plan.name, &lock_owner)
     });
     match (result, unlock_result) {
         (Ok(result), Ok(())) => Ok(result),
@@ -4368,9 +4585,10 @@ pub fn recover_deploy_lock(transport: &OpenSshTransport, app: &str) -> Result<()
         transport,
         "recover interrupted deployment lock",
         &format!(
-            "set -eu\nif sudo -n test -d {lock}; then sudo -n rm -f {started}; sudo -n rmdir {lock}; fi\n",
+            "set -eu\nif sudo -n test -d {lock}; then sudo -n rm -f {started} {owner}; sudo -n rmdir {lock}; fi\n",
             lock = shell_quote(&lock),
             started = shell_quote(&format!("{lock}/started")),
+            owner = shell_quote(&format!("{lock}/owner")),
         ),
     )
     .map(|_| ())
@@ -4441,6 +4659,8 @@ fn deploy_unlocked(
     })?;
     let staging = format!("/tmp/ciao-{}-{}", plan.name, release);
     let release_path = format!("{root}/{}/releases/{release}", plan.name);
+    let build_home = build_cache_path(&platform.os, &plan.name)?;
+    let build_env = format!("{root}/{}/shared/env", plan.name);
     let user = service_user(transport, &platform.os, &plan.name)?;
     let user_group = match &platform.os {
         HostOs::MacOs => "staff".to_owned(),
@@ -4545,7 +4765,7 @@ fn deploy_unlocked(
                         transport,
                         &user,
                         "install dependencies",
-                        &command_script(install, &release_path)?,
+                        &command_script_with_home(install, &release_path, &build_home, &build_env)?,
                     )
                 })?;
             }
@@ -4555,7 +4775,7 @@ fn deploy_unlocked(
                         transport,
                         &user,
                         "build",
-                        &command_script(build, &release_path)?,
+                        &command_script_with_home(build, &release_path, &build_home, &build_env)?,
                     )
                 })?;
             }
@@ -4680,13 +4900,11 @@ fn deploy_unlocked(
                 &service_unit_name(&plan.name, false),
             );
         }
-        let current_after_recovery = match read_current_release(transport, &root, &plan.name) {
-            Ok(current) => current,
-            Err(_) => Some(release.clone()),
-        };
-        if current_after_recovery.as_deref() != Some(release.as_str()) {
-            let _ = cleanup_release(transport, &platform.os, &plan.name, &release);
-        }
+        // Cleanup performs its own remote current-release check. Keeping that
+        // check and the removal in one SSH command avoids a stale local read
+        // leaving a partial release behind when cancellation interrupts a
+        // preceding SSH session.
+        let _ = cleanup_release(transport, &platform.os, &plan.name, &release);
         let active_message = previous_release
             .as_deref()
             .map(|previous| format!("previous release `{previous}` was restored when possible"))
@@ -5218,6 +5436,20 @@ fn host_app_root(os: &HostOs) -> String {
     }
 }
 
+fn build_cache_path(os: &HostOs, app: &str) -> Result<String> {
+    validate_identifier("app name", app)?;
+    let root = match os {
+        HostOs::Linux => "/var/cache/ciao",
+        HostOs::MacOs => "/Library/Caches/Ciao",
+        HostOs::Unknown(value) => {
+            return Err(CiaoError::Config(format!(
+                "build cache is unsupported on OS `{value}`"
+            )))
+        }
+    };
+    Ok(format!("{root}/{app}"))
+}
+
 fn service_user(transport: &OpenSshTransport, os: &HostOs, app: &str) -> Result<String> {
     let user = match os {
         HostOs::MacOs => ssh_login_user(&transport.target).ok_or_else(|| {
@@ -5260,33 +5492,48 @@ fn deploy_lock_path(root: &str, app: &str) -> String {
     format!("{root}/{app}/.deploy-lock")
 }
 
-fn acquire_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
+fn acquire_deploy_lock(
+    transport: &OpenSshTransport,
+    root: &str,
+    app: &str,
+    owner: &str,
+) -> Result<()> {
     validate_identifier("app name", app)?;
+    validate_identifier("deployment owner", owner)?;
     remote_script(
         transport,
         "acquire deployment lock",
-        &deploy_lock_script(root, app)?,
+        &deploy_lock_script(root, app, owner)?,
     )
     .map(|_| ())
 }
 
-fn deploy_lock_script(root: &str, app: &str) -> Result<String> {
+fn deploy_lock_script(root: &str, app: &str, owner: &str) -> Result<String> {
     validate_identifier("app name", app)?;
+    validate_identifier("deployment owner", owner)?;
     let lock = deploy_lock_path(root, app);
     Ok(format!(
-        "set -eu\nsudo -n install -d -m 0755 {app_root}\nnow=$(date +%s)\nstarted_value=''\nif sudo -n test -f {started}; then started_value=$(sudo -n cat {started} || true); fi\nif ! sudo -n mkdir -m 0755 {lock} 2>/dev/null; then age='unknown'; case \"$started_value\" in ''|*[!0-9]*) ;; *) age=$((now - started_value));; esac; echo \"another Ciao deployment is already running for this app (lock age: $age seconds)\" >&2; exit 73; fi\nprintf '%s\\n' \"$now\" | sudo -n tee {started} >/dev/null\n",
+        "set -eu\napp_root={app_root}\nlock={lock}\nowner={owner}\nsudo -n install -d -m 0755 \"$app_root\"\nnow=$(date +%s)\nstarted_value=''\nif sudo -n test -f \"$lock/started\"; then started_value=$(sudo -n cat \"$lock/started\" || true); fi\nlock_ready=0\ncleanup_lock() {{ status=$?; if [ \"$lock_ready\" -eq 1 ]; then sudo -n rm -rf \"$lock\"; fi; trap - 0 1 2 3 15; exit \"$status\"; }}\ntrap cleanup_lock 0 1 2 3 15\nif ! sudo -n mkdir -m 0755 \"$lock\" 2>/dev/null; then age='unknown'; case \"$started_value\" in ''|*[!0-9]*) ;; *) age=$((now - started_value));; esac; echo \"another Ciao deployment is already running for this app (lock age: $age seconds)\" >&2; exit 73; fi\nlock_ready=1\nprintf '%s\\n' \"$now\" | sudo -n tee \"$lock/started\" >/dev/null\nprintf '%s\\n' \"$owner\" | sudo -n tee \"$lock/owner\" >/dev/null\ntrap - 0 1 2 3 15\n",
         app_root = shell_quote(&format!("{root}/{app}")),
         lock = shell_quote(&lock),
-        started = shell_quote(&format!("{lock}/started")),
+        owner = shell_quote(owner),
     ))
 }
 
-fn release_deploy_lock(transport: &OpenSshTransport, root: &str, app: &str) -> Result<()> {
+fn release_deploy_lock(
+    transport: &OpenSshTransport,
+    root: &str,
+    app: &str,
+    owner: &str,
+) -> Result<()> {
     validate_identifier("app name", app)?;
+    validate_identifier("deployment owner", owner)?;
     let lock = deploy_lock_path(root, app);
     let script = format!(
-        "set -eu\nsudo -n rm -f {started}\nsudo -n rmdir {lock}\n",
+        "set -eu\nif ! sudo -n test -d {lock}; then exit 0; fi\nif ! sudo -n test -f {owner_file} || [ \"$(sudo -n cat {owner_file})\" != {owner} ]; then echo 'deployment lock is owned by another process' >&2; exit 73; fi\nsudo -n rm -f {started} {owner_file}\nsudo -n rmdir {lock}\n",
         started = shell_quote(&format!("{lock}/started")),
+        owner_file = shell_quote(&format!("{lock}/owner")),
+        owner = shell_quote(owner),
         lock = shell_quote(&lock),
     );
     remote_script(transport, "release deployment lock", &script).map(|_| ())
@@ -5302,19 +5549,22 @@ fn ensure_remote_layout(
     validate_identifier("release", release)?;
     let root = host_app_root(os);
     let user = service_user(transport, os, app)?;
+    let build_cache = build_cache_path(os, app)?;
     let script = match os {
         HostOs::Linux => format!(
-            "set -eu\nif ! id -u {user} >/dev/null 2>&1; then sudo -n useradd --system --user-group --home-dir {app_root} --shell /usr/sbin/nologin {user}; fi\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared\nsudo -n chown root:root {root}/{app} {root}/{app}/releases\nsudo -n chown {user}:{user} {root}/{app}/shared\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases\nsudo -n chmod 0750 {root}/{app}/shared\n",
+            "set -eu\nif ! id -u {user} >/dev/null 2>&1; then sudo -n useradd --system --user-group --home-dir {app_root} --shell /usr/sbin/nologin {user}; fi\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared /var/cache/ciao\nsudo -n install -d -m 0750 {cache}\nsudo -n chown root:root {root}/{app} {root}/{app}/releases /var/cache/ciao\nsudo -n chown {user}:{user} {root}/{app}/shared {cache}\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases /var/cache/ciao\nsudo -n chmod 0750 {root}/{app}/shared {cache}\n",
             user = shell_quote(&user),
             app_root = shell_quote(&format!("{root}/{app}")),
             root = shell_quote(&root),
             app = shell_quote(app),
+            cache = shell_quote(&build_cache),
         ),
         HostOs::MacOs => format!(
-            "set -eu\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared /Library/Ciao/logs\nsudo -n chown root:wheel {root}/{app} {root}/{app}/releases\nsudo -n chown {user}:staff {root}/{app}/shared\nsudo -n touch /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chown {user}:staff /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0644 /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases\nsudo -n chmod 0750 {root}/{app}/shared\n",
+            "set -eu\nsudo -n install -d -m 0755 {root}/{app}/releases {root}/{app}/shared /Library/Caches/Ciao /Library/Ciao/logs\nsudo -n install -d -m 0750 {cache}\nsudo -n chown root:wheel {root}/{app} {root}/{app}/releases /Library/Caches/Ciao\nsudo -n chown {user}:staff {root}/{app}/shared {cache}\nsudo -n touch /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chown {user}:staff /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0644 /Library/Ciao/logs/{app}.out /Library/Ciao/logs/{app}.err\nsudo -n chmod 0755 {root}/{app} {root}/{app}/releases /Library/Caches/Ciao\nsudo -n chmod 0750 {root}/{app}/shared {cache}\n",
             root = shell_quote(&root),
             app = shell_quote(app),
             user = shell_quote(&user),
+            cache = shell_quote(&build_cache),
         ),
         HostOs::Unknown(value) => {
             return Err(CiaoError::Config(format!("unsupported host OS `{value}`")))
@@ -5935,22 +6185,18 @@ fn cleanup_release(
     validate_identifier("app name", app)?;
     validate_identifier("release", release)?;
     let root = host_app_root(os);
-    let current = read_current_release(transport, &root, app)?;
-    if current.as_deref() == Some(release) {
-        return Err(CiaoError::Config(
-            "refusing to clean a release currently selected by current".to_owned(),
-        ));
-    }
+    let current_path = format!("{root}/{app}/current");
+    let release_path = format!("{root}/{app}/releases/{release}");
+    let staging_path = format!("/tmp/ciao-{app}-{release}");
     remote_script(
         transport,
         "cleanup failed release",
         &format!(
-            "set -eu\nsudo -n rm -rf {}/{}/releases/{} /tmp/ciao-{}-{}\n",
-            shell_quote(&root),
-            shell_quote(app),
-            shell_quote(release),
-            shell_quote(app),
-            shell_quote(release)
+            "set -eu\ncurrent=''\nif sudo -n test -L {current_path}; then current=$(sudo -n readlink {current_path}); fi\ncase \"$(basename \"$current\")\" in {release}) echo 'refusing to clean a release currently selected by current' >&2; exit 1;; esac\nsudo -n rm -rf {release_path} {staging_path}\n",
+            current_path = shell_quote(&current_path),
+            release = shell_quote(release),
+            release_path = shell_quote(&release_path),
+            staging_path = shell_quote(&staging_path),
         ),
     )
     .map(|_| ())
@@ -6202,6 +6448,18 @@ mod tests {
             .any(|message| message.contains("upload source")));
     }
 
+    #[test]
+    fn build_cache_stays_outside_release_and_user_home_layouts() {
+        assert_eq!(
+            build_cache_path(&HostOs::Linux, "demo").unwrap(),
+            "/var/cache/ciao/demo"
+        );
+        assert_eq!(
+            build_cache_path(&HostOs::MacOs, "demo").unwrap(),
+            "/Library/Caches/Ciao/demo"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingReporter {
         messages: std::sync::Mutex<Vec<String>>,
@@ -6215,11 +6473,14 @@ mod tests {
 
     #[test]
     fn deploy_lock_script_reports_lock_age_without_automatic_removal() {
-        let script = deploy_lock_script("/var/lib/ciao/apps", "demo").unwrap();
+        let script = deploy_lock_script("/var/lib/ciao/apps", "demo", "owner").unwrap();
         assert!(script.contains("started_value=''"));
         assert!(script.contains("lock age: $age seconds"));
         assert!(script.contains("exit 73"));
-        assert!(script.contains("tee '/var/lib/ciao/apps/demo/.deploy-lock/started'"));
+        assert!(script.contains("tee \"$lock/started\""));
+        assert!(script.contains("tee \"$lock/owner\""));
+        assert!(script.contains("lock_ready=0"));
+        assert!(script.contains("if [ \"$lock_ready\" -eq 1 ]"));
         assert!(!script.contains("21600"));
     }
 
