@@ -4,6 +4,10 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [v0.1.4]
+
 - Generate GitHub Actions workflows from the detected project runtime and app
   type.
 - Install a pinned, checksum-verified Ciao release binary in GitHub Actions.
