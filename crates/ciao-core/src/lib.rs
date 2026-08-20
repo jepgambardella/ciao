@@ -4216,6 +4216,32 @@ fn run_local_interactive_script(script: &str) -> Result<CommandOutput> {
     })
 }
 
+fn local_sudo_is_cached() -> bool {
+    let mut command = Command::new("sudo");
+    command
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.status().is_ok_and(|status| status.success())
+}
+
+fn local_privileged_script_with_sudo(script: &str, sudo_prefix: &str) -> String {
+    format!(
+        "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{}",
+        script.replace("sudo -n", sudo_prefix)
+    )
+}
+
+fn run_local_privileged_script(script: &str) -> Result<CommandOutput> {
+    let sudo_prefix = if local_sudo_is_cached() {
+        "sudo -n"
+    } else {
+        "sudo"
+    };
+    run_local_interactive_script(&local_privileged_script_with_sudo(script, sudo_prefix))
+}
+
 fn run_local_interactive_capture(script: &str) -> Result<CommandOutput> {
     let mut command = Command::new("sh");
     command
@@ -4520,10 +4546,7 @@ pub fn local_setup() -> Result<LocalSetupResult> {
     if local_setup_ready() {
         return Ok(local_setup_result());
     }
-    let output = run_local_interactive_script(&format!(
-        "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{}",
-        local_setup_script()?
-    ))?;
+    let output = run_local_privileged_script(&local_setup_script()?)?;
     if output.status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "configure local .ciao resolver and Caddy".to_owned(),
@@ -4647,10 +4670,7 @@ fn local_remote_dns_path() -> Result<PathBuf> {
 
 pub fn local_resolver_setup() -> Result<LocalResolverResult> {
     if !local_resolver_ready() {
-        let output = run_local_interactive_script(&format!(
-            "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{}",
-            local_resolver_setup_script()?
-        ))?;
+        let output = run_local_privileged_script(&local_resolver_setup_script()?)?;
         if output.status != 0 {
             return Err(CiaoError::LocalCommand {
                 stage: "configure local .ciao resolver".to_owned(),
@@ -4705,7 +4725,7 @@ pub fn configure_local_remote_domain(name: &str, address: &str) -> Result<LocalR
         shell_quote(&line),
         shell_quote(&path.to_string_lossy()),
     );
-    let output = run_local_interactive_script(&script)?;
+    let output = run_local_privileged_script(&script)?;
     if output.status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "configure local .ciao route".to_owned(),
@@ -4722,7 +4742,7 @@ pub fn configure_local_remote_domain(name: &str, address: &str) -> Result<LocalR
     } else {
         "set -eu\nsudo -n systemctl restart dnsmasq\n".to_owned()
     };
-    let output = run_local_interactive_script(&reload)?;
+    let output = run_local_privileged_script(&reload)?;
     if output.status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "reload local .ciao resolver".to_owned(),
@@ -4749,7 +4769,7 @@ pub fn remove_local_remote_domain(name: &str) -> Result<()> {
         shell_quote(&path.to_string_lossy()),
         shell_quote(&path.to_string_lossy()),
     );
-    let output = run_local_interactive_script(&script)?;
+    let output = run_local_privileged_script(&script)?;
     if output.status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "remove local .ciao route".to_owned(),
@@ -8328,6 +8348,14 @@ mod tests {
             assert!(script.contains("dev.ciao.local-loopback"));
             assert!(script.contains("/Library/LaunchDaemons"));
         }
+    }
+
+    #[test]
+    fn local_privileged_script_uses_interactive_sudo_when_cache_is_missing() {
+        let script = local_privileged_script_with_sudo("sudo -n install -d /etc/ciao", "sudo");
+        assert!(script.starts_with("set -eu\nsudo -v </dev/tty"));
+        assert!(script.contains("sudo install -d /etc/ciao"));
+        assert!(!script.contains("sudo -n install"));
     }
 
     #[test]

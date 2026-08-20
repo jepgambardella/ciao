@@ -767,10 +767,7 @@ fn offer_remote_local_domain(transport: &OpenSshTransport, app: &str) -> Result<
         )
     })?;
     let result = configure_local_remote_domain(app, &address)?;
-    println!(
-        "✓ local route: http://{}.ciao → {} via Tailscale",
-        app, address
-    );
+    println!("✓ {app} running on http://{app}.ciao (via Tailscale {address})");
     if !result.dependencies.is_empty() {
         println!("  resolver ready (no local Caddy)");
     }
