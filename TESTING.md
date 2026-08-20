@@ -5,7 +5,8 @@ test suite. It runs locally and in Ubuntu CI without a remote host, covering
 identifier and SSH validation, project detection and configuration overrides,
 local `.ciao` name/port/proxy planning, release manifests, config
 round-tripping, generated systemd/launchd definitions, and shell-script
-quoting. The local setup script is inspected for native dependencies and for
+quoting. Astro static detection and the temporary `ciao run` script are also
+covered. The local setup script is inspected for native dependencies and for
 the absence of per-project `/etc/hosts` edits; tests do not mutate the
 developer's DNS or service manager.
 
@@ -51,6 +52,7 @@ a manual fixture.
 If a required host or service manager is unavailable, report
 `skipped: <reason>`; a green local or CI unit run is not evidence that remote
 systemd, journald, launchd, or SSH behavior was exercised. The repository does
-not start Docker or install a remote daemon as part of its tests. A host with
-`cloudflared` but without an explicitly provisioned tunnel is not evidence for
-Cloudflare exposure; report that feature as skipped.
+not start Docker or install a remote daemon as part of its tests. A Cloudflare
+test is opt-in. It must use a disposable hostname and verify the guided login,
+DNS route, target credentials mode `0600`, standard service status and HTTPS
+response. Do not put Cloudflare credentials in test logs.

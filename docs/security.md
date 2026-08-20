@@ -55,10 +55,13 @@ configuration and one Caddy import, then stores only project name, source and
 internal port in the local config. It does not edit `/etc/hosts` per project,
 store secrets, or expose a generic command runner.
 
-Cloudflare Tunnel is deliberately not provisioned implicitly. Tunnel IDs,
-credentials, DNS changes and the `cloudflared` service remain under the
-operator's control; an exposure integration must use an explicit existing
-configuration and must never print or copy its credential file.
+When `ciao deploy` receives `--domain`, Ciao uses the official `cloudflared`
+CLI. It installs the client only when needed, opens `cloudflared tunnel login`
+in the browser, creates or reuses a tunnel named `ciao-<app>`, creates the DNS
+route and installs the standard `cloudflared` service on the target. The tunnel
+credential file is read locally and sent over SSH only to the root-owned target
+path with mode `0600`; it is never printed or stored in Ciao state. The public
+TLS connection ends at Cloudflare. Caddy serves the tunnel origin on loopback.
 
 GitHub auto-deploy is opt-in. It stores only the dedicated CI private key and
 the trusted known-hosts material in GitHub Actions secrets; Ciao's local integration state

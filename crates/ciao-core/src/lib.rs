@@ -226,6 +226,7 @@ pub enum Runtime {
     Go,
     Bun,
     Node,
+    Astro,
     Static,
 }
 
@@ -236,6 +237,7 @@ impl Display for Runtime {
             Self::Go => "Go",
             Self::Bun => "Bun",
             Self::Node => "Node",
+            Self::Astro => "Astro",
             Self::Static => "Static",
         })
     }
@@ -509,6 +511,13 @@ pub struct LocalDevPlan {
 pub struct LocalSetupResult {
     pub resolver: String,
     pub proxy: String,
+    pub dependencies: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalResolverResult {
+    pub resolver: String,
     pub dependencies: Vec<String>,
     pub message: String,
 }
@@ -2403,15 +2412,39 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         } else {
             ("npm install", "npm")
         };
-        (
-            Runtime::Node,
-            AppType::Service,
-            Some(install.to_owned()),
-            Some(format!("{runner} run build")),
-            Some(format!("{runner} start")),
-            Some(3000),
-            None,
-        )
+        if is_astro_project(root)? {
+            if astro_is_server_output(root)? {
+                (
+                    Runtime::Astro,
+                    AppType::Service,
+                    Some(install.to_owned()),
+                    Some(format!("{runner} run build")),
+                    Some(format!("{runner} start")),
+                    Some(3000),
+                    None,
+                )
+            } else {
+                (
+                    Runtime::Astro,
+                    AppType::Static,
+                    Some(install.to_owned()),
+                    Some(format!("{runner} run build")),
+                    None,
+                    None,
+                    Some("dist".to_owned()),
+                )
+            }
+        } else {
+            (
+                Runtime::Node,
+                AppType::Service,
+                Some(install.to_owned()),
+                Some(format!("{runner} run build")),
+                Some(format!("{runner} start")),
+                Some(3000),
+                None,
+            )
+        }
     } else if let Some(directory) = ["dist", "build", "public"]
         .into_iter()
         .find(|directory| root.join(directory).is_dir())
@@ -2458,14 +2491,13 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
             }
         };
         if plan.app_type == AppType::Static {
-            plan.install_command = None;
-            plan.build_command = None;
             plan.run_command = None;
             plan.port = None;
             plan.static_directory = ["dist", "build", "public"]
                 .into_iter()
                 .find(|directory| root.join(directory).is_dir())
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| (plan.runtime == Runtime::Astro).then_some("dist".to_owned()));
             if plan.static_directory.is_none() {
                 return Err(CiaoError::Detection(
                     "static app.type requires dist, build or public".to_owned(),
@@ -2513,8 +2545,6 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
     plan.local_port = local_port;
     plan.local_command = local_command;
     if plan.app_type == AppType::Static {
-        plan.install_command = None;
-        plan.build_command = None;
         plan.run_command = None;
         plan.port = None;
     }
@@ -2529,6 +2559,49 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         ));
     }
     Ok(plan)
+}
+
+fn is_astro_project(root: &Path) -> Result<bool> {
+    let contents = fs::read_to_string(root.join("package.json"))
+        .map_err(|error| CiaoError::Detection(format!("cannot read package.json: {error}")))?;
+    let package: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| CiaoError::Detection(format!("invalid package.json: {error}")))?;
+    Ok(["dependencies", "devDependencies", "peerDependencies"]
+        .into_iter()
+        .filter_map(|section| package.get(section))
+        .any(|section| section.get("astro").is_some())
+        || [
+            "astro.config.mjs",
+            "astro.config.js",
+            "astro.config.ts",
+            "astro.config.cjs",
+        ]
+        .into_iter()
+        .any(|file| root.join(file).is_file()))
+}
+
+fn astro_is_server_output(root: &Path) -> Result<bool> {
+    for file in [
+        "astro.config.mjs",
+        "astro.config.js",
+        "astro.config.ts",
+        "astro.config.cjs",
+    ] {
+        let path = root.join(file);
+        if path.is_file() {
+            let contents = fs::read_to_string(path)
+                .map_err(|error| CiaoError::Detection(format!("cannot read {file}: {error}")))?;
+            let normalized = contents.replace(['\'', '"', '`', ' ', '\n', '\r', '\t'], "");
+            if normalized.contains("output:server")
+                || normalized.contains("output:hybrid")
+                || normalized.contains("output=server")
+                || normalized.contains("output=hybrid")
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub fn local_domain(name: &str) -> Result<String> {
@@ -3813,11 +3886,14 @@ sudo -n launchctl bootstrap system "$loopback_plist"
 if ! ifconfig lo0 2>/dev/null | grep -q '10.0.0.1'; then sudo -n ifconfig lo0 alias 10.0.0.1; fi
 dnsmasq_conf="$brew_prefix/etc/dnsmasq.conf"
 sudo -n install -d -m 0755 "$brew_prefix/etc"
+dnsmasq_dir="$brew_prefix/etc/dnsmasq.d"
+sudo -n install -d -m 0755 "$dnsmasq_dir"
 if ! sudo -n test -f "$dnsmasq_conf"; then
-    printf '%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee "$dnsmasq_conf" >/dev/null
+    printf '%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' "conf-dir=$dnsmasq_dir,*.conf" | sudo -n tee "$dnsmasq_conf" >/dev/null
 elif ! sudo -n grep -Fq '# Ciao .ciao resolver' "$dnsmasq_conf"; then
     printf '\n%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee -a "$dnsmasq_conf" >/dev/null
 fi
+if ! sudo -n grep -Fq "conf-dir=$dnsmasq_dir,*.conf" "$dnsmasq_conf"; then printf '%s\n' "conf-dir=$dnsmasq_dir,*.conf" | sudo -n tee -a "$dnsmasq_conf" >/dev/null; fi
 sudo -n install -d -m 0755 /etc/resolver
 printf '%s\n' 'nameserver 10.0.0.1' 'port 53' | sudo -n tee /etc/resolver/ciao >/dev/null
 fragment_dir="$brew_prefix/etc/ciao"
@@ -3901,6 +3977,546 @@ pub fn local_setup() -> Result<LocalSetupResult> {
         });
     }
     Ok(local_setup_result())
+}
+
+/// Install only the `.ciao` resolver. Remote deployments use this path to
+/// map `app.ciao` directly to the host's Tailscale address. It deliberately
+/// does not install or start Caddy on this computer.
+pub fn local_resolver_setup_script() -> Result<String> {
+    if cfg!(target_os = "macos") {
+        Ok(r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'macOS curl is required' >&2; exit 1; }
+brew_bin=''
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+done
+if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
+if [ -z "$brew_bin" ]; then
+    brew_install_script=$(mktemp -t ciao-homebrew)
+    trap 'rm -f "$brew_install_script"' EXIT
+    curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_install_script"
+    NONINTERACTIVE=1 /bin/bash "$brew_install_script"
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+        if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
+    done
+fi
+[ -n "$brew_bin" ] || { echo 'Homebrew installation finished without a usable brew executable' >&2; exit 1; }
+brew_prefix=$("$brew_bin" --prefix)
+export PATH="$brew_prefix/bin:$brew_prefix/sbin:$PATH"
+if ! "$brew_bin" list --formula dnsmasq >/dev/null 2>&1; then "$brew_bin" install dnsmasq; fi
+loopback_plist='/Library/LaunchDaemons/dev.ciao.local-loopback.plist'
+sudo -n tee "$loopback_plist" >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.ciao.local-loopback</string>
+<key>ProgramArguments</key><array><string>/sbin/ifconfig</string><string>lo0</string><string>alias</string><string>10.0.0.1</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+sudo -n chown root:wheel "$loopback_plist"
+sudo -n chmod 0644 "$loopback_plist"
+sudo -n launchctl bootout system/dev.ciao.local-loopback >/dev/null 2>&1 || true
+sudo -n launchctl bootstrap system "$loopback_plist"
+if ! ifconfig lo0 2>/dev/null | grep -q '10.0.0.1'; then sudo -n ifconfig lo0 alias 10.0.0.1; fi
+dnsmasq_conf="$brew_prefix/etc/dnsmasq.conf"
+dnsmasq_dir="$brew_prefix/etc/dnsmasq.d"
+sudo -n install -d -m 0755 "$brew_prefix/etc" "$dnsmasq_dir"
+if ! sudo -n test -f "$dnsmasq_conf"; then
+    printf '%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' "conf-dir=$dnsmasq_dir,*.conf" | sudo -n tee "$dnsmasq_conf" >/dev/null
+else
+    if ! sudo -n grep -Fq '# Ciao .ciao resolver' "$dnsmasq_conf"; then printf '\n%s\n' '# Ciao .ciao resolver' 'listen-address=10.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee -a "$dnsmasq_conf" >/dev/null; fi
+    if ! sudo -n grep -Fq "conf-dir=$dnsmasq_dir,*.conf" "$dnsmasq_conf"; then printf '%s\n' "conf-dir=$dnsmasq_dir,*.conf" | sudo -n tee -a "$dnsmasq_conf" >/dev/null; fi
+fi
+sudo -n install -d -m 0755 /etc/resolver
+printf '%s\n' 'nameserver 10.0.0.1' 'port 53' | sudo -n tee /etc/resolver/ciao >/dev/null
+sudo -n "$brew_bin" services restart dnsmasq >/dev/null
+printf 'ciao_local_resolver=ready\n'
+"#.to_owned())
+    } else if cfg!(target_os = "linux") {
+        Ok(r#"set -eu
+command -v apt-get >/dev/null 2>&1 || { echo 'automatic Linux local setup requires apt-get' >&2; exit 1; }
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates dnsmasq iproute2 systemd-resolved
+sudo -n install -d -m 0755 /etc/dnsmasq.d
+printf '%s\n' '# Ciao .ciao resolver' 'listen-address=127.0.0.1' 'bind-interfaces' 'port=53' 'address=/.ciao/127.0.0.1' | sudo -n tee /etc/dnsmasq.d/ciao-ciao.conf >/dev/null
+sudo -n systemctl enable --now dnsmasq
+if ! command -v resolvectl >/dev/null 2>&1; then
+    echo 'systemd-resolved/resolvectl is required for automatic .ciao DNS routing' >&2
+    exit 1
+fi
+sudo -n install -d -m 0755 /etc/systemd/resolved.conf.d
+printf '%s\n' '[Resolve]' 'DNS=127.0.0.1' 'Domains=~ciao' | sudo -n tee /etc/systemd/resolved.conf.d/ciao-ciao.conf >/dev/null
+sudo -n systemctl enable --now systemd-resolved
+sudo -n systemctl reload-or-restart systemd-resolved
+printf 'ciao_local_resolver=ready\n'
+"#.to_owned())
+    } else {
+        Err(CiaoError::Config(
+            "local .ciao DNS routing is supported on macOS and Linux".to_owned(),
+        ))
+    }
+}
+
+fn local_resolver_ready() -> bool {
+    if cfg!(target_os = "macos") {
+        Path::new("/etc/resolver/ciao").is_file()
+            && Command::new("pgrep")
+                .args(["-x", "dnsmasq"])
+                .status()
+                .is_ok_and(|status| status.success())
+    } else if cfg!(target_os = "linux") {
+        Path::new("/etc/dnsmasq.d/ciao-ciao.conf").is_file()
+            && Path::new("/etc/systemd/resolved.conf.d/ciao-ciao.conf").is_file()
+            && Command::new("systemctl")
+                .args(["is-active", "--quiet", "dnsmasq"])
+                .status()
+                .is_ok_and(|status| status.success())
+    } else {
+        false
+    }
+}
+
+fn local_remote_dns_path() -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Ok(local_brew_prefix().join("etc/dnsmasq.d/ciao-remote.conf"))
+    } else if cfg!(target_os = "linux") {
+        Ok(PathBuf::from("/etc/dnsmasq.d/ciao-remote.conf"))
+    } else {
+        Err(CiaoError::Config(
+            "remote .ciao routing is supported on macOS and Linux".to_owned(),
+        ))
+    }
+}
+
+pub fn local_resolver_setup() -> Result<LocalResolverResult> {
+    if !local_resolver_ready() {
+        let output = run_local_interactive_script(&format!(
+            "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{}",
+            local_resolver_setup_script()?
+        ))?;
+        if output.status != 0 {
+            return Err(CiaoError::LocalCommand {
+                stage: "configure local .ciao resolver".to_owned(),
+                exit: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+    }
+    Ok(LocalResolverResult {
+        resolver: "*.ciao uses the local resolver; deployed apps use Tailscale addresses"
+            .to_owned(),
+        dependencies: if cfg!(target_os = "macos") {
+            vec![
+                "Homebrew (installed if missing)".to_owned(),
+                "dnsmasq".to_owned(),
+            ]
+        } else {
+            vec!["dnsmasq".to_owned(), "systemd-resolved".to_owned()]
+        },
+        message: "local .ciao resolver is ready".to_owned(),
+    })
+}
+
+pub fn configure_local_remote_domain(name: &str, address: &str) -> Result<LocalResolverResult> {
+    validate_local_name(name)?;
+    let address = address.trim();
+    let parsed = address.parse::<IpAddr>().map_err(|_| {
+        CiaoError::Config(
+            "the Tailscale target has no IPv4 address; Ciao cannot create the local .ciao DNS route"
+                .to_owned(),
+        )
+    })?;
+    if !parsed.is_ipv4() {
+        return Err(CiaoError::Config(
+            "the local .ciao DNS route requires a Tailscale IPv4 address".to_owned(),
+        ));
+    }
+    let setup = local_resolver_setup()?;
+    let path = local_remote_dns_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CiaoError::Config("local dnsmasq path has no parent".to_owned()))?;
+    let domain = local_domain(name)?;
+    let line = format!("address=/{domain}/{address}");
+    let script = format!(
+        "set -eu\nsudo -n install -d -m 0755 {}\ntmp=$(mktemp)\ntrap 'rm -f \"$tmp\"' EXIT\nif sudo -n test -f {}; then sudo -n grep -Fv -- {} {} >\"$tmp\" || true; fi\nprintf '%s\\n' {} | sudo -n tee -a \"$tmp\" >/dev/null\nsudo -n install -m 0644 \"$tmp\" {}\n",
+        shell_quote(&parent.to_string_lossy()),
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&line),
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&line),
+        shell_quote(&path.to_string_lossy()),
+    );
+    let output = run_local_interactive_script(&script)?;
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "configure local .ciao route".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    let reload = if cfg!(target_os = "macos") {
+        format!(
+            "set -eu\nbrew_bin={}\nsudo -n \"$brew_bin\" services restart dnsmasq >/dev/null\n",
+            shell_quote(&local_brew_prefix().join("bin/brew").to_string_lossy())
+        )
+    } else {
+        "set -eu\nsudo -n systemctl restart dnsmasq\n".to_owned()
+    };
+    let output = run_local_interactive_script(&reload)?;
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "reload local .ciao resolver".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    Ok(setup)
+}
+
+pub fn remove_local_remote_domain(name: &str) -> Result<()> {
+    validate_local_name(name)?;
+    let path = local_remote_dns_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let domain = local_domain(name)?;
+    let line_prefix = format!("address=/{domain}/");
+    let script = format!(
+        "set -eu\ntmp=$(mktemp)\ntrap 'rm -f \"$tmp\"' EXIT\nif sudo -n test -f {}; then sudo -n grep -Fv -- {} {} >\"$tmp\" || true; sudo -n install -m 0644 \"$tmp\" {}; fi\n",
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&line_prefix),
+        shell_quote(&path.to_string_lossy()),
+        shell_quote(&path.to_string_lossy()),
+    );
+    let output = run_local_interactive_script(&script)?;
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "remove local .ciao route".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudflareTunnelResult {
+    pub app: String,
+    pub domain: String,
+    pub tunnel: String,
+    pub message: String,
+}
+
+/// Configure one standard, locally-managed Cloudflare Tunnel.
+pub fn cloudflare_tunnel_setup(
+    transport: &OpenSshTransport,
+    os: &HostOs,
+    app: &str,
+    domain: &str,
+) -> Result<CloudflareTunnelResult> {
+    validate_identifier("app name", app)?;
+    validate_domain(domain)?;
+    let cloudflared = ensure_local_cloudflared()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CiaoError::Config("HOME is not set; Ciao cannot find cloudflared credentials".to_owned())
+    })?;
+    let cloudflared_dir = home.join(".cloudflared");
+    let cert = cloudflared_dir.join("cert.pem");
+    if !cert.is_file() {
+        let output = run_local_interactive_script(&format!(
+            "set -eu\n{} tunnel login\n",
+            shell_quote(&cloudflared)
+        ))?;
+        if output.status != 0 {
+            return Err(CiaoError::LocalCommand {
+                stage: "sign in to Cloudflare".to_owned(),
+                exit: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+    }
+    if !cert.is_file() {
+        return Err(CiaoError::Config(
+            "Cloudflare login completed without ~/.cloudflared/cert.pem; rerun `cloudflared tunnel login` and retry".to_owned(),
+        ));
+    }
+    let tunnel_name = format!("ciao-{app}");
+    let tunnel_id = find_or_create_cloudflare_tunnel(&cloudflared, &tunnel_name)?;
+    let route = Command::new(&cloudflared)
+        .args(["tunnel", "route", "dns", tunnel_name.as_str(), domain])
+        .output()
+        .map_err(|error| CiaoError::LocalCommand {
+            stage: "create Cloudflare DNS route".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: error.to_string(),
+        })?;
+    if !route.status.success() {
+        let stdout = String::from_utf8_lossy(&route.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&route.stderr).into_owned();
+        let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+        if !combined.contains("already exists") && !combined.contains("already configured") {
+            return Err(CiaoError::LocalCommand {
+                stage: "create Cloudflare DNS route".to_owned(),
+                exit: route.status.code().unwrap_or(1),
+                stdout,
+                stderr,
+            });
+        }
+    }
+    let credential_path = cloudflared_dir.join(format!("{tunnel_id}.json"));
+    let credentials = fs::read_to_string(&credential_path).map_err(|error| {
+        CiaoError::Config(format!(
+            "Cloudflare tunnel credentials are missing at {}; rerun `cloudflared tunnel create {tunnel_name}`: {error}",
+            credential_path.display()
+        ))
+    })?;
+    if credentials.is_empty() || credentials.len() > 1024 * 1024 {
+        return Err(CiaoError::Config(
+            "Cloudflare tunnel credentials are empty or unexpectedly large".to_owned(),
+        ));
+    }
+    ensure_remote_cloudflared(transport, os)?;
+    remote_script(
+        transport,
+        "prepare Cloudflare Tunnel directory",
+        "set -eu\nsudo -n install -d -m 0700 /etc/cloudflared\n",
+    )?;
+    let remote_credentials = format!("/etc/cloudflared/{tunnel_id}.json");
+    write_remote_file(
+        transport,
+        &remote_credentials,
+        &credentials,
+        "root",
+        "install Cloudflare Tunnel credentials",
+    )?;
+    remote_script(
+        transport,
+        "protect Cloudflare Tunnel credentials",
+        &format!(
+            "set -eu\nsudo -n chmod 0600 {}\n",
+            shell_quote(&remote_credentials)
+        ),
+    )?;
+    let remote_config = "/etc/cloudflared/config.yml";
+    let config = format!(
+        "tunnel: {tunnel_id}\ncredentials-file: {remote_credentials}\ningress:\n  - hostname: {domain}\n    service: http://127.0.0.1:80\n    originRequest:\n      httpHostHeader: {domain}\n  - service: http_status:404\n"
+    );
+    write_remote_file(
+        transport,
+        remote_config,
+        &config,
+        "root",
+        "write Cloudflare Tunnel configuration",
+    )?;
+    remote_script(
+        transport,
+        "install Cloudflare Tunnel service",
+        &cloudflared_service_script(os),
+    )?;
+    Ok(CloudflareTunnelResult {
+        app: app.to_owned(),
+        domain: domain.to_owned(),
+        tunnel: tunnel_name,
+        message: format!("Cloudflare Tunnel is active for {domain}"),
+    })
+}
+
+fn cloudflared_executable() -> Option<PathBuf> {
+    find_executable("cloudflared").or_else(|| {
+        [
+            "/opt/homebrew/bin/cloudflared",
+            "/usr/local/bin/cloudflared",
+            "/usr/bin/cloudflared",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+    })
+}
+
+fn ensure_local_cloudflared() -> Result<String> {
+    if let Some(path) = cloudflared_executable() {
+        return Ok(path.display().to_string());
+    }
+    let script = if cfg!(target_os = "macos") {
+        r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'macOS curl is required to install cloudflared' >&2; exit 1; }
+brew_bin=''
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi; done
+if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
+if [ -z "$brew_bin" ]; then
+    brew_script=$(mktemp -t ciao-homebrew)
+    trap 'rm -f "$brew_script"' EXIT
+    curl -fsSL 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' -o "$brew_script"
+    NONINTERACTIVE=1 /bin/bash "$brew_script"
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi; done
+fi
+[ -n "$brew_bin" ] || { echo 'Homebrew installation finished without a usable brew executable' >&2; exit 1; }
+if ! "$brew_bin" list --formula cloudflared >/dev/null 2>&1; then "$brew_bin" install cloudflared; fi
+"#.to_owned()
+    } else if cfg!(target_os = "linux") {
+        r#"set -eu
+command -v apt-get >/dev/null 2>&1 || { echo 'automatic cloudflared installation requires apt-get' >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo 'curl is required to install cloudflared' >&2; exit 1; }
+sudo -n install -d -m 0755 /usr/share/keyrings
+curl -fsSL 'https://pkg.cloudflare.com/cloudflare-main.gpg' | sudo -n tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+printf '%s\n' 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo -n tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+"#.to_owned()
+    } else {
+        return Err(CiaoError::Config(
+            "automatic cloudflared installation is supported on macOS and Linux".to_owned(),
+        ));
+    };
+    let output = run_local_interactive_capture(&format!(
+        "set -eu\nsudo -v </dev/tty >/dev/tty 2>/dev/tty\n{script}"
+    ))?;
+    if output.status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "install cloudflared".to_owned(),
+            exit: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    cloudflared_executable()
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| CiaoError::Config("cloudflared was installed but is not on PATH".to_owned()))
+}
+
+fn find_or_create_cloudflare_tunnel(cloudflared: &str, name: &str) -> Result<String> {
+    if let Ok(output) = Command::new(cloudflared)
+        .args(["tunnel", "list", "--output", "json"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                let items = value
+                    .as_array()
+                    .or_else(|| value.get("tunnels").and_then(serde_json::Value::as_array));
+                if let Some(id) = items.and_then(|items| {
+                    items.iter().find_map(|item| {
+                        (item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                            .then(|| {
+                                item.get("id")
+                                    .or_else(|| item.get("uuid"))
+                                    .and_then(serde_json::Value::as_str)
+                            })
+                            .flatten()
+                    })
+                }) {
+                    return Ok(id.to_owned());
+                }
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(id) = text.lines().find_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.contains(&name).then(|| uuid_from_text(line))?
+            }) {
+                return Ok(id);
+            }
+        }
+    }
+    let output = Command::new(cloudflared)
+        .args(["tunnel", "create", name])
+        .output()
+        .map_err(|error| CiaoError::LocalCommand {
+            stage: "create Cloudflare Tunnel".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: error.to_string(),
+        })?;
+    let output_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Err(CiaoError::LocalCommand {
+            stage: "create Cloudflare Tunnel".to_owned(),
+            exit: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    uuid_from_text(&output_text).ok_or_else(|| {
+        CiaoError::Config("Cloudflare created the tunnel, but Ciao could not read its ID; run `cloudflared tunnel list` and retry".to_owned())
+    })
+}
+
+fn uuid_from_text(value: &str) -> Option<String> {
+    value
+        .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
+        .find(|token| {
+            token.len() == 36
+                && token.chars().enumerate().all(|(index, character)| {
+                    character.is_ascii_hexdigit()
+                        || (matches!(index, 8 | 13 | 18 | 23) && character == '-')
+                })
+        })
+        .map(str::to_owned)
+}
+
+fn ensure_remote_cloudflared(transport: &OpenSshTransport, os: &HostOs) -> Result<()> {
+    if remote_script(
+        transport,
+        "detect cloudflared on target",
+        "set -eu\ncommand -v cloudflared >/dev/null 2>&1\n",
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let script = match os {
+        HostOs::Linux => r#"set -eu
+command -v curl >/dev/null 2>&1 || { echo 'curl is required to install cloudflared' >&2; exit 1; }
+sudo -n install -d -m 0755 /usr/share/keyrings
+curl -fsSL 'https://pkg.cloudflare.com/cloudflare-main.gpg' | sudo -n tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+printf '%s\n' 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo -n tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+"#.to_owned(),
+        HostOs::MacOs => r#"set -eu
+brew_bin=''
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi; done
+if [ -z "$brew_bin" ] && command -v brew >/dev/null 2>&1; then brew_bin=$(command -v brew); fi
+[ -n "$brew_bin" ] || { echo 'Homebrew is not available on the target' >&2; exit 1; }
+if ! "$brew_bin" list --formula cloudflared >/dev/null 2>&1; then "$brew_bin" install cloudflared; fi
+"#.to_owned(),
+        HostOs::Unknown(value) => {
+            return Err(CiaoError::Config(format!(
+                "automatic cloudflared installation is unsupported on host OS {value}"
+            )))
+        }
+    };
+    remote_script(transport, "install cloudflared on target", &script)?;
+    Ok(())
+}
+
+fn cloudflared_service_script(os: &HostOs) -> String {
+    match os {
+        HostOs::Linux => r#"set -eu
+command -v cloudflared >/dev/null 2>&1 || { echo 'cloudflared is not installed on the target' >&2; exit 1; }
+sudo -n cloudflared --config /etc/cloudflared/config.yml service install >/dev/null 2>&1 || true
+sudo -n systemctl enable --now cloudflared
+sudo -n systemctl restart cloudflared
+"#.to_owned(),
+        HostOs::MacOs => r#"set -eu
+command -v cloudflared >/dev/null 2>&1 || { echo 'cloudflared is not installed on the target' >&2; exit 1; }
+sudo -n cloudflared --config /etc/cloudflared/config.yml service install >/dev/null 2>&1 || true
+sudo -n launchctl kickstart -k system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared
+"#.to_owned(),
+        HostOs::Unknown(_) => String::new(),
+    }
 }
 
 fn local_setup_result() -> LocalSetupResult {
@@ -4024,7 +4640,7 @@ pub fn local_dev_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
         ));
     }
     let mut script = format!(
-        "set -eu\ncd -- {}\nexport HOST=127.0.0.1\nexport PORT={}\n",
+        "set -eu\ntrap 'exit 130' INT TERM\ncd -- {}\nexport HOST=127.0.0.1\nexport PORT={}\n",
         shell_quote(&plan.source.to_string_lossy()),
         plan.port
     );
@@ -4043,6 +4659,204 @@ pub fn local_dev_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
     script.push_str(run);
     script.push('\n');
     Ok(script.into_bytes())
+}
+
+/// Build the short-lived local runner used by `ciao run`.
+///
+/// This path never installs Caddy and never writes the `.ciao` resolver. It
+/// runs one project on loopback, then exits when the foreground process exits.
+pub fn local_run_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
+    let mut script = format!(
+        "set -eu\ntrap 'exit 130' INT TERM\ncd -- {}\nexport HOST=127.0.0.1\nexport PORT={}\n",
+        shell_quote(&plan.source.to_string_lossy()),
+        plan.port
+    );
+    for command in [&plan.install_command, &plan.build_command]
+        .into_iter()
+        .flatten()
+    {
+        if command.trim().is_empty() {
+            return Err(CiaoError::Config(
+                "local install/build command cannot be empty".to_owned(),
+            ));
+        }
+        script.push_str(command);
+        script.push('\n');
+    }
+    match plan.app_type {
+        AppType::Service => {
+            let run = plan
+                .run_command
+                .as_deref()
+                .ok_or_else(|| CiaoError::Config("local service has no run command".to_owned()))?;
+            if run.trim().is_empty() {
+                return Err(CiaoError::Config(
+                    "local service run command cannot be empty".to_owned(),
+                ));
+            }
+            script.push_str("exec ");
+            script.push_str(run);
+            script.push('\n');
+        }
+        AppType::Static => {
+            let root = plan.static_root.as_ref().ok_or_else(|| {
+                CiaoError::Config("static project has no output directory".to_owned())
+            })?;
+            let root = shell_quote(&root.to_string_lossy());
+            script.push_str(&format!(
+                "test -d {root} || {{ echo 'static build did not create {}' >&2; exit 1; }}\n",
+                shell_quote(
+                    plan.static_root
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy())
+                        .as_deref()
+                        .unwrap_or("the output directory")
+                ),
+                root = root
+            ));
+            script.push_str("if command -v python3 >/dev/null 2>&1; then exec python3 -m http.server \"$PORT\" --bind 127.0.0.1 --directory ");
+            script.push_str(&root);
+            script.push_str("; fi\n");
+            script.push_str("if command -v python >/dev/null 2>&1; then exec python -m http.server \"$PORT\" --bind 127.0.0.1 --directory ");
+            script.push_str(&root);
+            script.push_str("; fi\n");
+            script.push_str("if command -v npx >/dev/null 2>&1; then exec npx --yes serve --listen \"127.0.0.1:$PORT\" ");
+            script.push_str(&root);
+            script.push_str("; fi\n");
+            script.push_str(
+                "echo 'ciao run needs python3, python or npx to serve static files' >&2\nexit 127\n",
+            );
+        }
+    }
+    Ok(script.into_bytes())
+}
+
+pub fn run_local_project(plan: &LocalDevPlan) -> Result<i32> {
+    run_local_project_with_reporter(plan, &NoopProgressReporter)
+}
+
+pub fn run_local_project_with_reporter(
+    plan: &LocalDevPlan,
+    reporter: &dyn ProgressReporter,
+) -> Result<i32> {
+    for (step, command) in [
+        ("install dependencies", plan.install_command.as_deref()),
+        ("build", plan.build_command.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(step, command)| command.map(|command| (step, command)))
+    {
+        if command.trim().is_empty() {
+            return Err(CiaoError::Config(format!(
+                "local {step} command cannot be empty"
+            )));
+        }
+        progress_step(reporter, step, || {
+            let script = format!(
+                "set -eu\ncd -- {}\n{}\n",
+                shell_quote(&plan.source.to_string_lossy()),
+                command
+            );
+            let output = run_local_script(script.as_bytes())?;
+            if output.status != 0 {
+                return Err(CiaoError::LocalCommand {
+                    stage: step.to_owned(),
+                    exit: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            Ok(())
+        })?;
+    }
+    let mut process = match plan.app_type {
+        AppType::Service => {
+            let run = plan
+                .run_command
+                .as_deref()
+                .ok_or_else(|| CiaoError::Config("local service has no run command".to_owned()))?;
+            if run.trim().is_empty() {
+                return Err(CiaoError::Config(
+                    "local service run command cannot be empty".to_owned(),
+                ));
+            }
+            let script = format!(
+                "set -eu\ncd -- {}\nexec {}\n",
+                shell_quote(&plan.source.to_string_lossy()),
+                run
+            );
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOST", "127.0.0.1")
+                .env("PORT", plan.port.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            let mut child = command.spawn()?;
+            if let Err(error) = child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())
+            {
+                terminate_child(&mut child);
+                return Err(error.into());
+            }
+            child
+        }
+        AppType::Static => {
+            let root = plan.static_root.as_ref().ok_or_else(|| {
+                CiaoError::Config("static project has no output directory".to_owned())
+            })?;
+            if !root.is_dir() {
+                return Err(CiaoError::Detection(format!(
+                    "static build did not create {}",
+                    root.display()
+                )));
+            }
+            let mut command;
+            if let Some(program) = ["python3", "python"]
+                .into_iter()
+                .find(|program| find_executable(program).is_some())
+            {
+                command = Command::new(program);
+                command.args([
+                    "-m",
+                    "http.server",
+                    &plan.port.to_string(),
+                    "--bind",
+                    "127.0.0.1",
+                    "--directory",
+                    &root.to_string_lossy(),
+                ]);
+            } else if find_executable("npx").is_some() {
+                command = Command::new("npx");
+                command.args([
+                    "--yes",
+                    "serve",
+                    "--listen",
+                    &format!("127.0.0.1:{}", plan.port),
+                    &root.to_string_lossy(),
+                ]);
+            } else {
+                return Err(CiaoError::Config(
+                    "ciao run needs python3, python or npx to serve static files".to_owned(),
+                ));
+            }
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            command.spawn()?
+        }
+    };
+    reporter.started("start local server");
+    let status = process.wait()?.code().unwrap_or(128);
+    if status == 0 {
+        reporter.finished("start local server");
+    } else {
+        reporter.failed("start local server");
+    }
+    Ok(status)
 }
 
 pub fn run_local_dev(plan: &LocalDevPlan) -> Result<i32> {
@@ -4312,7 +5126,7 @@ fn runtime_init_script(
         (HostOs::Linux, Runtime::Go) => {
             "set -eu\nif ! command -v go >/dev/null 2>&1; then sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go; fi\ncommand -v go >/dev/null 2>&1\n".to_owned()
         }
-        (HostOs::Linux, Runtime::Node) => {
+        (HostOs::Linux, Runtime::Node | Runtime::Astro) => {
             "set -eu\nif ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; fi\ncommand -v node >/dev/null 2>&1\ncommand -v npm >/dev/null 2>&1\n".to_owned()
         }
         (HostOs::Linux, Runtime::Bun) => format!(
@@ -4333,7 +5147,9 @@ command -v bun >/dev/null 2>&1
         (HostOs::MacOs, Runtime::Rust) => macos_runtime_script("rust", &["cargo", "rustc"]),
         (HostOs::MacOs, Runtime::Go) => macos_runtime_script("go", &["go"]),
         (HostOs::MacOs, Runtime::Bun) => macos_runtime_script("bun", &["bun"]),
-        (HostOs::MacOs, Runtime::Node) => macos_runtime_script("node", &["node", "npm"]),
+        (HostOs::MacOs, Runtime::Node | Runtime::Astro) => {
+            macos_runtime_script("node", &["node", "npm"])
+        }
         (HostOs::Unknown(value), _) => {
             return Err(CiaoError::Config(format!(
                 "runtime initialization is unsupported on OS {value}"
@@ -4609,9 +5425,9 @@ fn deploy_unlocked(
     validate_identifier("release", &release)?;
     if dry_run {
         let steps = if plan.app_type == AppType::Static {
-            "upload, create immutable release, activate current"
+            "upload, install dependencies, build, verify static output, activate current, update local Ciao route"
         } else {
-            "upload, install dependencies, build, start candidate, healthcheck, activate service"
+            "upload, install dependencies, build, start candidate, healthcheck, activate service, update local Ciao route"
         };
         let planned_port = if plan.app_type == AppType::Static {
             None
@@ -4724,6 +5540,42 @@ fn deploy_unlocked(
             )
         })?;
         if plan.app_type == AppType::Static {
+            if let Some(install) = plan.install_command.as_deref() {
+                progress_step(reporter, "install dependencies", || {
+                    run_as_user_script(
+                        transport,
+                        &user,
+                        "install dependencies",
+                        &command_script_with_home(install, &release_path, &build_home, &build_env)?,
+                    )
+                })?;
+            }
+            if let Some(build) = plan.build_command.as_deref() {
+                progress_step(reporter, "build static site", || {
+                    run_as_user_script(
+                        transport,
+                        &user,
+                        "build static site",
+                        &command_script_with_home(build, &release_path, &build_home, &build_env)?,
+                    )
+                })?;
+            }
+            let static_directory = plan.static_directory.as_deref().ok_or_else(|| {
+                CiaoError::Config("static deployment has no output directory".to_owned())
+            })?;
+            let static_path = format!("{release_path}/{static_directory}");
+            progress_step(reporter, "verify static output", || {
+                remote_script(
+                    transport,
+                    "verify static output",
+                    &format!(
+                        "set -eu\nsudo -n test -d {} || {{ echo 'static build did not create {}' >&2; exit 1; }}\n",
+                        shell_quote(&static_path),
+                        shell_quote(static_directory)
+                    ),
+                )
+                .map(|_| ())
+            })?;
             progress_step(reporter, "activate static release", || {
                 harden_release(transport, &platform.os, &release_path)?;
                 remote_script(
@@ -4838,9 +5690,16 @@ fn deploy_unlocked(
                 remote_healthcheck(transport, port, &plan.health)
             })?;
         }
+        progress_step(reporter, "configure local Ciao domain", || {
+            configure_remote_ciao_domain(transport, &plan.name)
+        })?;
         if let Some(domain) = effective_domain {
             progress_step(reporter, "configure domain", || {
-                configure_domain(transport, &plan.name, domain)
+                if existing_domain_is_plain_http(transport, &plan.name)? {
+                    configure_domain_for_cloudflare(transport, &plan.name, domain)
+                } else {
+                    configure_domain(transport, &plan.name, domain)
+                }
             })?;
         }
         progress_step(reporter, "prune old releases", || {
@@ -4869,8 +5728,14 @@ fn deploy_unlocked(
                     );
                 }
                 if let Some(domain) = retained_domain.as_deref() {
-                    let _ = configure_domain(transport, &plan.name, domain);
+                    let _ = if existing_domain_is_plain_http(transport, &plan.name).unwrap_or(false)
+                    {
+                        configure_domain_for_cloudflare(transport, &plan.name, domain)
+                    } else {
+                        configure_domain(transport, &plan.name, domain)
+                    };
                 }
+                let _ = configure_remote_ciao_domain(transport, &plan.name);
             }
         } else {
             if effective_domain.is_some() {
@@ -4894,6 +5759,14 @@ fn deploy_unlocked(
                     ),
                 );
             }
+            let _ = remote_script(
+                transport,
+                "remove failed local Ciao route",
+                &format!(
+                    "set -eu\nsudo -n rm -f {}\n",
+                    shell_quote(&format!("/etc/caddy/ciao/{}.local.caddy", plan.name))
+                ),
+            );
             let _ = remove_service(
                 transport,
                 &platform.os,
@@ -5162,8 +6035,13 @@ pub fn rollback(transport: &OpenSshTransport, app: &str) -> Result<OperationResu
             )?;
         }
         if let Some(domain) = retained_domain.as_deref() {
-            add_domain(transport, app, domain)?;
+            if existing_domain_is_plain_http(transport, app)? {
+                configure_domain_for_cloudflare(transport, app, domain)?;
+            } else {
+                add_domain(transport, app, domain)?;
+            }
         }
+        configure_remote_ciao_domain(transport, app)?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = activation {
@@ -5189,8 +6067,13 @@ pub fn rollback(transport: &OpenSshTransport, app: &str) -> Result<OperationResu
                 )?;
             }
             if let Some(domain) = retained_domain.as_deref() {
-                add_domain(transport, app, domain)?;
+                if existing_domain_is_plain_http(transport, app)? {
+                    configure_domain_for_cloudflare(transport, app, domain)?;
+                } else {
+                    add_domain(transport, app, domain)?;
+                }
             }
+            configure_remote_ciao_domain(transport, app)?;
             Ok::<(), CiaoError>(())
         })();
         let recovery = match restore {
@@ -5300,6 +6183,69 @@ fn configure_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Re
     Ok(())
 }
 
+/// Use plain HTTP between a Cloudflare Tunnel and Caddy. Cloudflare handles
+/// the public TLS connection; keeping the origin local avoids a certificate
+/// challenge loop through the tunnel.
+pub fn configure_domain_for_cloudflare(
+    transport: &OpenSshTransport,
+    app: &str,
+    domain: &str,
+) -> Result<()> {
+    validate_identifier("app name", app)?;
+    validate_domain(domain)?;
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    let release = read_current_release(transport, &root, app)?
+        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, domain, true)?;
+    let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
+    write_remote_file(
+        transport,
+        &fragment_path,
+        &fragment,
+        "root",
+        "write Cloudflare Caddy route",
+    )?;
+    remote_script(
+        transport,
+        "reload Caddy for Cloudflare",
+        &caddy_reload_script(&platform.os),
+    )?;
+    Ok(())
+}
+
+/// Add the stable local `.ciao` host on the remote Caddy instance. It uses a
+/// separate fragment, so a public domain configured for the same app remains
+/// active at the same time.
+pub fn configure_remote_ciao_domain(transport: &OpenSshTransport, app: &str) -> Result<()> {
+    validate_identifier("app name", app)?;
+    let domain = local_domain(app)?;
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    let release = read_current_release(transport, &root, app)?
+        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, &domain, true)?;
+    let fragment_path = format!("/etc/caddy/ciao/{app}.local.caddy");
+    remote_script(
+        transport,
+        "prepare local Ciao Caddy directory",
+        "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
+    )?;
+    write_remote_file(
+        transport,
+        &fragment_path,
+        &fragment,
+        "root",
+        "write local Ciao Caddy route",
+    )?;
+    remote_script(
+        transport,
+        "reload Caddy for local Ciao domain",
+        &caddy_reload_script(&platform.os),
+    )?;
+    Ok(())
+}
+
 fn remove_domain_fragment(transport: &OpenSshTransport, app: &str) -> Result<()> {
     validate_identifier("app name", app)?;
     let path = format!("/etc/caddy/ciao/{app}.caddy");
@@ -5318,16 +6264,32 @@ fn caddy_fragment(
     release: &str,
     domain: &str,
 ) -> Result<String> {
+    caddy_fragment_with_scheme(transport, root, app, release, domain, false)
+}
+
+fn caddy_fragment_with_scheme(
+    transport: &OpenSshTransport,
+    root: &str,
+    app: &str,
+    release: &str,
+    domain: &str,
+    cloudflare_origin: bool,
+) -> Result<String> {
+    let site = if cloudflare_origin {
+        format!("http://{domain}")
+    } else {
+        domain.to_owned()
+    };
     if let Some(static_directory) = read_release_static_directory(transport, root, app, release)? {
         let static_root = format!("{root}/{app}/releases/{release}/{static_directory}");
         Ok(format!(
-            "{domain} {{\n    root * {}\n    file_server\n}}\n",
+            "{site} {{\n    root * {}\n    file_server\n}}\n",
             static_root
         ))
     } else {
         let port = read_release_port(transport, root, app, release)?.unwrap_or(PORT_START);
         Ok(format!(
-            "{domain} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n"
+            "{site} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n"
         ))
     }
 }
@@ -5348,9 +6310,29 @@ fn read_existing_domain(transport: &OpenSshTransport, app: &str) -> Result<Optio
     if value.is_empty() {
         Ok(None)
     } else {
-        validate_domain(value)?;
-        Ok(Some(value.to_owned()))
+        let normalized = value
+            .strip_prefix("http://")
+            .or_else(|| value.strip_prefix("https://"))
+            .unwrap_or(value)
+            .trim_end_matches('/');
+        validate_domain(normalized)?;
+        Ok(Some(normalized.to_owned()))
     }
+}
+
+fn existing_domain_is_plain_http(transport: &OpenSshTransport, app: &str) -> Result<bool> {
+    validate_identifier("app name", app)?;
+    let path = format!("/etc/caddy/ciao/{app}.caddy");
+    let output = remote_script(
+        transport,
+        "read existing domain scheme",
+        &format!(
+            "set -eu\nif sudo -n test -f {}; then sudo -n awk 'NR == 1 {{print $1; exit}}' {}; fi\n",
+            shell_quote(&path),
+            shell_quote(&path)
+        ),
+    )?;
+    Ok(output.stdout.trim_start().starts_with("http://"))
 }
 
 pub fn remove_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
@@ -6566,6 +7548,56 @@ mod tests {
     }
 
     #[test]
+    fn astro_is_detected_as_static_with_a_build_output_before_dist_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"build":"astro build"},"devDependencies":{"astro":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"astro-site\"\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("astro.config.mjs"),
+            "export default {};\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.runtime, Runtime::Astro);
+        assert_eq!(plan.app_type, AppType::Static);
+        assert_eq!(plan.static_directory.as_deref(), Some("dist"));
+        assert_eq!(plan.build_command.as_deref(), Some("npm run build"));
+        assert!(plan.run_command.is_none());
+    }
+
+    #[test]
+    fn astro_server_output_remains_a_service() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"build":"astro build","start":"node ./dist/server/entry.mjs"},"dependencies":{"astro":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"astro-server\"\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("astro.config.mjs"),
+            "export default { output: 'server' };\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.runtime, Runtime::Astro);
+        assert_eq!(plan.app_type, AppType::Service);
+        assert_eq!(plan.run_command.as_deref(), Some("npm start"));
+    }
+
+    #[test]
     fn local_dev_keeps_name_and_mapping_stable_while_avoiding_collisions() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
@@ -6633,6 +7665,28 @@ mod tests {
     }
 
     #[test]
+    fn local_run_serves_static_output_without_caddy() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = LocalDevPlan {
+            name: "site".to_owned(),
+            domain: "site.ciao".to_owned(),
+            port: 41001,
+            source: directory.path().to_path_buf(),
+            runtime: Runtime::Astro,
+            app_type: AppType::Static,
+            install_command: Some("npm ci".to_owned()),
+            build_command: Some("npm run build".to_owned()),
+            run_command: None,
+            static_root: Some(directory.path().join("dist")),
+        };
+        let script = String::from_utf8(local_run_script(&plan).unwrap()).unwrap();
+        assert!(script.contains("npm ci"));
+        assert!(script.contains("npm run build"));
+        assert!(script.contains("python3 -m http.server"));
+        assert!(!script.contains("caddy"));
+    }
+
+    #[test]
     fn local_setup_script_installs_native_dependencies_without_hosts_entries() {
         let script = local_setup_script().unwrap();
         assert!(script.contains("dnsmasq"));
@@ -6643,6 +7697,24 @@ mod tests {
             assert!(script.contains("dev.ciao.local-loopback"));
             assert!(script.contains("/Library/LaunchDaemons"));
         }
+    }
+
+    #[test]
+    fn remote_resolver_setup_does_not_install_a_local_proxy() {
+        let script = local_resolver_setup_script().unwrap();
+        assert!(script.contains("dnsmasq"));
+        assert!(!script.contains("Caddy"));
+        assert!(!script.contains("caddy"));
+        assert!(!script.contains("/etc/hosts"));
+    }
+
+    #[test]
+    fn cloudflare_tunnel_ids_are_read_only_from_uuid_tokens() {
+        assert_eq!(
+            uuid_from_text("Created tunnel ciao-demo with id 123e4567-e89b-12d3-a456-426614174000"),
+            Some("123e4567-e89b-12d3-a456-426614174000".to_owned())
+        );
+        assert!(uuid_from_text("not a tunnel id").is_none());
     }
 
     #[test]

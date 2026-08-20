@@ -36,6 +36,8 @@ enum Command {
     Deploy(DeployArgs),
     /// Run the current project behind the local *.ciao resolver and Caddy.
     Dev(DevArgs),
+    /// Run the detected project on loopback for a temporary local test.
+    Run(RunArgs),
     Status(AppArgs),
     /// List applications managed on a host.
     Apps {
@@ -176,6 +178,15 @@ struct DevArgs {
     name: Option<String>,
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Use a fixed loopback port instead of the automatic Ciao port.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
@@ -375,7 +386,19 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("✓ dry-run complete");
             }
             output(&result, cli.json, || result.message.clone());
-            if !args.ci && !args.dry_run {
+            if !args.ci && !args.dry_run && interactive_output {
+                if let Err(error) = offer_remote_local_domain(&transport, &result.app) {
+                    eprintln!(
+                        "! deployment succeeded, but local .ciao routing was not configured: {error}"
+                    );
+                }
+                if let Some(domain) = args.domain.as_deref() {
+                    if let Err(error) = setup_cloudflare_tunnel(&transport, &result.app, domain) {
+                        eprintln!(
+                            "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
+                        );
+                    }
+                }
                 if let Err(error) = offer_github_setup(&path, &args.host, &result.app, cli.json) {
                     eprintln!(
                         "! deployment succeeded, but GitHub auto-deploy was not configured: {error}"
@@ -385,6 +408,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Dev(args) => local_dev_command(args, cli.json),
+        Command::Run(args) => local_run_command(args, cli.json),
         Command::Status(args) => {
             let transport =
                 authorized_transport_for(&args.host, cli.json, "reading application status")?;
@@ -615,6 +639,100 @@ fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
             stderr: String::new(),
         });
     }
+    Ok(())
+}
+
+fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
+    let source = args.path.canonicalize()?;
+    let mut detected = detect_project(&source)?;
+    if let Some(port) = args.port {
+        detected.local_port = Some(port);
+        detected.port_explicit = true;
+    }
+    let plan = local_dev_plan(&source, &detected, None, &LocalConfig::default())?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "project": plan.name,
+                "runtime": plan.runtime,
+                "app_type": plan.app_type,
+                "source": plan.source,
+                "port": plan.port,
+                "url": format!("http://127.0.0.1:{}", plan.port),
+                "temporary": true,
+            }))
+            .map_err(ser_error)?
+        );
+    } else {
+        println!("✓ project detected: {}", plan.runtime);
+        println!("✓ temporary local server: http://127.0.0.1:{}", plan.port);
+        println!("  Press Ctrl-C to stop.");
+        println!();
+    }
+    let progress = TerminalProgress::new();
+    let status = run_local_project_with_reporter(&plan, &progress)?;
+    if status != 0 {
+        return Err(CiaoError::LocalCommand {
+            stage: "run temporary local project".to_owned(),
+            exit: status,
+            stdout: "process output was streamed to the terminal".to_owned(),
+            stderr: String::new(),
+        });
+    }
+    Ok(())
+}
+
+fn offer_remote_local_domain(transport: &OpenSshTransport, app: &str) -> Result<()> {
+    ensure_local_tailscale()?;
+    if local_tailscale_target().is_err() {
+        let url = start_local_tailscale_auth()?.ok_or_else(|| {
+            CiaoError::Config(
+                "local Tailscale authentication finished without a connected device".to_owned(),
+            )
+        })?;
+        eprintln!("Ciao is opening the local Tailscale sign-in page in your browser.");
+        if let Err(error) = open_tailscale_auth_url(&url) {
+            eprintln!("{error}");
+        }
+        eprintln!("Complete sign-in. Ciao will continue automatically.");
+        wait_for_local_tailscale_auth(Duration::from_secs(300))?;
+    }
+    let platform = transport.inspect()?;
+    let _ = ensure_tailscale_target(transport, &platform.os)?;
+    let remote_tailscale = if let Some(url) = start_tailscale_auth(transport)? {
+        eprintln!("Ciao is opening the target Tailscale sign-in page in your browser.");
+        if let Err(error) = open_tailscale_auth_url(&url) {
+            eprintln!("{error}");
+        }
+        eprintln!("Complete sign-in. Ciao will continue automatically.");
+        wait_for_tailscale_auth(transport, Duration::from_secs(300))?
+    } else {
+        tailscale_target(transport)?
+    };
+    let address = remote_tailscale.ipv4.clone().ok_or_else(|| {
+        CiaoError::Config(
+            "Tailscale is connected, but the target has no IPv4 address for local .ciao DNS"
+                .to_owned(),
+        )
+    })?;
+    let result = configure_local_remote_domain(app, &address)?;
+    println!(
+        "✓ local route: http://{}.ciao → {} via Tailscale",
+        app, address
+    );
+    if !result.dependencies.is_empty() {
+        println!("  resolver ready (no local Caddy)");
+    }
+    Ok(())
+}
+
+fn setup_cloudflare_tunnel(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
+    let platform = transport.inspect()?;
+    let result = cloudflare_tunnel_setup(transport, &platform.os, app, domain)?;
+    configure_domain_for_cloudflare(transport, app, domain)?;
+    println!("✓ public domain: https://{}", result.domain);
+    println!("  {}", result.message);
     Ok(())
 }
 

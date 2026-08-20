@@ -1,5 +1,34 @@
 Aggiungi a Ciao una modalità di sviluppo locale integrata basata su domini **`.ciao`** e porte automatiche.
 
+## Due usi
+
+`ciao dev` serve un processo che gira su questo computer. Usa dnsmasq e Caddy
+locali:
+
+```text
+my-app.ciao -> 127.0.0.1 -> Caddy locale -> processo locale
+```
+
+Per una prova rapida senza DNS e senza Caddy usa:
+
+```bash
+ciao run
+```
+
+Ciao rileva il progetto, esegue install e build e avvia un server temporaneo
+su `127.0.0.1`. Premi `Ctrl-C` per fermarlo.
+
+`ciao deploy home` usa lo stesso resolver, ma non installa Caddy locale. Dopo
+il deploy crea una regola DNS precisa per il progetto:
+
+```text
+my-app.ciao -> indirizzo Tailscale dell'host -> Caddy sull'host -> app
+```
+
+Il processo remoto resta sul server. Se Tailscale manca, Ciao lo installa e
+apre il login nel browser. Il resolver locale richiede una password
+amministrativa una sola volta.
+
 La UX desiderata è:
 
 ```bash
@@ -137,3 +166,7 @@ Silicon e Intel e viene installato se assente; inoltre un piccolo job launchd
 ripristina l'alias loopback usato dal resolver dopo il reboot. Su Linux sono
 supportati apt e systemd-resolved. Il setup è idempotente e non modifica
 `/etc/hosts` per progetto.
+
+Per `ciao deploy`, Ciao installa solo dnsmasq e il resolver nativo su questo
+computer. Scrive le regole remote in un file Ciao-owned di dnsmasq. Non avvia
+Caddy locale e non espone porte dell'app sul computer.

@@ -428,7 +428,9 @@ Command:
 ciao domain add home myapp app.example.com
 ```
 
-DNS remains the user's responsibility unless a provider adapter is explicitly configured.
+For a Cloudflare-managed domain, `ciao deploy home --domain app.example.com`
+configures the DNS route and the standard `cloudflared` service. Other DNS
+providers remain the user's responsibility.
 
 ---
 
@@ -439,8 +441,13 @@ Cloudflare Tunnel should be a first-class optional exposure method for homeserve
 Example:
 
 ```bash
-ciao expose home myapp --cloudflare app.example.com
+ciao deploy home --domain app.example.com
 ```
+
+Ciao installs `cloudflared` when needed, opens the standard browser login,
+creates or reuses a tunnel, creates the DNS route and installs the standard
+Cloudflare service on the host. The user still owns the Cloudflare account and
+the domain.
 
 Architecture:
 
@@ -622,6 +629,7 @@ Rust
 Go
 Bun
 Node
+Astro static sites
 static sites
 ```
 
@@ -866,6 +874,10 @@ public/
 ```
 
 Ciao should serve the files directly through Caddy.
+
+Astro static projects are detected from `package.json` and built with their
+normal package-manager command before Ciao activates the `dist/` directory.
+Use `ciao run` for a temporary loopback server without Caddy.
 
 Result:
 
@@ -2212,22 +2224,17 @@ Do not require it for the core product.
 
 ---
 
-# 64. Potential future localhost mode
+# 64. Local development modes
 
-The separate “localhost done well” idea can later become:
+Use `ciao run` for a temporary local process:
 
 ```bash
-ciao dev
+ciao run
 ```
 
-with:
-
-```text
-api.project.localhost
-admin.project.localhost
-```
-
-But do not build this first.
+Use `ciao dev` when you want a stable `.ciao` URL and the local Caddy reverse
+proxy. A deployed app uses the same `.ciao` name, but the resolver points to
+the host's Tailscale address and Caddy stays on the host.
 
 Deployment is Ciao's initial identity.
 

@@ -55,8 +55,21 @@ ciao deploy home
 ```
 
 The first deploy checks the host. It installs missing tools, including Caddy.
-If SSH needs a password, Ciao opens the normal SSH prompt. Ciao does not read
-or save the password.
+It also connects the host to Tailscale and adds `my-app.ciao` on this computer.
+That address reaches the app on the server. The app does not run on this
+computer. If SSH needs a password, Ciao opens the normal SSH prompt. Ciao does
+not read or save the password.
+
+For a public hostname on a Cloudflare-managed domain, use the same command
+with `--domain`:
+
+```bash
+ciao deploy home --domain app.example.com
+```
+
+Ciao installs `cloudflared` when needed, opens the Cloudflare sign-in page once,
+creates or reuses a standard tunnel, creates the DNS route and starts the
+standard `cloudflared` service on the host.
 
 Use a normal SSH key for later commands. Ciao can create the key and install
 the public key during the guided host setup.
@@ -80,12 +93,23 @@ or offers a safe lock recovery on the next deploy.
 - Go
 - Bun
 - Node
+- Astro static sites
 - Static sites
 
 Ciao detects the project. Add `ciao.toml` only when you need custom build,
 run, health check, domain or environment settings.
 
 ## Local development
+
+For a temporary test on this computer, use:
+
+```bash
+ciao run
+```
+
+Ciao detects the project, installs and builds it, then starts it on
+`127.0.0.1`. Press `Ctrl-C` to stop it. This command does not configure DNS or
+Caddy.
 
 Run an app locally with a stable `.ciao` address:
 
@@ -94,7 +118,8 @@ ciao dev
 ```
 
 Ciao configures the local DNS and Caddy setup. A project named `my-app` uses
-`http://my-app.ciao`. The setup is automatic and can be customized later.
+`http://my-app.ciao`. This mode is for a process running on this computer. The
+remote route created by `ciao deploy` does not use local Caddy.
 
 ## GitHub and Tailscale
 
