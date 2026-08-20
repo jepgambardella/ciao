@@ -863,7 +863,7 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         .unwrap_or_else(|| repository.default_branch.clone());
     validate_github_branch(&branch)?;
     repository.default_branch = branch.clone();
-    let plan = detect_project(&root)?;
+    let plan = detect_single_project(&root)?;
     let app = args.app.unwrap_or(plan.name);
     validate_identifier("app name", &app)?;
 
@@ -1116,7 +1116,7 @@ fn github_unlink(args: GithubUnlinkArgs, json_output: bool) -> Result<()> {
             .ok_or_else(|| CiaoError::Config("no GitHub origin found".to_owned()))?
             .reference(),
     )?;
-    let plan = detect_project(&root)?;
+    let plan = detect_single_project(&root)?;
     let app = args.app.unwrap_or(plan.name);
     let key = github_link_key(&repository.full_name(), &app);
     let mut config = GitHubConfig::load(&github_config_path())?;
@@ -1822,16 +1822,23 @@ fn mcp_call(name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         .map_err(ser_error)?),
         "inspect_app" => {
             let path = optional_string(args, "path")?.unwrap_or(".");
-            Ok(
-                serde_json::to_value(detect_project(&PathBuf::from(path).canonicalize()?)?)
-                    .map_err(ser_error)?,
-            )
+            let path = PathBuf::from(path).canonicalize()?;
+            let components = detect_project_components(&path)?;
+            if components.is_empty() {
+                Ok(serde_json::to_value(detect_project(&path)?).map_err(ser_error)?)
+            } else {
+                Ok(json!({
+                    "project": path.file_name().map(|name| name.to_string_lossy().into_owned()),
+                    "kind": "full-stack",
+                    "components": components,
+                }))
+            }
         }
         "deploy_app" => {
             let host_name = required_string(args, "host")?;
             let path =
                 PathBuf::from(optional_string(args, "path")?.unwrap_or(".")).canonicalize()?;
-            let plan = detect_project(&path)?;
+            let plan = detect_single_project(&path)?;
             let domain = optional_string(args, "domain")?;
             let dry_run = optional_bool(args, "dry_run")?.unwrap_or(false);
             let transport = transport_for(host_name)?;
