@@ -1138,11 +1138,11 @@ jobs:
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
           base="https://github.com/jepgambardella/ciao/releases/download/$CIAO_VERSION"
-          curl --fail --silent --show-error --location "$base/ciao-linux-x86_64" -o "$work/ciao"
+          curl --fail --silent --show-error --location "$base/ciao-linux-x86_64" -o "$work/ciao-linux-x86_64"
           curl --fail --silent --show-error --location "$base/checksums.txt" -o "$work/checksums.txt"
           (cd "$work" && grep '  ciao-linux-x86_64$' checksums.txt | sha256sum --check -)
           install -d -m 0755 "$HOME/.local/bin"
-          install -m 0755 "$work/ciao" "$HOME/.local/bin/ciao"
+          install -m 0755 "$work/ciao-linux-x86_64" "$HOME/.local/bin/ciao"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Confirm project plan
         env:
