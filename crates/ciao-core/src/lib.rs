@@ -4534,15 +4534,23 @@ pub fn local_caddy_fragment(plan: &LocalDevPlan) -> Result<String> {
         ));
     }
     let site = format!("http://{}", plan.domain);
-    match (&plan.app_type, &plan.static_root) {
-        (AppType::Static, Some(root)) => Ok(format!(
+    match (&plan.app_type, &plan.runtime, &plan.static_root) {
+        // Astro static projects use the foreground dev server for `ciao run`.
+        // Proxy the canonical hostname to that server so Vite HMR can update
+        // CSS and pages while the command is running. Remote deploys still
+        // serve the immutable `dist` release as usual.
+        (AppType::Static, Runtime::Astro, _) => Ok(format!(
+            "{site} {{\n    reverse_proxy 127.0.0.1:{}\n}}\n",
+            plan.port
+        )),
+        (AppType::Static, _, Some(root)) => Ok(format!(
             "{site} {{\n    root * {}\n    file_server\n}}\n",
             caddyfile_quote(root)?
         )),
-        (AppType::Static, None) => Err(CiaoError::Config(
+        (AppType::Static, _, None) => Err(CiaoError::Config(
             "static local project has no directory to serve".to_owned(),
         )),
-        (AppType::Service, _) => Ok(format!(
+        (AppType::Service, _, _) => Ok(format!(
             "{site} {{\n    reverse_proxy 127.0.0.1:{}\n}}\n",
             plan.port
         )),
@@ -8504,6 +8512,14 @@ mod tests {
         assert!(local_caddy_fragment(&static_plan)
             .unwrap()
             .contains("file_server"));
+
+        let astro_plan = LocalDevPlan {
+            runtime: Runtime::Astro,
+            ..static_plan
+        };
+        let astro_fragment = local_caddy_fragment(&astro_plan).unwrap();
+        assert!(astro_fragment.contains("reverse_proxy 127.0.0.1:41001"));
+        assert!(!astro_fragment.contains("file_server"));
     }
 
     #[test]

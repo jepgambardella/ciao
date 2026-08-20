@@ -4,7 +4,15 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
-No changes yet.
+- Route local Astro projects through the dev server so CSS and page changes
+  update immediately through the `.localhost` address.
+
+## [v0.1.6]
+
+- Proxy `ciao run` Astro projects to the foreground Vite/Astro server instead
+  of serving the previous `dist` build through Caddy.
+- Keep static site deploys unchanged: remote releases still build and serve
+  the immutable output directory.
 
 ## [v0.1.5]
 
