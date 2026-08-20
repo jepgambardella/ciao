@@ -6,12 +6,18 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.7]
+
+- Bound captured process output to 64 KiB while continuing to drain pipes.
+- Stop remote command capture on Ctrl-C and wait for the child cleanly.
+- Remove unused Unicode-width support from the terminal spinner dependency.
+
 ## [v0.1.6]
 
 - Proxy `ciao run` Astro projects to the foreground Vite/Astro server instead
   of serving the previous `dist` build through Caddy.
 - Keep static site deploys unchanged: remote releases still build and serve
-  the immutable output directory.
+  the immutable `dist` release as usual.
 
 ## [v0.1.5]
 

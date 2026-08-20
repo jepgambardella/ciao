@@ -3672,6 +3672,10 @@ struct UploadChildren {
     armed: bool,
 }
 
+// Keep diagnostics bounded while continuing to drain each pipe. Stopping at
+// the limit would let a noisy child block on a full pipe.
+const PIPE_CAPTURE_LIMIT: usize = 64 * 1024;
+
 impl UploadChildren {
     fn new(tar: Child, remote: Child) -> Self {
         Self {
@@ -3813,8 +3817,22 @@ where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let mut output = Vec::with_capacity(PIPE_CAPTURE_LIMIT);
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if read == 0 {
+                break;
+            }
+            let remaining = PIPE_CAPTURE_LIMIT.saturating_sub(output.len());
+            if remaining > 0 {
+                output.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
         Ok(output)
     })
 }
@@ -3952,7 +3970,7 @@ impl RemoteHost for OpenSshTransport {
                 return Err(CiaoError::Io(error));
             }
         }
-        let output = child.wait_with_output()?;
+        let output = wait_with_output_cancellation(&mut child)?;
         let result = CommandOutput::from_output_with_limit(output, command.full_output);
         result.ensure_success(&command.stage)
     }
@@ -8670,6 +8688,16 @@ mod tests {
         let truncated = truncate(&value);
         assert!(truncated.starts_with(&"a".repeat(16_383)));
         assert!(truncated.contains("output truncated"));
+    }
+
+    #[test]
+    fn pipe_reader_caps_capture_without_stopping_the_reader() {
+        let input = vec![b'x'; PIPE_CAPTURE_LIMIT + 8192];
+        let captured = spawn_pipe_reader(std::io::Cursor::new(input))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.len(), PIPE_CAPTURE_LIMIT);
     }
 
     #[test]
