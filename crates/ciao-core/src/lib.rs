@@ -3554,6 +3554,13 @@ fn terminate_child(child: &mut Child) {
         Ok(Some(_)) => {}
         Ok(None) | Err(_) => {
             terminate_process_group(child);
+            for _ in 0..10 {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(_) => break,
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
