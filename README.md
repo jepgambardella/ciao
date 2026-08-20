@@ -5,7 +5,7 @@
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584?logo=rust&logoColor=white" alt="Built with Rust"></a>
     <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-supported-111111?logo=apple&logoColor=white" alt="macOS supported"></a>
     <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=black" alt="Linux supported"></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-personal_use_only-5c6ac4" alt="Personal use only"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3-5c6ac4" alt="AGPLv3 license"></a>
   </p>
 </div>
 
@@ -120,8 +120,8 @@ ciao run
 ```
 
 Ciao detects the project, installs and builds it, then starts it on
-`127.0.0.1`. Press `Ctrl-C` to stop it. This command does not configure DNS or
-Caddy.
+`http://<project>.localhost`. Ciao keeps the app on an internal loopback port
+and uses the local Caddy proxy to hide it. Press `Ctrl-C` to stop it.
 
 Run an app locally with a stable `.ciao` address:
 
@@ -145,6 +145,23 @@ Ciao reuses Tailscale when it exists. Otherwise it installs it and guides the
 sign-in in a browser. GitHub Actions then runs the same deploy engine over
 Tailscale and SSH.
 
+The generated workflow is specific to the detected project. Ciao records the
+runtime and app type (for example, `Astro` + `static`, or `Go` + `service`),
+downloads one pinned Ciao release binary, verifies its checksum, and deploys.
+It does not install Rust in the GitHub runner for an Astro, Node, static, Go or
+other non-Rust project.
+
+After setup, commit and push the generated workflow:
+
+```bash
+git add .github/workflows/ciao-deploy.yml
+git commit -m "enable Ciao auto-deploy"
+git push
+```
+
+Every push to the configured branch then runs the normal Ciao deploy path over
+the private Tailscale network.
+
 See [the GitHub and Tailscale guide](docs/Ciao_GitHub_Tailscale_Autodeploy.md).
 
 ## Safety
@@ -159,6 +176,7 @@ through MCP. Secrets are sent over SSH and are not printed.
 - [Security](docs/security.md)
 - [Local `.ciao` domains](docs/local_ciao_domain.md)
 - [Testing](TESTING.md)
+- [Changelog](CHANGELOG.md)
 - [Product source of truth](Ciao.md)
 
 Run the checks:
@@ -173,6 +191,6 @@ cargo test --workspace --all-targets
 
 Copyright © 2026 Luca La Barbera.
 
-Ciao is available for personal, non-commercial use under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use needs a
-separate written license from Luca La Barbera. See [NOTICE](NOTICE).
+Ciao is free software licensed under the
+[GNU Affero General Public License, version 3 (AGPLv3)](LICENSE).
+See [NOTICE](NOTICE).

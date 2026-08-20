@@ -178,6 +178,9 @@ struct DevArgs {
     name: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    /// Remove the local Caddy route for this project.
+    #[arg(long)]
+    stop: bool,
 }
 
 #[derive(Debug, Args)]
@@ -585,10 +588,41 @@ fn detect_single_project(path: &Path) -> Result<ProjectPlan> {
 }
 
 fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
-    let source = args.path.canonicalize()?;
+    // Keep the natural `ciao dev stop` spelling while retaining the explicit
+    // `--stop` alias. A project directory literally named `stop` is not a
+    // useful default target, so this positional form is unambiguous here.
+    let positional_stop = args.path == Path::new("stop");
+    let source = if positional_stop {
+        PathBuf::from(".").canonicalize()?
+    } else {
+        args.path.canonicalize()?
+    };
     let detected = detect_single_project(&source)?;
     let config_path = default_config_path();
     let mut config = Config::load(&config_path)?;
+    if args.stop || positional_stop {
+        let name = args
+            .name
+            .as_deref()
+            .or(detected.local_name.as_deref())
+            .unwrap_or(&detected.name);
+        validate_local_name(name)?;
+        let paths = local_proxy_paths()?;
+        remove_local_caddy_fragment(name)?;
+        reload_local_caddy(&paths)?;
+        config.local.projects.remove(name);
+        config.save(&config_path)?;
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"stopped": true, "project": name}))
+                    .map_err(ser_error)?
+            );
+        } else {
+            println!("✓ local domain stopped: {name}.ciao");
+        }
+        return Ok(());
+    }
     let plan = local_dev_plan(&source, &detected, args.name.as_deref(), &config.local)?;
     if args.dry_run {
         let result = json!({
@@ -699,7 +733,16 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
         detected.local_port = Some(port);
         detected.port_explicit = true;
     }
-    let plan = local_dev_plan(&source, &detected, None, &LocalConfig::default())?;
+    let mut plan = local_dev_plan(&source, &detected, None, &LocalConfig::default())?;
+    // Use the native .localhost namespace, while Caddy hides the assigned
+    // backend port behind its standard HTTP endpoint.
+    plan.domain = format!("{}.localhost", plan.name);
+    let setup = local_setup()?;
+    let paths = write_local_caddy_fragment(&plan)?;
+    if let Err(error) = reload_local_caddy(&paths) {
+        let _ = remove_local_caddy_fragment(&plan.name).and_then(|_| reload_local_caddy(&paths));
+        return Err(error);
+    }
     if json_output {
         println!(
             "{}",
@@ -709,19 +752,31 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
                 "app_type": plan.app_type,
                 "source": plan.source,
                 "port": plan.port,
-                "url": format!("http://127.0.0.1:{}", plan.port),
+                "url": format!("http://{}.localhost", plan.name),
+                "proxy": setup.proxy,
                 "temporary": true,
             }))
             .map_err(ser_error)?
         );
     } else {
         println!("✓ project detected: {}", plan.runtime);
-        println!("✓ temporary local server: http://127.0.0.1:{}", plan.port);
+        println!("✓ temporary local server: http://{}.localhost", plan.name);
         println!("  Press Ctrl-C to stop.");
         println!();
     }
     let progress = TerminalProgress::new();
-    let status = run_local_project_with_reporter(&plan, &progress)?;
+    let status = run_local_project_with_reporter(&plan, &progress);
+    let cleanup_result =
+        remove_local_caddy_fragment(&plan.name).and_then(|_| reload_local_caddy(&paths));
+    if let Err(error) = cleanup_result {
+        return Err(CiaoError::LocalCommand {
+            stage: "clean up temporary local proxy".to_owned(),
+            exit: 1,
+            stdout: String::new(),
+            stderr: error.to_string(),
+        });
+    }
+    let status = status?;
     if status != 0 {
         return Err(CiaoError::LocalCommand {
             stage: "run temporary local project".to_owned(),
@@ -883,13 +938,17 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         )));
     }
 
-    let ciao_version = env!("CIAO_BUILD_REVISION").to_owned();
-    if ciao_version == "unknown" {
-        return Err(CiaoError::Config(
-            "Ciao was not built from a Git checkout; build it from the pinned Ciao repository revision before generating a workflow".to_owned(),
-        ));
-    }
-    let workflow = render_github_workflow(&workflow_spec_for(&branch, &ciao_version))?;
+    let ciao_version = github_latest_release_tag()?;
+    let project_type = match plan.app_type {
+        AppType::Static => "static",
+        AppType::Service => "service",
+    };
+    let workflow = render_github_workflow(&workflow_spec_for_project(
+        &branch,
+        &ciao_version,
+        plan.runtime.to_string(),
+        project_type,
+    ))?;
     let workflow_path = github_workflow_path(&root);
     validate_workflow_writable(&workflow_path, &workflow, args.yes)?;
 
@@ -937,25 +996,6 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
                 .to_owned(),
         )
     })?;
-
-    let ciao_token = if args.ciao_github_token_stdin {
-        Some(read_secret_value()?)
-    } else {
-        std::env::var("CIAO_GITHUB_TOKEN").ok()
-    };
-    let ciao_repository = GitHubRepoRef {
-        owner: "jepgambardella".to_owned(),
-        repo: "ciao".to_owned(),
-    };
-    let ciao_metadata = github_repository_metadata(&ciao_repository)?;
-    if ciao_metadata.private
-        && ciao_token.is_none()
-        && repository.full_name() != ciao_metadata.full_name()
-    {
-        return Err(CiaoError::Config(
-            "the Ciao source repository is private; set CIAO_GITHUB_TOKEN to a read-only GitHub token before setup so Actions can install the pinned CLI".to_owned(),
-        ));
-    }
 
     let (client_id, audience, identity_id) = if let (Some(client_id), Some(audience)) =
         (args.tailscale_client_id, args.tailscale_audience)
@@ -1013,10 +1053,6 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         "CIAO_SSH_KNOWN_HOSTS",
         &known_hosts,
     )?;
-    let source_token_configured = ciao_token.is_some();
-    if let Some(token) = ciao_token {
-        github_set_secret(&repository.reference(), "CIAO_GITHUB_TOKEN", &token)?;
-    }
     github_set_variable(&repository.reference(), "CIAO_HOST", &tailscale_host)?;
     github_set_variable(&repository.reference(), "CIAO_USER", &ssh_user)?;
     github_set_variable(&repository.reference(), "CIAO_APP", &app)?;
@@ -1036,7 +1072,7 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         workflow_path: PathBuf::from(".github/workflows/ciao-deploy.yml"),
         public_key: Some(generated_key.public_key),
         ciao_version,
-        source_token_configured,
+        source_token_configured: false,
     };
     github.links.insert(link_key, link.clone());
     github.save(&github_config_path())?;
@@ -1121,6 +1157,10 @@ fn github_unlink(args: GithubUnlinkArgs, json_output: bool) -> Result<()> {
     )?;
     let plan = detect_single_project(&root)?;
     let app = args.app.unwrap_or(plan.name);
+    let project_type = match plan.app_type {
+        AppType::Static => "static",
+        AppType::Service => "service",
+    };
     let key = github_link_key(&repository.full_name(), &app);
     let mut config = GitHubConfig::load(&github_config_path())?;
     let link = config
@@ -1152,8 +1192,12 @@ fn github_unlink(args: GithubUnlinkArgs, json_output: bool) -> Result<()> {
     }
     let workflow_path = github_workflow_path(&root);
     if workflow_path.exists() {
-        let expected =
-            render_github_workflow(&workflow_spec_for(&link.branch, &link.ciao_version))?;
+        let expected = render_github_workflow(&workflow_spec_for_project(
+            &link.branch,
+            &link.ciao_version,
+            plan.runtime.to_string(),
+            project_type,
+        ))?;
         if fs::read_to_string(&workflow_path)? == expected {
             fs::remove_file(&workflow_path)?;
         } else {
@@ -1180,17 +1224,33 @@ fn github_regenerate(args: GithubRegenerateArgs, json_output: bool) -> Result<()
     let root = args.path.canonicalize()?;
     let repository = detect_github_repository(&root)?
         .ok_or_else(|| CiaoError::Config("no GitHub origin found".to_owned()))?;
-    let config = GitHubConfig::load(&github_config_path())?;
-    let (_, link) = config
+    let mut config = GitHubConfig::load(&github_config_path())?;
+    let (link_key, link) = config
         .links
         .iter()
         .find(|(_, link)| link.repository == repository.full_name())
+        .map(|(key, link)| (key.clone(), link.clone()))
         .ok_or_else(|| {
             CiaoError::Config("no Ciao GitHub link is saved for this repository".to_owned())
         })?;
-    let workflow = render_github_workflow(&workflow_spec_for(&link.branch, &link.ciao_version))?;
+    let plan = detect_single_project(&root)?;
+    let project_type = match plan.app_type {
+        AppType::Static => "static",
+        AppType::Service => "service",
+    };
+    let ciao_version = github_latest_release_tag()?;
+    let workflow = render_github_workflow(&workflow_spec_for_project(
+        &link.branch,
+        &ciao_version,
+        plan.runtime.to_string(),
+        project_type,
+    ))?;
     let path = github_workflow_path(&root);
     write_generated_workflow(&path, &workflow, args.yes)?;
+    if let Some(saved_link) = config.links.get_mut(&link_key) {
+        saved_link.ciao_version = ciao_version;
+    }
+    config.save(&github_config_path())?;
     if json_output {
         println!("{}", json!({"workflow": path, "regenerated": true}));
     } else {

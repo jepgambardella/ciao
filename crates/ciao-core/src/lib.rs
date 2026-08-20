@@ -505,6 +505,8 @@ pub struct WorkflowSpec {
     pub branch: String,
     pub ciao_version: String,
     pub ciao_repository: String,
+    pub project_runtime: String,
+    pub project_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,6 +840,36 @@ pub fn github_auth_status() -> Result<CommandOutput> {
     )
 }
 
+pub fn github_latest_release_tag() -> Result<String> {
+    let output = run_local_command(
+        "gh",
+        &[
+            "release".to_owned(),
+            "view".to_owned(),
+            "--repo".to_owned(),
+            "jepgambardella/ciao".to_owned(),
+            "--json".to_owned(),
+            "tagName".to_owned(),
+            "--jq".to_owned(),
+            ".tagName".to_owned(),
+        ],
+        None,
+        "read the latest Ciao release",
+    )?;
+    let tag = output.stdout.trim();
+    if tag.is_empty()
+        || !tag.starts_with('v')
+        || !tag[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(CiaoError::Config(
+            "GitHub did not return a valid Ciao release tag".to_owned(),
+        ));
+    }
+    Ok(tag.to_owned())
+}
+
 pub fn ssh_user_from_target(target: &str) -> Option<String> {
     ssh_login_user(target)
 }
@@ -987,10 +1019,21 @@ pub fn workflow_spec_for(
     branch: impl Into<String>,
     ciao_version: impl Into<String>,
 ) -> WorkflowSpec {
+    workflow_spec_for_project(branch, ciao_version, "unknown", "unknown")
+}
+
+pub fn workflow_spec_for_project(
+    branch: impl Into<String>,
+    ciao_version: impl Into<String>,
+    project_runtime: impl Into<String>,
+    project_type: impl Into<String>,
+) -> WorkflowSpec {
     WorkflowSpec {
         branch: branch.into(),
         ciao_version: ciao_version.into(),
         ciao_repository: "jepgambardella/ciao".to_owned(),
+        project_runtime: project_runtime.into(),
+        project_type: project_type.into(),
     }
 }
 
@@ -1045,8 +1088,19 @@ pub fn render_github_workflow(spec: &WorkflowSpec) -> Result<String> {
             "Ciao GitHub repository is invalid".to_owned(),
         ));
     }
+    if spec.project_runtime.is_empty()
+        || spec.project_runtime.contains(['\n', '\r', '\''])
+        || spec.project_type.is_empty()
+        || spec.project_type.contains(['\n', '\r', '\''])
+    {
+        return Err(CiaoError::Config(
+            "GitHub workflow project metadata is invalid".to_owned(),
+        ));
+    }
     let branch = yaml_quote(&spec.branch);
     let version = yaml_quote(&spec.ciao_version);
+    let project_runtime = yaml_quote(&spec.project_runtime);
+    let project_type = yaml_quote(&spec.project_type);
     let gh = "$";
     Ok(format!(
         r#"name: Ciao Deploy
@@ -1069,13 +1123,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout pinned Ciao
-        uses: actions/checkout@v4
-        with:
-          repository: {repo}
-          ref: {version}
-          path: .ciao-tool
-          token: {gh}{{{{ secrets.CIAO_GITHUB_TOKEN || github.token }}}}
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -1083,10 +1130,27 @@ jobs:
           audience: {gh}{{{{ vars.TS_AUDIENCE }}}}
           tags: tag:ciao-ci
           ping: {gh}{{{{ vars.CIAO_HOST }}}}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
       - name: Install Ciao
-        run: cargo install --locked --path .ciao-tool/crates/ciao
+        env:
+          CIAO_VERSION: {version}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          base="https://github.com/jepgambardella/ciao/releases/download/$CIAO_VERSION"
+          curl --fail --silent --show-error --location "$base/ciao-linux-x86_64" -o "$work/ciao"
+          curl --fail --silent --show-error --location "$base/checksums.txt" -o "$work/checksums.txt"
+          (cd "$work" && grep '  ciao-linux-x86_64$' checksums.txt | sha256sum --check -)
+          install -d -m 0755 "$HOME/.local/bin"
+          install -m 0755 "$work/ciao" "$HOME/.local/bin/ciao"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Confirm project plan
+        env:
+          CIAO_PROJECT_RUNTIME: {project_runtime}
+          CIAO_PROJECT_TYPE: {project_type}
+        run: |
+          echo "Ciao project runtime: $CIAO_PROJECT_RUNTIME"
+          echo "Ciao project type: $CIAO_PROJECT_TYPE"
       - name: Configure SSH
         env:
           CIAO_SSH_KEY: {gh}{{{{ secrets.CIAO_SSH_KEY }}}}
@@ -1114,8 +1178,9 @@ jobs:
         run: ciao deploy --ci --path . ciao-target
 "#,
         branch = branch,
-        repo = spec.ciao_repository,
         version = version,
+        project_runtime = project_runtime,
+        project_type = project_type,
         gh = gh,
     ))
 }
@@ -4433,7 +4498,8 @@ fn caddyfile_quote(path: &Path) -> Result<String> {
 
 pub fn local_caddy_fragment(plan: &LocalDevPlan) -> Result<String> {
     validate_local_name(&plan.name)?;
-    if plan.domain != local_domain(&plan.name)? {
+    let localhost_domain = format!("{}.localhost", plan.name);
+    if plan.domain != local_domain(&plan.name)? && plan.domain != localhost_domain {
         return Err(CiaoError::Config(
             "local proxy domain does not match the project name".to_owned(),
         ));
@@ -4521,9 +4587,11 @@ elif ! sudo -n grep -Fqx "$import_line" "$caddyfile"; then
 fi
 caddy_bin="$brew_prefix/bin/caddy"
 sudo -n "$brew_bin" services restart dnsmasq >/dev/null
-sudo -n "$caddy_bin" validate --config "$caddyfile"
-sudo -n "$brew_bin" services restart caddy >/dev/null
-sudo -n "$caddy_bin" reload --config "$caddyfile"
+"$caddy_bin" validate --config "$caddyfile"
+# Caddy must run as the logged-in user. Starting it through sudo creates a
+# root-owned Homebrew service that cannot be managed reliably at user login.
+"$brew_bin" services restart caddy >/dev/null
+"$caddy_bin" reload --config "$caddyfile"
 printf 'ciao_local_setup=ready\n'
 "#.to_owned())
     } else if cfg!(target_os = "linux") {
@@ -5367,6 +5435,30 @@ pub fn run_local_project_with_reporter(
             );
             let output = run_local_script(script.as_bytes())?;
             if output.status != 0 {
+                // npm can race while removing one stale package directory during
+                // `npm ci` (notably with node_modules/commander), leaving a
+                // recoverable ENOTEMPTY failure. Retry only this exact case and
+                // only for the standard npm ci command; custom install commands
+                // must retain their original semantics.
+                let retry_npm_ci = command.trim_start().starts_with("npm ci")
+                    && output.stderr.contains("ENOTEMPTY");
+                if retry_npm_ci {
+                    let retry_script = format!(
+                        "set -eu\ncd -- {}\nrm -rf -- node_modules\n{}\n",
+                        shell_quote(&plan.source.to_string_lossy()),
+                        command
+                    );
+                    let retry = run_local_script(retry_script.as_bytes())?;
+                    if retry.status == 0 {
+                        return Ok(());
+                    }
+                    return Err(CiaoError::LocalCommand {
+                        stage: step.to_owned(),
+                        exit: retry.status,
+                        stdout: retry.stdout,
+                        stderr: retry.stderr,
+                    });
+                }
                 return Err(CiaoError::LocalCommand {
                     stage: step.to_owned(),
                     exit: output.status,
@@ -8378,6 +8470,8 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(script.contains("dev.ciao.local-loopback"));
             assert!(script.contains("/Library/LaunchDaemons"));
+            assert!(script.contains("\"$brew_bin\" services restart caddy"));
+            assert!(!script.contains("sudo -n \"$brew_bin\" services restart caddy"));
         }
     }
 
@@ -8667,18 +8761,20 @@ remote footer"#;
 
     #[test]
     fn generated_workflow_is_pinned_and_strict() {
-        let workflow = render_github_workflow(&workflow_spec_for(
-            "main",
-            "0123456789012345678901234567890123456789",
+        let workflow = render_github_workflow(&workflow_spec_for_project(
+            "main", "v0.1.3", "Astro", "static",
         ))
         .unwrap();
         assert!(workflow.contains("id-token: write"));
         assert!(workflow.contains("tailscale/github-action@v4"));
         assert!(workflow.contains("ping: ${{ vars.CIAO_HOST }}"));
-        assert!(workflow.contains("dtolnay/rust-toolchain@stable"));
+        assert!(!workflow.contains("dtolnay/rust-toolchain@stable"));
+        assert!(workflow.contains("ciao-linux-x86_64"));
+        assert!(workflow.contains("CIAO_PROJECT_RUNTIME: 'Astro'"));
+        assert!(workflow.contains("CIAO_PROJECT_TYPE: 'static'"));
         assert!(workflow.contains("StrictHostKeyChecking yes"));
         assert!(workflow.contains("ciao deploy --ci"));
-        assert!(workflow.contains("ref: '0123456789012345678901234567890123456789'"));
-        assert!(!workflow.contains("ref: 'latest'"));
+        assert!(workflow.contains("CIAO_VERSION: 'v0.1.3'"));
+        assert!(!workflow.contains("CIAO_VERSION: 'latest'"));
     }
 }

@@ -178,9 +178,15 @@ Conceptually:
     audience: ${{ vars.TS_AUDIENCE }}
     tags: tag:ciao-ci
 
-- name: Install Rust
-  uses: dtolnay/rust-toolchain@stable
+- name: Install Ciao
+  run: |
+    # download the pinned Ciao release for the GitHub runner
+    # verify checksums.txt before installing it in $HOME/.local/bin
 ```
+
+Ciao generates this workflow from the detected project. It includes the
+runtime and app type, downloads a pinned Linux Ciao binary, and verifies its
+checksum. It does not install Rust unless a separate project step needs Rust.
 
 ---
 
@@ -570,12 +576,10 @@ jobs:
           tags: tag:ciao-ci
           ping: ${{ vars.CIAO_HOST }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install ciao
         run: |
-          # install pinned ciao release + verify checksum
+          # generated workflow downloads the pinned Ciao release asset
+          # and verifies checksums.txt
 
       - name: Configure SSH
         env:
