@@ -132,8 +132,8 @@ struct GithubSetupArgs {
     app: Option<String>,
     #[arg(long)]
     branch: Option<String>,
-    /// Read a temporary Tailscale admin token from stdin instead of prompting.
-    #[arg(long)]
+    /// Compatibility option for older scripts. Interactive setup still prompts normally.
+    #[arg(long, hide = true)]
     tailscale_token_stdin: bool,
     /// Read a temporary read-only token for the private Ciao source repository from stdin.
     #[arg(long)]
@@ -165,8 +165,8 @@ struct GithubUnlinkArgs {
     /// Required because this removes GitHub resources and the target key.
     #[arg(long)]
     yes: bool,
-    /// Read the temporary Tailscale token from stdin to remove the federated identity too.
-    #[arg(long)]
+    /// Compatibility option for older scripts. Interactive unlink still prompts normally.
+    #[arg(long, hide = true)]
     tailscale_token_stdin: bool,
 }
 
@@ -934,6 +934,12 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         tailscale_target(&transport)?
     };
     let tailscale_host = tailscale.preferred_address()?;
+    let tailscale_policy_target = tailscale.ipv4.clone().ok_or_else(|| {
+        CiaoError::Config(
+            "Tailscale setup needs the target IPv4 address to create its private SSH policy"
+                .to_owned(),
+        )
+    })?;
 
     let ciao_token = if args.ciao_github_token_stdin {
         Some(read_secret_value()?)
@@ -965,7 +971,7 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         (client_id, audience, None)
     } else {
         let token = read_tailscale_token(args.tailscale_token_stdin)?;
-        ensure_tailscale_policy(&token, &tailscale_host, args.yes)?;
+        ensure_tailscale_policy(&token, &tailscale_policy_target, args.yes)?;
         let request = tailscale_federated_identity_request(&repository)?;
         let identity = tailscale_create_federated_identity(&token, &request)?;
         let client_id = identity.id.clone();
@@ -1125,14 +1131,9 @@ fn github_unlink(args: GithubUnlinkArgs, json_output: bool) -> Result<()> {
         .get(&key)
         .cloned()
         .ok_or_else(|| CiaoError::Config(format!("no Ciao GitHub link found for {app}")))?;
-    if link.federated_identity_id.is_some() && !args.tailscale_token_stdin {
-        return Err(CiaoError::Config(
-            "this link owns a Tailscale identity; rerun with --tailscale-token-stdin".to_owned(),
-        ));
-    }
     let transport = transport_for(&link.host)?;
     if let Some(identity_id) = &link.federated_identity_id {
-        let token = read_tailscale_token(true)?;
+        let token = read_tailscale_token(args.tailscale_token_stdin)?;
         tailscale_delete_federated_identity(&token, identity_id)?;
     }
     github_delete_secret(&repository.reference(), "CIAO_SSH_KEY")?;
@@ -1260,12 +1261,14 @@ fn read_tailscale_token(from_stdin: bool) -> Result<String> {
     if let Ok(token) = std::env::var("CIAO_TAILSCALE_BOOTSTRAP_TOKEN") {
         return Ok(token);
     }
-    if from_stdin {
+    // Keep the old flag usable for non-interactive scripts. In a terminal, always
+    // use the normal one-line prompt so paste + Enter completes immediately.
+    if from_stdin && !io::stdin().is_terminal() {
         return read_secret_value();
     }
     if !io::stdin().is_terminal() {
         return Err(CiaoError::Config(
-            "Tailscale setup needs a temporary admin token: pipe it with --tailscale-token-stdin or set CIAO_TAILSCALE_BOOTSTRAP_TOKEN".to_owned(),
+            "Tailscale setup needs a temporary admin token. Run this command in a terminal and paste it when prompted, or set CIAO_TAILSCALE_BOOTSTRAP_TOKEN for automation.".to_owned(),
         ));
     }
     print!("Paste temporary Tailscale admin token (not stored): ");
