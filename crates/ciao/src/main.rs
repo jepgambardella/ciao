@@ -1303,7 +1303,7 @@ fn ensure_tailscale_policy(token: &str, target: &str, yes: bool) -> Result<()> {
             "Tailscale rejected the policy during validation: {error}; no policy change was applied"
         )));
     }
-    let preview = tailscale_preview_policy(token, &patched_text)?;
+    let preview = tailscale_preview_policy(token, &patched_text, &format!("{target}:22"))?;
     if let Some(error) = tailscale_policy_api_error(&preview) {
         return Err(CiaoError::Config(format!(
             "Tailscale rejected the policy preview: {error}; no policy change was applied"

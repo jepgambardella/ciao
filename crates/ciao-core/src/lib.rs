@@ -2064,7 +2064,11 @@ pub fn tailscale_validate_policy(api_token: &str, policy: &str) -> Result<String
     Ok(output.stdout)
 }
 
-pub fn tailscale_preview_policy(api_token: &str, policy: &str) -> Result<String> {
+pub fn tailscale_preview_policy(
+    api_token: &str,
+    policy: &str,
+    preview_for: &str,
+) -> Result<String> {
     validate_tailscale_token(api_token)?;
     if policy.trim().is_empty() {
         return Err(CiaoError::Config(
@@ -2074,12 +2078,27 @@ pub fn tailscale_preview_policy(api_token: &str, policy: &str) -> Result<String>
     let output = run_tailscale_curl(
         api_token,
         "POST",
-        "https://api.tailscale.com/api/v2/tailnet/-/acl/preview",
+        &format!(
+            "https://api.tailscale.com/api/v2/tailnet/-/acl/preview?type=ipport&previewFor={}",
+            percent_encode_query_component(preview_for)
+        ),
         Some("application/hujson"),
         Some(policy),
         "preview Tailscale policy",
     )?;
     Ok(output.stdout)
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            byte => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 pub fn tailscale_apply_policy(api_token: &str, policy: &str) -> Result<()> {
@@ -8492,6 +8511,14 @@ mod tests {
             serde_json::json!(["autogroup:admin"])
         );
         assert_eq!(first["grants"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tailscale_preview_query_escapes_ip_port() {
+        assert_eq!(
+            percent_encode_query_component("100.64.0.7:22"),
+            "100.64.0.7%3A22"
+        );
     }
 
     #[test]
