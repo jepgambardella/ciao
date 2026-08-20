@@ -1046,7 +1046,7 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
     github_set_secret(
         &repository.reference(),
         "CIAO_SSH_KEY",
-        &generated_key.private_key,
+        &base64_encode(generated_key.private_key.as_bytes()),
     )?;
     github_set_secret(
         &repository.reference(),

@@ -870,6 +870,29 @@ pub fn github_latest_release_tag() -> Result<String> {
     Ok(tag.to_owned())
 }
 
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0] as usize;
+        let second = chunk.get(1).copied().unwrap_or_default() as usize;
+        let third = chunk.get(2).copied().unwrap_or_default() as usize;
+        output.push(TABLE[first >> 2] as char);
+        output.push(TABLE[((first & 0x03) << 4) | (second >> 4)] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((second & 0x0f) << 2) | (third >> 6)] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[third & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
 pub fn ssh_user_from_target(target: &str) -> Option<String> {
     ssh_login_user(target)
 }
@@ -1157,7 +1180,7 @@ jobs:
           CIAO_SSH_KNOWN_HOSTS: {gh}{{{{ secrets.CIAO_SSH_KNOWN_HOSTS }}}}
         run: |
           install -d -m 700 "$HOME/.ssh"
-          printf '%s' "$CIAO_SSH_KEY" > "$HOME/.ssh/ciao_ci_ed25519"
+          printf '%s' "$CIAO_SSH_KEY" | base64 --decode > "$HOME/.ssh/ciao_ci_ed25519"
           chmod 600 "$HOME/.ssh/ciao_ci_ed25519"
           printf '%s\n' "$CIAO_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
@@ -8776,5 +8799,12 @@ remote footer"#;
         assert!(workflow.contains("ciao deploy --ci"));
         assert!(workflow.contains("CIAO_VERSION: 'v0.1.3'"));
         assert!(!workflow.contains("CIAO_VERSION: 'latest'"));
+        assert!(workflow.contains("base64 --decode"));
+    }
+
+    #[test]
+    fn base64_encoding_is_standard() {
+        assert_eq!(base64_encode(b"Ciao"), "Q2lhbw==");
+        assert_eq!(base64_encode(b"Ciao deploy"), "Q2lhbyBkZXBsb3k=");
     }
 }
