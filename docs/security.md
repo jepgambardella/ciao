@@ -72,8 +72,16 @@ repository-specific remote deployment lock. Policy changes are previewed and
 validated before an interactive apply; HuJSON that Ciao cannot preserve safely
 is rejected with the exact narrow rule to add manually. During setup Ciao may
 install the Tailscale client using the native package manager and starts only
-the standard browser authentication flow; it never stores a Tailscale login
-token or asks the user to paste one.
+the standard browser authentication flow. If the tailnet API needs admin
+permission, Ciao asks for one temporary token in a normal terminal prompt,
+uses it for setup, and never stores or logs it.
+
+Ciao tracks every detached browser-authentication process in a Ciao-owned
+temporary state directory. It stops that process after sign-in, on timeout, or
+when the user interrupts the command. Local temporary servers and upload
+children are also waited for and stopped on normal cancellation; Ciao does not
+leave a managed child process behind after `ciao run`, `ciao dev`, or an
+interrupted upload.
 
 The test suite includes validation and generated-definition checks plus a local
 CLI/MCP smoke path. SSH tests are opt-in and disposable; they must not reboot

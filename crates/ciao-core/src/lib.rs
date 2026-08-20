@@ -12,8 +12,10 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1304,7 +1306,9 @@ mkdir -p "$state"
 chmod 700 "$state"
 output="$state/output"
 rm -f "$output"
+rm -f "$state/pid"
 nohup {privilege}{executable} up > "$output" 2>&1 < /dev/null &
+printf '%s\n' "$!" > "$state/pid"
 for attempt in $(seq 1 45); do
     url=$(grep -Eo 'https://login\.tailscale\.com/[A-Za-z0-9._/?=&%:-]+' "$output" 2>/dev/null | head -n 1 || true)
     if [ -n "$url" ]; then printf '%s\n' "$url"; exit 0; fi
@@ -1330,6 +1334,7 @@ exit 124
         run_local_script(script.as_bytes())?
     };
     if output.status != 0 {
+        let _ = stop_local_tailscale_auth();
         return Err(CiaoError::LocalCommand {
             stage: "start guided local Tailscale authentication".to_owned(),
             exit: output.status,
@@ -1338,15 +1343,44 @@ exit 124
         });
     }
     if output.stdout.contains(TAILSCALE_CONNECTED_MARKER) {
+        let _ = stop_local_tailscale_auth();
         return Ok(None);
     }
-    tailscale_auth_url_from_output(&output.stdout)
-        .map(Some)
-        .ok_or_else(|| {
-            CiaoError::Config(
-                "Ciao could not obtain a local Tailscale browser login URL".to_owned(),
-            )
-        })
+    if let Some(url) = tailscale_auth_url_from_output(&output.stdout) {
+        Ok(Some(url))
+    } else {
+        let _ = stop_local_tailscale_auth();
+        Err(CiaoError::Config(
+            "Ciao could not obtain a local Tailscale browser login URL".to_owned(),
+        ))
+    }
+}
+
+/// Stop the detached local login command and remove only Ciao's temporary
+/// state. The PID is checked before sending a signal so a stale file cannot
+/// terminate an unrelated process after PID reuse.
+pub fn stop_local_tailscale_auth() -> Result<()> {
+    let state = format!("/tmp/ciao-tailscale-auth-local-{}", std::process::id());
+    let script = format!(
+        r#"set +e
+state={state}
+if test -s "$state/pid"; then
+    pid=$(cat "$state/pid" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+            case "$command" in
+                *tailscale*) kill "$pid" 2>/dev/null || true ;;
+            esac
+            ;;
+    esac
+fi
+rm -rf "$state"
+"#,
+        state = shell_quote(&state),
+    );
+    run_local_script(script.as_bytes()).map(|_| ())
 }
 
 pub fn wait_for_local_tailscale_auth(timeout: Duration) -> Result<TailscaleTarget> {
@@ -1354,14 +1388,24 @@ pub fn wait_for_local_tailscale_auth(timeout: Duration) -> Result<TailscaleTarge
     let mut last_error = None;
     while Instant::now() < deadline {
         match local_tailscale_target() {
-            Ok(target) => return Ok(target),
+            Ok(target) => {
+                let _ = stop_local_tailscale_auth();
+                return Ok(target);
+            }
             Err(error @ CiaoError::Config(_)) | Err(error @ CiaoError::LocalCommand { .. }) => {
                 last_error = Some(error)
             }
             Err(error) => return Err(error),
         }
+        if cancellation_requested() {
+            let _ = stop_local_tailscale_auth();
+            return Err(CiaoError::Config(
+                "operation interrupted by user; local Tailscale login was stopped".to_owned(),
+            ));
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
+    let _ = stop_local_tailscale_auth();
     Err(CiaoError::Config(format!(
         "timed out waiting for local Tailscale browser authentication{}",
         last_error
@@ -1528,8 +1572,15 @@ pub fn start_tailscale_auth(transport: &dyn RemoteHost) -> Result<Option<String>
     if tailscale_target(transport).is_ok() {
         return Ok(None);
     }
-    let output = transport.exec(tailscale_auth_start_command())?;
+    let output = match transport.exec(tailscale_auth_start_command()) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = stop_tailscale_auth(transport);
+            return Err(error);
+        }
+    };
     if output.stdout.contains(TAILSCALE_CONNECTED_MARKER) {
+        let _ = stop_tailscale_auth(transport);
         return Ok(None);
     }
     if let Some(url) = tailscale_auth_url_from_output(&output.stdout) {
@@ -1545,6 +1596,7 @@ pub fn start_tailscale_auth(transport: &dyn RemoteHost) -> Result<Option<String>
         .filter(|line| !line.contains("https://login.tailscale.com/"))
         .collect::<Vec<_>>()
         .join("\n");
+    let _ = stop_tailscale_auth(transport);
     Err(CiaoError::Config(format!(
         "Ciao could not obtain a Tailscale browser login URL from the target{}",
         if details.is_empty() {
@@ -1553,6 +1605,32 @@ pub fn start_tailscale_auth(transport: &dyn RemoteHost) -> Result<Option<String>
             format!("; target output: {details}")
         }
     )))
+}
+
+/// Stop the detached target login command and remove only its temporary Ciao
+/// state. The remote script checks that the PID still belongs to Tailscale.
+pub fn stop_tailscale_auth(transport: &dyn RemoteHost) -> Result<()> {
+    let command = CommandSpec::fixed("sh", &["-s"], "stop guided Tailscale authentication")
+        .with_stdin(
+            br#"set +e
+state="/tmp/ciao-tailscale-auth-$(id -u)"
+if test -s "$state/pid"; then
+    pid=$(cat "$state/pid" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+            case "$command" in
+                *tailscale*) kill "$pid" 2>/dev/null || true ;;
+            esac
+            ;;
+    esac
+fi
+rm -rf "$state"
+"#
+            .to_vec(),
+        );
+    transport.exec(command).map(|_| ())
 }
 
 /// Wait for the browser-guided target login to finish, with a bounded timeout
@@ -1565,12 +1643,22 @@ pub fn wait_for_tailscale_auth(
     let mut last_error = None;
     while Instant::now() < deadline {
         match tailscale_target(transport) {
-            Ok(target) => return Ok(target),
+            Ok(target) => {
+                let _ = stop_tailscale_auth(transport);
+                return Ok(target);
+            }
             Err(error @ CiaoError::Config(_)) => last_error = Some(error),
             Err(error) => return Err(error),
         }
+        if cancellation_requested() {
+            let _ = stop_tailscale_auth(transport);
+            return Err(CiaoError::Config(
+                "operation interrupted by user; target Tailscale login was stopped".to_owned(),
+            ));
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
+    let _ = stop_tailscale_auth(transport);
     Err(CiaoError::Config(format!(
         "timed out waiting for Tailscale browser authentication on the target{}",
         last_error
@@ -1796,6 +1884,7 @@ pub fn install_public_key_interactively(
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    own_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| CiaoError::Transport {
         stage: "install SSH public key".to_owned(),
         message: error.to_string(),
@@ -3209,6 +3298,7 @@ impl OpenSshTransport {
         for arg in &command.args {
             process.arg(arg);
         }
+        own_process_group(&mut process);
         process
     }
 
@@ -3272,6 +3362,7 @@ impl OpenSshTransport {
             .arg("--directory")
             .arg(source)
             .arg(".");
+        own_process_group(&mut tar_command);
         let mut tar = tar_command
             // macOS' BSD tar otherwise emits AppleDouble metadata entries
             // when archiving files with Finder metadata. The env var is
@@ -3462,10 +3553,102 @@ fn terminate_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) | Err(_) => {
+            terminate_process_group(child);
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+#[cfg(unix)]
+fn own_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn own_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+    if pid > 0 {
+        // Ciao gives every foreground child its own process group. This also
+        // stops a shell-launched compiler or dev server when the parent is
+        // interrupted, instead of leaving a grandchild behind.
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_child: &Child) {}
+
+/// Wait for a foreground child without turning Ctrl-C into a leaked server.
+/// The child normally receives the terminal signal itself and exits through
+/// its own cleanup path. If it does not, Ciao gives it a short grace period and
+/// then kills and waits for it before returning.
+fn wait_child_with_cancellation(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if cancellation_requested() {
+            for _ in 0..10 {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(Some(status));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            terminate_child(child);
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[allow(clippy::io_other_error)]
+fn wait_with_output_cancellation(child: &mut Child) -> io::Result<Output> {
+    let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+    let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_child(child);
+                return Err(error);
+            }
+        }
+        if cancellation_requested() {
+            let mut exited = None;
+            for _ in 0..10 {
+                if let Some(status) = child.try_wait()? {
+                    exited = Some(status);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if let Some(status) = exited {
+                break status;
+            }
+            if child.try_wait()?.is_none() {
+                terminate_child(child);
+            }
+            break child.try_wait()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "child did not exit after cancellation",
+                )
+            })?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok(Output {
+        status,
+        stdout: join_pipe_reader_io(stdout_reader)?,
+        stderr: join_pipe_reader_io(stderr_reader)?,
+    })
 }
 
 fn spawn_pipe_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
@@ -3492,6 +3675,16 @@ fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>, stream: &str) -> Re
             message: format!("could not read {stream}: {error}"),
             details: String::new(),
         })
+}
+
+#[allow(clippy::io_other_error)]
+fn join_pipe_reader_io(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "pipe reader thread panicked"))?,
+        None => Ok(Vec::new()),
+    }
 }
 
 fn copy_upload_stream(
@@ -3820,6 +4013,7 @@ fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
                 .flat_map(|path| ["-i".to_owned(), path.display().to_string()]),
         )
         .arg(&transport.target);
+    own_process_group(&mut process);
     process
 }
 
@@ -3942,27 +4136,42 @@ fn env_file_line(key: &str, value: &str) -> String {
 }
 
 pub fn run_local_script(script: &[u8]) -> Result<CommandOutput> {
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-s")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().expect("piped stdin").write_all(script)?;
-            child.wait_with_output()
-        })?;
+        .stderr(Stdio::piped());
+    own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    if let Err(error) = child.stdin.take().expect("piped stdin").write_all(script) {
+        terminate_child(&mut child);
+        return Err(error.into());
+    }
+    let output = wait_with_output_cancellation(&mut child)?;
     Ok(CommandOutput::from_output(output))
 }
 
 fn run_local_interactive_script(script: &str) -> Result<CommandOutput> {
-    let status = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(script)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    let status = match wait_child_with_cancellation(&mut child)? {
+        Some(status) => status,
+        None => {
+            return Ok(CommandOutput {
+                status: 130,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    };
     Ok(CommandOutput {
         status: status.code().unwrap_or(128),
         stdout: String::new(),
@@ -3971,13 +4180,16 @@ fn run_local_interactive_script(script: &str) -> Result<CommandOutput> {
 }
 
 fn run_local_interactive_capture(script: &str) -> Result<CommandOutput> {
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(script)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+        .stderr(Stdio::piped());
+    own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    let output = wait_with_output_cancellation(&mut child)?;
     Ok(CommandOutput::from_output(output))
 }
 
@@ -4012,12 +4224,15 @@ fn run_local_command_with_output_limit(
         command.stdin(Stdio::piped());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = command.spawn().and_then(|mut child| {
-        if let Some(stdin) = stdin {
-            child.stdin.take().expect("piped stdin").write_all(stdin)?;
+    own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    if let Some(stdin) = stdin {
+        if let Err(error) = child.stdin.take().expect("piped stdin").write_all(stdin) {
+            terminate_child(&mut child);
+            return Err(error.into());
         }
-        child.wait_with_output()
-    })?;
+    }
+    let output = wait_with_output_cancellation(&mut child)?;
     let result = CommandOutput::from_output_with_limit(output, full_output);
     if result.status == 0 {
         Ok(result)
@@ -5098,6 +5313,7 @@ pub fn run_local_project_with_reporter(
                 .stdin(Stdio::piped())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
+            own_process_group(&mut command);
             let mut child = command.spawn()?;
             if let Err(error) = child
                 .stdin
@@ -5150,11 +5366,18 @@ pub fn run_local_project_with_reporter(
                 ));
             }
             command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            own_process_group(&mut command);
             command.spawn()?
         }
     };
     reporter.started("start local server");
-    let status = process.wait()?.code().unwrap_or(128);
+    let status = match wait_child_with_cancellation(&mut process)? {
+        Some(status) => status.code().unwrap_or(128),
+        None => {
+            reporter.failed("start local server");
+            return Ok(130);
+        }
+    };
     if status == 0 {
         reporter.finished("start local server");
     } else {
@@ -5178,21 +5401,24 @@ pub fn run_local_dev(plan: &LocalDevPlan) -> Result<i32> {
     );
     let mut script = cleanup.into_bytes();
     script.extend(local_dev_script(plan)?);
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-s")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .and_then(|mut child| {
-            child
-                .stdin
-                .take()
-                .expect("piped stdin")
-                .write_all(&script)?;
-            child.wait()
-        })?;
-    Ok(output.code().unwrap_or(128))
+        .stderr(Stdio::inherit());
+    // The shell owns the local Caddy cleanup trap; its process group also
+    // contains the foreground development server.
+    own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    if let Err(error) = child.stdin.take().expect("piped stdin").write_all(&script) {
+        terminate_child(&mut child);
+        return Err(error.into());
+    }
+    Ok(match wait_child_with_cancellation(&mut child)? {
+        Some(status) => status.code().unwrap_or(128),
+        None => 130,
+    })
 }
 
 const CADDY_IMPORT: &str = "import /etc/caddy/ciao/*.caddy";
@@ -8270,6 +8496,14 @@ mod tests {
             Some("https://login.tailscale.com/a/example?redirect=1".to_owned())
         );
         assert!(tailscale_auth_url_from_output("https://evil.example/login").is_none());
+    }
+
+    #[test]
+    fn guided_tailscale_auth_records_a_pid_for_cleanup() {
+        let command = tailscale_auth_start_command();
+        let script = String::from_utf8(command.stdin.unwrap()).unwrap();
+        assert!(script.contains("printf '%s\\n' \"$!\" > \"$state/pid\""));
+        assert!(script.contains("state=\"/tmp/ciao-tailscale-auth-$(id -u)\""));
     }
 
     #[test]
