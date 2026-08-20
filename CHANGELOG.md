@@ -6,6 +6,12 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.9]
+
+- Prevent concurrent `ciao run` sessions for the same project from removing
+  each other’s local Caddy route.
+- Remove stale local-run locks after an interrupted process.
+
 ## [v0.1.8]
 
 - Remove two unused legacy local-run wrappers and their obsolete test path.

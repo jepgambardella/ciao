@@ -240,6 +240,57 @@ struct TerminalProgress {
     current: Mutex<Option<ProgressBar>>,
 }
 
+struct LocalRunLock {
+    path: PathBuf,
+}
+
+impl LocalRunLock {
+    fn acquire(project: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("ciao-run-{project}.lock"));
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let active = fs::read_to_string(path.join("pid"))
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .is_some_and(local_run_pid_is_active);
+                if active {
+                    return Err(CiaoError::Config(format!(
+                        "another `ciao run` is already running for `{project}`. Stop it with Ctrl-C in the other terminal, then retry."
+                    )));
+                }
+                fs::remove_dir_all(&path)?;
+                fs::create_dir(&path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = fs::write(path.join("pid"), std::process::id().to_string()) {
+            let _ = fs::remove_dir_all(&path);
+            return Err(error.into());
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for LocalRunLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn local_run_pid_is_active(pid: u32) -> bool {
+    let Ok(output) = ProcessCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return true;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("ciao run")
+}
+
 impl TerminalProgress {
     fn new() -> Self {
         Self {
@@ -745,6 +796,7 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
     // Use the native .localhost namespace, while Caddy hides the assigned
     // backend port behind its standard HTTP endpoint.
     plan.domain = format!("{}.localhost", plan.name);
+    let _run_lock = LocalRunLock::acquire(&plan.name)?;
     let setup = local_setup()?;
     let paths = write_local_caddy_fragment(&plan)?;
     if let Err(error) = reload_local_caddy(&paths) {
