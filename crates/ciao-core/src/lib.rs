@@ -1982,9 +1982,20 @@ pub fn tailscale_federated_identity_request(
             "GitHub repository ID is required to scope Tailscale identity".to_owned(),
         ));
     }
+    let description = repository
+        .full_name()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
     Ok(serde_json::json!({
         "keyType": "federated",
-        "description": format!("Ciao GitHub CI - {}", repository.full_name()),
+        "description": format!("Ciao GitHub CI - {description}"),
         "scopes": ["auth_keys"],
         "tags": ["tag:ciao-ci"],
         "audience": format!("api.tailscale.com/ciao-{}", repository.repository_id),
@@ -8482,6 +8493,24 @@ mod tests {
         assert!(parse_github_remote("https://gitlab.com/acme/app")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn tailscale_federated_identity_description_has_safe_characters() {
+        let repository = GitHubRepository {
+            owner: "acme".to_owned(),
+            repo: "case-porto-cervo".to_owned(),
+            repository_id: "123".to_owned(),
+            default_branch: "main".to_owned(),
+            remote: "https://github.com/acme/case-porto-cervo".to_owned(),
+            private: false,
+        };
+        let request = tailscale_federated_identity_request(&repository).unwrap();
+        assert_eq!(
+            request["description"],
+            "Ciao GitHub CI - acme-case-porto-cervo"
+        );
+        assert!(!request["description"].as_str().unwrap().contains('/'));
     }
 
     #[test]
