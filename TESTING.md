@@ -3,7 +3,8 @@
 `cargo test --workspace --all-targets` is the repository’s current automated
 test suite. It runs locally and in Ubuntu CI without a remote host, covering
 identifier and SSH validation, project detection and configuration overrides,
-local `.ciao` name/port/proxy planning, release manifests, config
+Python/Flask detection, full-stack `backend/` + `frontend/` component
+detection, local `.ciao` name/port/proxy planning, release manifests, config
 round-tripping, generated systemd/launchd definitions, and shell-script
 quoting. Astro static detection and the temporary `ciao run` script are also
 covered. The local setup script is inspected for native dependencies and for

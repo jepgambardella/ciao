@@ -311,7 +311,34 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Host { command } => host_command(command, cli.json),
         Command::Inspect { path } => {
-            let plan = detect_project(&path.canonicalize()?)?;
+            let path = path.canonicalize()?;
+            let components = detect_project_components(&path)?;
+            if !components.is_empty() {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "project": path.file_name().map(|name| name.to_string_lossy().into_owned()),
+                            "kind": "full-stack",
+                            "components": components,
+                        }))
+                        .map_err(ser_error)?
+                    );
+                } else {
+                    println!("✓ full-stack project detected");
+                    for component in &components {
+                        println!(
+                            "  {}: {} ({}) → {}",
+                            component.role,
+                            component.name,
+                            component.plan.runtime,
+                            component.path.display()
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            let plan = detect_project(&path)?;
             output(&plan, cli.json, || {
                 format!(
                     "✓ project detected: {}\n  app: {}\n  command: {}",
@@ -324,7 +351,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Deploy(args) => {
             let path = args.path.canonicalize()?;
-            let mut plan = detect_project(&path)?;
+            let mut plan = detect_single_project(&path)?;
             let (transport, app_override) = if args.ci {
                 let target =
                     ci_target_from_env(&std::env::vars().collect::<BTreeMap<String, String>>())?;
@@ -534,9 +561,32 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn detect_single_project(path: &Path) -> Result<ProjectPlan> {
+    let components = detect_project_components(path)?;
+    if !components.is_empty() {
+        let summary = components
+            .iter()
+            .map(|component| {
+                format!(
+                    "{} `{}` ({})",
+                    component.role,
+                    component.path.display(),
+                    component.plan.runtime
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CiaoError::Detection(format!(
+            "full-stack project detected: {summary}; Ciao needs one deployable app at a time, use `ciao inspect {}` and deploy the backend or frontend path",
+            path.display()
+        )));
+    }
+    detect_project(path)
+}
+
 fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
     let source = args.path.canonicalize()?;
-    let detected = detect_project(&source)?;
+    let detected = detect_single_project(&source)?;
     let config_path = default_config_path();
     let mut config = Config::load(&config_path)?;
     let plan = local_dev_plan(&source, &detected, args.name.as_deref(), &config.local)?;
@@ -644,7 +694,7 @@ fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
 
 fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
     let source = args.path.canonicalize()?;
-    let mut detected = detect_project(&source)?;
+    let mut detected = detect_single_project(&source)?;
     if let Some(port) = args.port {
         detected.local_port = Some(port);
         detected.port_explicit = true;
@@ -2024,7 +2074,11 @@ fn required_string<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a st
 fn read_secret_value() -> Result<String> {
     use std::io::{self, Read};
     let mut value = String::new();
-    io::stdin().read_to_string(&mut value)?;
+    if io::stdin().is_terminal() {
+        io::stdin().read_line(&mut value)?;
+    } else {
+        io::stdin().read_to_string(&mut value)?;
+    }
     let value = value.trim_end_matches(['\r', '\n']).to_owned();
     if value.is_empty() {
         return Err(CiaoError::Config(

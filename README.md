@@ -93,11 +93,23 @@ or offers a safe lock recovery on the next deploy.
 - Go
 - Bun
 - Node
+- Python / Flask
 - Astro static sites
 - Static sites
 
-Ciao detects the project. Add `ciao.toml` only when you need custom build,
-run, health check, domain or environment settings.
+Ciao detects the project. It also recognizes the common full-stack layout:
+
+```text
+my-app/
+  backend/   # Flask or another supported Python service
+  frontend/  # Next, Astro or another supported Node app
+```
+
+Run `ciao inspect` to see both components and their detected commands. Ciao
+deploys one app plan at a time today. Deploy `backend` and `frontend` as two
+normal Ciao apps until the shared transaction for multi-service projects is
+enabled. Add `ciao.toml` only when you need custom build, run, health check,
+domain or environment settings.
 
 ## Local development
 

@@ -227,6 +227,7 @@ pub enum Runtime {
     Bun,
     Node,
     Astro,
+    Python,
     Static,
 }
 
@@ -238,9 +239,33 @@ impl Display for Runtime {
             Self::Bun => "Bun",
             Self::Node => "Node",
             Self::Astro => "Astro",
+            Self::Python => "Python",
             Self::Static => "Static",
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectRole {
+    Backend,
+    Frontend,
+}
+
+impl Display for ProjectRole {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Backend => "backend",
+            Self::Frontend => "frontend",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectComponent {
+    pub name: String,
+    pub role: ProjectRole,
+    pub path: PathBuf,
+    pub plan: ProjectPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2008,7 +2033,14 @@ fn run_tailscale_curl(
             curl_config_quote(content_type)
         ));
     }
-    let mut args = vec!["--config".to_owned(), "-".to_owned()];
+    let mut args = vec![
+        "--connect-timeout".to_owned(),
+        "10".to_owned(),
+        "--max-time".to_owned(),
+        "60".to_owned(),
+        "--config".to_owned(),
+        "-".to_owned(),
+    ];
     if let Some(body) = body {
         args.push("--data-binary".to_owned());
         args.push(body.to_owned());
@@ -2415,6 +2447,28 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
             config.run.as_ref().and_then(|run| run.port).or(Some(3000)),
             None,
         )
+    } else if is_python_project(root) {
+        let install = match config
+            .build
+            .as_ref()
+            .and_then(|build| build.install.clone())
+        {
+            Some(command) => Some(command),
+            None => Some(python_install_command(root)?),
+        };
+        let run = match config.run.as_ref().and_then(|run| run.command.clone()) {
+            Some(command) => Some(command),
+            None => Some(python_run_command(root)?),
+        };
+        (
+            Runtime::Python,
+            AppType::Service,
+            install,
+            None,
+            run,
+            config.run.as_ref().and_then(|run| run.port).or(Some(8000)),
+            None,
+        )
     } else if root.join("bun.lock").exists() || root.join("bun.lockb").exists() {
         (
             Runtime::Bun,
@@ -2483,7 +2537,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         )
     } else {
         return Err(CiaoError::Detection(
-                "no supported project marker found (Cargo.toml, go.mod, Bun/Node lockfile or dist/build/public)".to_owned(),
+                "no supported project marker found (Cargo.toml, go.mod, package.json, Python files or dist/build/public)".to_owned(),
             ));
     };
 
@@ -2584,6 +2638,104 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
     Ok(plan)
 }
 
+/// Detect the common two-directory full-stack layout without requiring a
+/// project file:
+///
+/// ```text
+/// project/
+///   backend/   (Flask or another supported Python service)
+///   frontend/  (Next, Astro or another supported Node app)
+/// ```
+///
+/// The deploy engine still receives one `ProjectPlan` at a time. This API
+/// keeps component detection explicit and lets callers choose a safe
+/// orchestration policy instead of silently combining two processes.
+pub fn detect_project_components(root: &Path) -> Result<Vec<ProjectComponent>> {
+    let root_name = root_project_name(root)?;
+    validate_identifier("app name", &root_name)?;
+
+    let candidates = [
+        (
+            ProjectRole::Backend,
+            &["backend", "api", "server"] as &[&str],
+        ),
+        (
+            ProjectRole::Frontend,
+            &["frontend", "web", "client", "ui"] as &[&str],
+        ),
+    ];
+    let mut components = Vec::new();
+    for (role, directories) in candidates {
+        for directory in directories {
+            let path = root.join(directory);
+            if !path.is_dir() || !project_marker_exists(&path) {
+                continue;
+            }
+            let mut plan = match detect_project(&path) {
+                Ok(plan) => plan,
+                Err(_) => continue,
+            };
+            let configured_name = path.join("ciao.toml").is_file();
+            if !configured_name {
+                plan.name = format!("{root_name}-{directory}");
+                validate_identifier("app name", &plan.name)?;
+            }
+            components.push(ProjectComponent {
+                name: plan.name.clone(),
+                role,
+                path,
+                plan,
+            });
+            break;
+        }
+    }
+    if components
+        .iter()
+        .any(|component| component.role == ProjectRole::Backend)
+        && components
+            .iter()
+            .any(|component| component.role == ProjectRole::Frontend)
+    {
+        Ok(components)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn root_project_name(root: &Path) -> Result<String> {
+    if root.join("ciao.toml").is_file() {
+        let config: ProjectConfig = toml::from_str(&fs::read_to_string(root.join("ciao.toml"))?)
+            .map_err(|error| CiaoError::Config(error.to_string()))?;
+        if let Some(name) = config.app.and_then(|app| app.name) {
+            return Ok(name);
+        }
+    }
+    root.file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| CiaoError::Detection("project has no usable name".to_owned()))
+}
+
+fn project_marker_exists(root: &Path) -> bool {
+    [
+        "Cargo.toml",
+        "go.mod",
+        "package.json",
+        "bun.lock",
+        "bun.lockb",
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile",
+        "setup.py",
+        "app.py",
+        "main.py",
+        "dist",
+        "build",
+        "public",
+    ]
+    .into_iter()
+    .any(|file| root.join(file).exists())
+}
+
 fn is_astro_project(root: &Path) -> Result<bool> {
     let contents = fs::read_to_string(root.join("package.json"))
         .map_err(|error| CiaoError::Detection(format!("cannot read package.json: {error}")))?;
@@ -2601,6 +2753,97 @@ fn is_astro_project(root: &Path) -> Result<bool> {
         ]
         .into_iter()
         .any(|file| root.join(file).is_file()))
+}
+
+fn is_python_project(root: &Path) -> bool {
+    [
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile",
+        "setup.py",
+        "app.py",
+        "main.py",
+        "wsgi.py",
+        "manage.py",
+    ]
+    .into_iter()
+    .any(|file| root.join(file).is_file())
+}
+
+fn python_install_command(root: &Path) -> Result<String> {
+    if root.join("requirements.txt").is_file() {
+        return Ok(
+            "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt".to_owned(),
+        );
+    }
+    if root.join("pyproject.toml").is_file() || root.join("setup.py").is_file() {
+        return Ok(
+            "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install .".to_owned(),
+        );
+    }
+    Err(CiaoError::Detection(
+        "Python app needs requirements.txt, pyproject.toml or setup.py".to_owned(),
+    ))
+}
+
+fn python_dependency_declared(root: &Path, dependency: &str) -> bool {
+    let mut contents = String::new();
+    if let Ok(value) = fs::read_to_string(root.join("requirements.txt")) {
+        contents.push_str(&value);
+        contents.push('\n');
+    }
+    if let Ok(value) = fs::read_to_string(root.join("pyproject.toml")) {
+        contents.push_str(&value);
+    }
+    contents.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let line = line.split('#').next().unwrap_or_default().trim();
+        line == dependency
+            || line.starts_with(&format!("{dependency}=="))
+            || line.starts_with(&format!("{dependency}>"))
+            || line.starts_with(&format!("{dependency}<"))
+            || line.starts_with(&format!("{dependency}~"))
+            || line.starts_with(&format!("{dependency}["))
+            || line.contains(&format!("'{dependency}'"))
+            || line.contains(&format!("\"{dependency}\""))
+    })
+}
+
+fn python_entrypoint(root: &Path) -> Option<&'static str> {
+    [
+        ("app.py", "app"),
+        ("main.py", "main"),
+        ("wsgi.py", "wsgi"),
+        ("run.py", "run"),
+    ]
+    .into_iter()
+    .find(|(file, _)| root.join(file).is_file())
+    .map(|(_, module)| module)
+}
+
+fn python_run_command(root: &Path) -> Result<String> {
+    let module = python_entrypoint(root).ok_or_else(|| {
+        CiaoError::Detection(
+            "Python app entrypoint not found; add app.py, main.py, wsgi.py or a [run] command to ciao.toml"
+                .to_owned(),
+        )
+    })?;
+    if python_dependency_declared(root, "gunicorn") {
+        return Ok(format!(
+            ".venv/bin/gunicorn --bind \"$HOST:$PORT\" {module}:app"
+        ));
+    }
+    if python_dependency_declared(root, "uvicorn") {
+        return Ok(format!(
+            ".venv/bin/uvicorn {module}:app --host \"$HOST\" --port \"$PORT\""
+        ));
+    }
+    if python_dependency_declared(root, "flask") {
+        return Ok(format!(
+            ".venv/bin/python -m flask --app {module} run --host \"$HOST\" --port \"$PORT\""
+        ));
+    }
+    Ok(format!(".venv/bin/python {module}.py"))
 }
 
 fn astro_is_server_output(root: &Path) -> Result<bool> {
@@ -5187,6 +5430,9 @@ fn runtime_init_script(
         (HostOs::Linux, Runtime::Go) => {
             "set -eu\nif ! command -v go >/dev/null 2>&1; then sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go; fi\ncommand -v go >/dev/null 2>&1\n".to_owned()
         }
+        (HostOs::Linux, Runtime::Python) => {
+            "set -eu\nif ! command -v python3 >/dev/null 2>&1 || ! command -v pip3 >/dev/null 2>&1; then sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv; fi\ncommand -v python3 >/dev/null 2>&1\ncommand -v pip3 >/dev/null 2>&1\n".to_owned()
+        }
         (HostOs::Linux, Runtime::Node | Runtime::Astro) => {
             "set -eu\nif ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; fi\ncommand -v node >/dev/null 2>&1\ncommand -v npm >/dev/null 2>&1\n".to_owned()
         }
@@ -5207,6 +5453,7 @@ command -v bun >/dev/null 2>&1
         ),
         (HostOs::MacOs, Runtime::Rust) => macos_runtime_script("rust", &["cargo", "rustc"]),
         (HostOs::MacOs, Runtime::Go) => macos_runtime_script("go", &["go"]),
+        (HostOs::MacOs, Runtime::Python) => macos_runtime_script("python", &["python3"]),
         (HostOs::MacOs, Runtime::Bun) => macos_runtime_script("bun", &["bun"]),
         (HostOs::MacOs, Runtime::Node | Runtime::Astro) => {
             macos_runtime_script("node", &["node", "npm"])
@@ -7593,6 +7840,63 @@ mod tests {
         let plan = detect_project(directory.path()).unwrap();
         assert_eq!(plan.runtime, Runtime::Go);
         assert_eq!(plan.run_command.as_deref(), Some("./app"));
+    }
+
+    #[test]
+    fn detects_flask_service_with_a_safe_python_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("requirements.txt"),
+            "Flask==3.1.0\ngunicorn==23.0.0\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"flask-demo\"\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("app.py"), "from flask import Flask\n").unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.runtime, Runtime::Python);
+        assert_eq!(plan.app_type, AppType::Service);
+        assert_eq!(plan.port, Some(8000));
+        assert!(plan
+            .install_command
+            .as_deref()
+            .unwrap()
+            .contains("python3 -m venv .venv"));
+        assert_eq!(
+            plan.run_command.as_deref(),
+            Some(".venv/bin/gunicorn --bind \"$HOST:$PORT\" app:app")
+        );
+    }
+
+    #[test]
+    fn detects_backend_and_frontend_components_without_project_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = directory.path().join("backend");
+        let frontend = directory.path().join("frontend");
+        fs::create_dir_all(&backend).unwrap();
+        fs::create_dir_all(&frontend).unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"full-stack\"\n",
+        )
+        .unwrap();
+        fs::write(backend.join("requirements.txt"), "flask\n").unwrap();
+        fs::write(backend.join("app.py"), "from flask import Flask\n").unwrap();
+        fs::write(
+            frontend.join("package.json"),
+            r#"{"scripts":{"build":"next build","start":"next start"},"dependencies":{"next":"^15.0.0","react":"^19.0.0"}}"#,
+        )
+        .unwrap();
+        let components = detect_project_components(directory.path()).unwrap();
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].role, ProjectRole::Backend);
+        assert_eq!(components[0].plan.runtime, Runtime::Python);
+        assert_eq!(components[1].role, ProjectRole::Frontend);
+        assert_eq!(components[1].plan.runtime, Runtime::Node);
+        assert_eq!(components[1].name, "full-stack-frontend");
     }
 
     #[test]

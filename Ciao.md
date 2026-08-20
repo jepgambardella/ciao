@@ -620,6 +620,9 @@ package-lock.json
 
 yarn.lock
 → Node/Yarn
+
+requirements.txt / pyproject.toml + app.py
+→ Python web app (Flask, when detected)
 ```
 
 Recommended v0.1 support:
@@ -629,11 +632,10 @@ Rust
 Go
 Bun
 Node
+Python web apps, including Flask
 Astro static sites
 static sites
 ```
-
-Python can follow later.
 
 ---
 
@@ -1653,6 +1655,7 @@ enum Runtime {
     Go,
     Bun,
     Node,
+    Python,
     Static,
     Custom,
 }
@@ -1953,7 +1956,7 @@ No proxy.
 
 # 55. Multiple processes
 
-Do not support complex multi-process projects in the first version.
+Do not silently combine complex multi-process projects in the first version.
 
 Start with:
 
@@ -1961,6 +1964,12 @@ Start with:
 one deployable app
 one primary process
 ```
+
+Ciao may detect a conventional full-stack workspace with `backend/` and
+`frontend/` directories. It reports each component and its commands. Until a
+single transaction can activate and roll back all components together, deploy
+the components as separate Ciao apps. Never start only one half and report a
+successful full-stack deploy.
 
 Later:
 
