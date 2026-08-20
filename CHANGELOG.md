@@ -4,8 +4,7 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
-- Route local Astro projects through the dev server so CSS and page changes
-  update immediately through the `.localhost` address.
+No changes yet.
 
 ## [v0.1.6]
 
