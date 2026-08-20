@@ -156,6 +156,7 @@ pub struct HostInitResult {
 pub trait ProgressReporter {
     fn started(&self, _step: &str) {}
     fn updated(&self, _message: &str) {}
+    fn ready(&self, _message: &str) {}
     fn finished(&self, _step: &str) {}
     fn failed(&self, _step: &str) {}
     fn cancelled(&self) -> bool {
@@ -4358,7 +4359,7 @@ fn run_local_privileged_script(script: &str) -> Result<CommandOutput> {
     } else {
         "sudo"
     };
-    run_local_interactive_script(&local_privileged_script_with_sudo(script, sudo_prefix))
+    run_local_interactive_capture(&local_privileged_script_with_sudo(script, sudo_prefix))
 }
 
 fn run_local_interactive_capture(script: &str) -> Result<CommandOutput> {
@@ -4609,11 +4610,11 @@ elif ! sudo -n grep -Fqx "$import_line" "$caddyfile"; then
     printf '\n%s\n' "$import_line" | sudo -n tee -a "$caddyfile" >/dev/null
 fi
 caddy_bin="$brew_prefix/bin/caddy"
-sudo -n "$brew_bin" services restart dnsmasq >/dev/null
+sudo -n "$brew_bin" services restart dnsmasq >/dev/null 2>&1
 "$caddy_bin" validate --config "$caddyfile"
 # Caddy must run as the logged-in user. Starting it through sudo creates a
 # root-owned Homebrew service that cannot be managed reliably at user login.
-"$brew_bin" services restart caddy >/dev/null
+"$brew_bin" services restart caddy >/dev/null 2>&1
 "$caddy_bin" reload --config "$caddyfile"
 printf 'ciao_local_setup=ready\n'
 "#.to_owned())
@@ -5256,12 +5257,12 @@ fn local_setup_ready() -> bool {
     let services_ready = if cfg!(target_os = "macos") {
         Command::new("pgrep")
             .args(["-x", "dnsmasq"])
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|output| output.status.success())
             && Command::new("pgrep")
                 .args(["-x", "caddy"])
-                .status()
-                .is_ok_and(|status| status.success())
+                .output()
+                .is_ok_and(|output| output.status.success())
     } else {
         Command::new("systemctl")
             .args(["is-active", "--quiet", "dnsmasq"])
@@ -5430,6 +5431,20 @@ pub fn local_run_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
     Ok(script.into_bytes())
 }
 
+fn node_package_runner(root: &Path) -> Option<&'static str> {
+    if root.join("bun.lock").exists() || root.join("bun.lockb").exists() {
+        Some("bun")
+    } else if root.join("pnpm-lock.yaml").exists() {
+        Some("pnpm")
+    } else if root.join("yarn.lock").exists() {
+        Some("yarn")
+    } else if root.join("package.json").exists() {
+        Some("npm")
+    } else {
+        None
+    }
+}
+
 pub fn run_local_project(plan: &LocalDevPlan) -> Result<i32> {
     run_local_project_with_reporter(plan, &NoopProgressReporter)
 }
@@ -5492,100 +5507,130 @@ pub fn run_local_project_with_reporter(
             Ok(())
         })?;
     }
-    let mut process = match plan.app_type {
-        AppType::Service => {
-            let run = plan
-                .run_command
-                .as_deref()
-                .ok_or_else(|| CiaoError::Config("local service has no run command".to_owned()))?;
-            if run.trim().is_empty() {
-                return Err(CiaoError::Config(
-                    "local service run command cannot be empty".to_owned(),
-                ));
+    reporter.started("start local server");
+    let process_result = (|| -> Result<Child> {
+        Ok(match plan.app_type {
+            AppType::Service => {
+                let run = plan.run_command.as_deref().ok_or_else(|| {
+                    CiaoError::Config("local service has no run command".to_owned())
+                })?;
+                if run.trim().is_empty() {
+                    return Err(CiaoError::Config(
+                        "local service run command cannot be empty".to_owned(),
+                    ));
+                }
+                let script = format!(
+                    "set -eu\ncd -- {}\nexec {}\n",
+                    shell_quote(&plan.source.to_string_lossy()),
+                    run
+                );
+                let mut command = Command::new("sh");
+                command
+                    .arg("-s")
+                    .env("HOST", "127.0.0.1")
+                    .env("PORT", plan.port.to_string())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                own_process_group(&mut command);
+                let mut child = command.spawn()?;
+                if let Err(error) = child
+                    .stdin
+                    .take()
+                    .expect("piped stdin")
+                    .write_all(script.as_bytes())
+                {
+                    terminate_child(&mut child);
+                    return Err(error.into());
+                }
+                child
             }
-            let script = format!(
-                "set -eu\ncd -- {}\nexec {}\n",
-                shell_quote(&plan.source.to_string_lossy()),
-                run
-            );
-            let mut command = Command::new("sh");
-            command
-                .arg("-s")
-                .env("HOST", "127.0.0.1")
-                .env("PORT", plan.port.to_string())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            own_process_group(&mut command);
-            let mut child = command.spawn()?;
-            if let Err(error) = child
-                .stdin
-                .take()
-                .expect("piped stdin")
-                .write_all(script.as_bytes())
-            {
-                terminate_child(&mut child);
-                return Err(error.into());
-            }
-            child
-        }
-        AppType::Static => {
-            let root = plan.static_root.as_ref().ok_or_else(|| {
-                CiaoError::Config("static project has no output directory".to_owned())
-            })?;
-            if !root.is_dir() {
-                return Err(CiaoError::Detection(format!(
-                    "static build did not create {}",
-                    root.display()
-                )));
-            }
-            let mut command;
-            if let Some(program) = ["python3", "python"]
-                .into_iter()
-                .find(|program| find_executable(program).is_some())
-            {
-                command = Command::new(program);
+            AppType::Static if plan.runtime == Runtime::Astro => {
+                let runner = node_package_runner(&plan.source).ok_or_else(|| {
+                    CiaoError::Config(
+                        "Astro local run needs npm, pnpm, yarn or bun to start the dev server"
+                            .to_owned(),
+                    )
+                })?;
+                let mut command = Command::new(runner);
+                // Astro backgrounds itself in detected agent environments. Ciao
+                // owns the process lifecycle, so force the normal foreground mode.
+                command.env("ASTRO_DEV_BACKGROUND", "0");
                 command.args([
-                    "-m",
-                    "http.server",
-                    &plan.port.to_string(),
-                    "--bind",
+                    "run",
+                    "dev",
+                    "--",
+                    "--host",
                     "127.0.0.1",
-                    "--directory",
-                    &root.to_string_lossy(),
+                    "--port",
+                    &plan.port.to_string(),
                 ]);
-            } else if find_executable("npx").is_some() {
-                command = Command::new("npx");
-                command.args([
-                    "--yes",
-                    "serve",
-                    "--listen",
-                    &format!("127.0.0.1:{}", plan.port),
-                    &root.to_string_lossy(),
-                ]);
-            } else {
-                return Err(CiaoError::Config(
-                    "ciao run needs python3, python or npx to serve static files".to_owned(),
-                ));
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+                own_process_group(&mut command);
+                command.spawn()?
             }
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-            own_process_group(&mut command);
-            command.spawn()?
+            AppType::Static => {
+                let root = plan.static_root.as_ref().ok_or_else(|| {
+                    CiaoError::Config("static project has no output directory".to_owned())
+                })?;
+                if !root.is_dir() {
+                    return Err(CiaoError::Detection(format!(
+                        "static build did not create {}",
+                        root.display()
+                    )));
+                }
+                let mut command;
+                if let Some(program) = ["python3", "python"]
+                    .into_iter()
+                    .find(|program| find_executable(program).is_some())
+                {
+                    command = Command::new(program);
+                    command.args([
+                        "-m",
+                        "http.server",
+                        &plan.port.to_string(),
+                        "--bind",
+                        "127.0.0.1",
+                        "--directory",
+                        &root.to_string_lossy(),
+                    ]);
+                } else if find_executable("npx").is_some() {
+                    command = Command::new("npx");
+                    command.args([
+                        "--yes",
+                        "serve",
+                        "--listen",
+                        &format!("127.0.0.1:{}", plan.port),
+                        &root.to_string_lossy(),
+                    ]);
+                } else {
+                    return Err(CiaoError::Config(
+                        "ciao run needs python3, python or npx to serve static files".to_owned(),
+                    ));
+                }
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+                own_process_group(&mut command);
+                command.spawn()?
+            }
+        })
+    })();
+    let mut process = match process_result {
+        Ok(process) => process,
+        Err(error) => {
+            reporter.failed("start local server");
+            return Err(error);
         }
     };
-    reporter.started("start local server");
+    reporter.ready(&format!(
+        "local server started at http://{}.localhost — press Ctrl-C to stop",
+        plan.name
+    ));
     let status = match wait_child_with_cancellation(&mut process)? {
         Some(status) => status.code().unwrap_or(128),
         None => {
-            reporter.failed("start local server");
             return Ok(130);
         }
     };
-    if status == 0 {
-        reporter.finished("start local server");
-    } else {
-        reporter.failed("start local server");
-    }
     Ok(status)
 }
 

@@ -277,6 +277,14 @@ impl ProgressReporter for TerminalProgress {
         self.finish(step, true);
     }
 
+    fn ready(&self, message: &str) {
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(bar) = current.take() {
+                bar.finish_with_message(format!("✓ {message}"));
+            }
+        }
+    }
+
     fn updated(&self, message: &str) {
         if let Ok(current) = self.current.lock() {
             if let Some(bar) = current.as_ref() {
@@ -715,7 +723,7 @@ fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
             stderr: error.to_string(),
         });
     }
-    if status != 0 {
+    if status != 0 && status != 130 {
         return Err(CiaoError::LocalCommand {
             stage: "run local development process".to_owned(),
             exit: status,
@@ -760,8 +768,6 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
         );
     } else {
         println!("✓ project detected: {}", plan.runtime);
-        println!("✓ temporary local server: http://{}.localhost", plan.name);
-        println!("  Press Ctrl-C to stop.");
         println!();
     }
     let progress = TerminalProgress::new();
@@ -777,7 +783,7 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
         });
     }
     let status = status?;
-    if status != 0 {
+    if status != 0 && status != 130 {
         return Err(CiaoError::LocalCommand {
             stage: "run temporary local project".to_owned(),
             exit: status,

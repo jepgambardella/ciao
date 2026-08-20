@@ -121,7 +121,9 @@ ciao run
 
 Ciao detects the project, installs and builds it, then starts it on
 `http://<project>.localhost`. Ciao keeps the app on an internal loopback port
-and uses the local Caddy proxy to hide it. Press `Ctrl-C` to stop it.
+and uses the local Caddy proxy to hide it. Ciao prints one address and tells you
+how to stop the server. For Astro, Ciao starts the Astro development server
+after the first build, so CSS and source changes reload automatically.
 
 Run an app locally with a stable `.ciao` address:
 

@@ -6,6 +6,15 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.5]
+
+- Make `ciao run` print one canonical `.localhost` address.
+- Show a completed start message and a clear `Ctrl-C` instruction.
+- Keep Astro development servers in the foreground and enable CSS/source hot
+  reload.
+- Stop Astro child processes and remove the temporary Caddy route on exit.
+- Hide service-manager PIDs and other local setup output from the normal CLI.
+
 ## [v0.1.4]
 
 - Generate GitHub Actions workflows from the detected project runtime and app
