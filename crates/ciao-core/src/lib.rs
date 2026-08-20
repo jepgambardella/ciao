@@ -5386,77 +5386,6 @@ pub fn local_dev_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
     Ok(script.into_bytes())
 }
 
-/// Build the short-lived local runner used by `ciao run`.
-///
-/// This path never installs Caddy and never writes the `.ciao` resolver. It
-/// runs one project on loopback, then exits when the foreground process exits.
-pub fn local_run_script(plan: &LocalDevPlan) -> Result<Vec<u8>> {
-    let mut script = format!(
-        "set -eu\ntrap 'exit 130' INT TERM\ncd -- {}\nexport HOST=127.0.0.1\nexport PORT={}\n",
-        shell_quote(&plan.source.to_string_lossy()),
-        plan.port
-    );
-    for command in [&plan.install_command, &plan.build_command]
-        .into_iter()
-        .flatten()
-    {
-        if command.trim().is_empty() {
-            return Err(CiaoError::Config(
-                "local install/build command cannot be empty".to_owned(),
-            ));
-        }
-        script.push_str(command);
-        script.push('\n');
-    }
-    match plan.app_type {
-        AppType::Service => {
-            let run = plan
-                .run_command
-                .as_deref()
-                .ok_or_else(|| CiaoError::Config("local service has no run command".to_owned()))?;
-            if run.trim().is_empty() {
-                return Err(CiaoError::Config(
-                    "local service run command cannot be empty".to_owned(),
-                ));
-            }
-            script.push_str("exec ");
-            script.push_str(run);
-            script.push('\n');
-        }
-        AppType::Static => {
-            let root = plan.static_root.as_ref().ok_or_else(|| {
-                CiaoError::Config("static project has no output directory".to_owned())
-            })?;
-            let root = shell_quote(&root.to_string_lossy());
-            script.push_str(&format!(
-                "test -d {root} || {{ echo 'static build did not create {}' >&2; exit 1; }}\n",
-                shell_quote(
-                    plan.static_root
-                        .as_ref()
-                        .and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy())
-                        .as_deref()
-                        .unwrap_or("the output directory")
-                ),
-                root = root
-            ));
-            script.push_str("if command -v python3 >/dev/null 2>&1; then exec python3 -m http.server \"$PORT\" --bind 127.0.0.1 --directory ");
-            script.push_str(&root);
-            script.push_str("; fi\n");
-            script.push_str("if command -v python >/dev/null 2>&1; then exec python -m http.server \"$PORT\" --bind 127.0.0.1 --directory ");
-            script.push_str(&root);
-            script.push_str("; fi\n");
-            script.push_str("if command -v npx >/dev/null 2>&1; then exec npx --yes serve --listen \"127.0.0.1:$PORT\" ");
-            script.push_str(&root);
-            script.push_str("; fi\n");
-            script.push_str(
-                "echo 'ciao run needs python3, python or npx to serve static files' >&2\nexit 127\n",
-            );
-        }
-    }
-    Ok(script.into_bytes())
-}
-
 fn node_package_runner(root: &Path) -> Option<&'static str> {
     if root.join("bun.lock").exists() || root.join("bun.lockb").exists() {
         Some("bun")
@@ -5469,10 +5398,6 @@ fn node_package_runner(root: &Path) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-pub fn run_local_project(plan: &LocalDevPlan) -> Result<i32> {
-    run_local_project_with_reporter(plan, &NoopProgressReporter)
 }
 
 pub fn run_local_project_with_reporter(
@@ -8538,28 +8463,6 @@ mod tests {
         let astro_fragment = local_caddy_fragment(&astro_plan).unwrap();
         assert!(astro_fragment.contains("reverse_proxy 127.0.0.1:41001"));
         assert!(!astro_fragment.contains("file_server"));
-    }
-
-    #[test]
-    fn local_run_serves_static_output_without_caddy() {
-        let directory = tempfile::tempdir().unwrap();
-        let plan = LocalDevPlan {
-            name: "site".to_owned(),
-            domain: "site.ciao".to_owned(),
-            port: 41001,
-            source: directory.path().to_path_buf(),
-            runtime: Runtime::Astro,
-            app_type: AppType::Static,
-            install_command: Some("npm ci".to_owned()),
-            build_command: Some("npm run build".to_owned()),
-            run_command: None,
-            static_root: Some(directory.path().join("dist")),
-        };
-        let script = String::from_utf8(local_run_script(&plan).unwrap()).unwrap();
-        assert!(script.contains("npm ci"));
-        assert!(script.contains("npm run build"));
-        assert!(script.contains("python3 -m http.server"));
-        assert!(!script.contains("caddy"));
     }
 
     #[test]

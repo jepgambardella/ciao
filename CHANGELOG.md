@@ -6,6 +6,10 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.8]
+
+- Remove two unused legacy local-run wrappers and their obsolete test path.
+
 ## [v0.1.7]
 
 - Bound captured process output to 64 KiB while continuing to drain pipes.
