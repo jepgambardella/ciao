@@ -1130,6 +1130,7 @@ exit 127
 "#
         .to_vec(),
     )
+    .with_full_output()
 }
 
 /// Find an already installed local Tailscale CLI before attempting any
@@ -1245,11 +1246,9 @@ pub fn local_tailscale_target() -> Result<TailscaleTarget> {
             vec!["status".to_owned(), "--json".to_owned()],
         )
     };
-    let output = run_local_command(&program, &args, None, "inspect local Tailscale status")?;
-    let status: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
-        CiaoError::Config(format!(
-            "local Tailscale returned invalid status JSON: {error}"
-        ))
+    let output = run_local_command_full(&program, &args, None, "inspect local Tailscale status")?;
+    let status = tailscale_status_value(&output.stdout, &output.stderr).ok_or_else(|| {
+        CiaoError::Config("local Tailscale returned invalid status JSON".to_owned())
     })?;
     tailscale_target_from_status(&status)
 }
@@ -1446,9 +1445,33 @@ pub fn tailscale_target(transport: &dyn RemoteHost) -> Result<TailscaleTarget> {
 }
 
 fn tailscale_status_value(stdout: &str, stderr: &str) -> Option<serde_json::Value> {
-    [stdout, stderr]
-        .into_iter()
-        .find_map(|value| serde_json::from_str(value.trim()).ok())
+    [stdout, stderr].into_iter().find_map(parse_json_object)
+}
+
+/// Parse a Tailscale JSON response even when a transport prepends or appends
+/// harmless text (for example an SSH login banner). The command is still
+/// expected to contain a JSON object; unrelated text is never returned.
+fn parse_json_object(value: &str) -> Option<serde_json::Value> {
+    if let Ok(candidate) = serde_json::from_str::<serde_json::Value>(value.trim()) {
+        if candidate.is_object() {
+            return Some(candidate);
+        }
+    }
+    let mut offset = 0;
+    while let Some(relative) = value[offset..].find('{') {
+        let start = offset + relative;
+        let mut deserializer = serde_json::Deserializer::from_str(&value[start..]);
+        if let Ok(candidate) = serde_json::Value::deserialize(&mut deserializer) {
+            if candidate.is_object() {
+                return Some(candidate);
+            }
+        }
+        offset = start + 1;
+        if offset >= value.len() {
+            break;
+        }
+    }
+    None
 }
 
 const TAILSCALE_CONNECTED_MARKER: &str = "__CIAO_TAILSCALE_CONNECTED__";
@@ -2818,6 +2841,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub stdin: Option<Vec<u8>>,
     pub stage: String,
+    pub full_output: bool,
 }
 
 impl CommandSpec {
@@ -2827,11 +2851,17 @@ impl CommandSpec {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             stdin: None,
             stage: stage.into(),
+            full_output: false,
         }
     }
 
     pub fn with_stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(stdin.into());
+        self
+    }
+
+    pub fn with_full_output(mut self) -> Self {
+        self.full_output = true;
         self
     }
 }
@@ -2845,10 +2875,22 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     fn from_output(output: std::process::Output) -> Self {
+        Self::from_output_with_limit(output, false)
+    }
+
+    fn from_output_with_limit(output: std::process::Output, full_output: bool) -> Self {
         Self {
             status: output.status.code().unwrap_or(128),
-            stdout: truncate(&String::from_utf8_lossy(&output.stdout)),
-            stderr: truncate(&String::from_utf8_lossy(&output.stderr)),
+            stdout: if full_output {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            } else {
+                truncate(&String::from_utf8_lossy(&output.stdout))
+            },
+            stderr: if full_output {
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            } else {
+                truncate(&String::from_utf8_lossy(&output.stderr))
+            },
         }
     }
 
@@ -3318,7 +3360,7 @@ impl RemoteHost for OpenSshTransport {
             }
         }
         let output = child.wait_with_output()?;
-        let result = CommandOutput::from_output(output);
+        let result = CommandOutput::from_output_with_limit(output, command.full_output);
         result.ensure_success(&command.stage)
     }
 
@@ -3702,6 +3744,25 @@ fn run_local_command(
     stdin: Option<&[u8]>,
     stage: &str,
 ) -> Result<CommandOutput> {
+    run_local_command_with_output_limit(program, args, stdin, stage, false)
+}
+
+fn run_local_command_full(
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    stage: &str,
+) -> Result<CommandOutput> {
+    run_local_command_with_output_limit(program, args, stdin, stage, true)
+}
+
+fn run_local_command_with_output_limit(
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    stage: &str,
+    full_output: bool,
+) -> Result<CommandOutput> {
     let mut command = Command::new(program);
     command.args(args);
     if stdin.is_some() {
@@ -3714,7 +3775,7 @@ fn run_local_command(
         }
         child.wait_with_output()
     })?;
-    let result = CommandOutput::from_output(output);
+    let result = CommandOutput::from_output_with_limit(output, full_output);
     if result.status == 0 {
         Ok(result)
     } else {
@@ -5938,6 +5999,7 @@ pub fn app_logs(
                 },
                 stdin: None,
                 stage: "read logs".to_owned(),
+                full_output: false,
             };
             transport.exec(command.clone())?
         }
@@ -6904,6 +6966,7 @@ fn write_remote_file(
         args: vec!["-n".to_owned(), "tee".to_owned(), path.to_owned()],
         stdin: Some(contents.as_bytes().to_vec()),
         stage: stage.to_owned(),
+        full_output: false,
     };
     transport.exec(command)?;
     remote_script(
@@ -6936,6 +6999,7 @@ fn run_as_user_script(
         ],
         stdin: Some(script.to_vec()),
         stage: stage.to_owned(),
+        full_output: false,
     };
     transport.exec(command).map(|_| ())
 }
@@ -7902,6 +7966,23 @@ mod tests {
             Some("https://login.tailscale.com/a/example?redirect=1".to_owned())
         );
         assert!(tailscale_auth_url_from_output("https://evil.example/login").is_none());
+    }
+
+    #[test]
+    fn tailscale_status_parser_ignores_transport_text() {
+        let status = r#"remote banner
+{"BackendState":"Running","TailscaleIPs":["100.64.0.7"]}
+remote footer"#;
+        let parsed = tailscale_status_value(status, "").unwrap();
+        assert_eq!(parsed["BackendState"], "Running");
+        assert_eq!(parsed["TailscaleIPs"][0], "100.64.0.7");
+    }
+
+    #[test]
+    fn json_parser_keeps_top_level_object() {
+        let parsed =
+            parse_json_object(r#"{"BackendState":"Running","Self":{"Online":true}}"#).unwrap();
+        assert_eq!(parsed["BackendState"], "Running");
     }
 
     #[test]
