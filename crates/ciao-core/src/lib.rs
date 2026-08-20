@@ -422,6 +422,8 @@ impl GitHubRepoRef {
 pub struct GitHubRepository {
     pub owner: String,
     pub repo: String,
+    #[serde(default)]
+    pub owner_id: String,
     pub repository_id: String,
     pub default_branch: String,
     pub remote: String,
@@ -758,6 +760,7 @@ pub fn detect_github_repository(root: &Path) -> Result<Option<GitHubRepository>>
     Ok(Some(GitHubRepository {
         owner: reference.owner,
         repo: reference.repo,
+        owner_id: String::new(),
         repository_id: String::new(),
         default_branch: if branch.is_empty() {
             "main".to_owned()
@@ -793,6 +796,17 @@ pub fn github_repository_metadata(reference: &GitHubRepoRef) -> Result<GitHubRep
         .ok_or_else(|| {
             CiaoError::Config("GitHub metadata did not include repository id".to_owned())
         })?;
+    let owner_id = value
+        .get("owner")
+        .and_then(|owner| owner.get("id"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|id| id.to_string()))
+        })
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| CiaoError::Config("GitHub metadata did not include owner id".to_owned()))?;
     let default_branch = value
         .get("default_branch")
         .and_then(serde_json::Value::as_str)
@@ -807,6 +821,7 @@ pub fn github_repository_metadata(reference: &GitHubRepoRef) -> Result<GitHubRep
     Ok(GitHubRepository {
         owner: reference.owner.clone(),
         repo: reference.repo.clone(),
+        owner_id,
         repository_id,
         default_branch: default_branch.to_owned(),
         remote: format!("https://github.com/{}.git", reference.full_name()),
@@ -1993,6 +2008,22 @@ pub fn tailscale_federated_identity_request(
             }
         })
         .collect::<String>();
+    let subject = if repository.owner_id.is_empty() {
+        format!(
+            "repo:{}:ref:refs/heads/{}",
+            repository.full_name(),
+            repository.default_branch
+        )
+    } else {
+        format!(
+            "repo:{}@{}/{}@{}:ref:refs/heads/{}",
+            repository.owner,
+            repository.owner_id,
+            repository.repo,
+            repository.repository_id,
+            repository.default_branch
+        )
+    };
     Ok(serde_json::json!({
         "keyType": "federated",
         "description": format!("Ciao GitHub CI - {description}"),
@@ -2000,7 +2031,7 @@ pub fn tailscale_federated_identity_request(
         "tags": ["tag:ciao-ci"],
         "audience": format!("api.tailscale.com/ciao-{}", repository.repository_id),
         "issuer": "https://token.actions.githubusercontent.com",
-        "subject": format!("repo:{}:ref:refs/heads/{}", repository.full_name(), repository.default_branch),
+        "subject": subject,
         "customClaimRules": {
             "repository_id": repository.repository_id,
             "ref": format!("refs/heads/{}", repository.default_branch)
@@ -8527,18 +8558,20 @@ mod tests {
     fn tailscale_federated_identity_description_has_safe_characters() {
         let repository = GitHubRepository {
             owner: "acme".to_owned(),
-            repo: "case-porto-cervo".to_owned(),
+            repo: "demo-site".to_owned(),
+            owner_id: "42".to_owned(),
             repository_id: "123".to_owned(),
             default_branch: "main".to_owned(),
-            remote: "https://github.com/acme/case-porto-cervo".to_owned(),
+            remote: "https://github.com/acme/demo-site".to_owned(),
             private: false,
         };
         let request = tailscale_federated_identity_request(&repository).unwrap();
-        assert_eq!(
-            request["description"],
-            "Ciao GitHub CI - acme-case-porto-cervo"
-        );
+        assert_eq!(request["description"], "Ciao GitHub CI - acme-demo-site");
         assert!(!request["description"].as_str().unwrap().contains('/'));
+        assert_eq!(
+            request["subject"],
+            "repo:acme@42/demo-site@123:ref:refs/heads/main"
+        );
     }
 
     #[test]
