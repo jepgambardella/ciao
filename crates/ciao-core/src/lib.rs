@@ -5400,15 +5400,57 @@ fn node_package_runner(root: &Path) -> Option<&'static str> {
     }
 }
 
+fn local_dependencies_are_current(plan: &LocalDevPlan) -> bool {
+    if plan.install_command.is_none()
+        || !matches!(plan.runtime, Runtime::Astro | Runtime::Node | Runtime::Bun)
+    {
+        return plan.install_command.is_none();
+    }
+    let modules = plan.source.join("node_modules");
+    if !modules.is_dir()
+        || !fs::read_dir(&modules)
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .is_some()
+    {
+        return false;
+    }
+    let Ok(modules_time) = fs::metadata(&modules).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    [
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ]
+    .into_iter()
+    .map(|name| plan.source.join(name))
+    .filter(|path| path.is_file())
+    .all(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified <= modules_time)
+    })
+}
+
 pub fn run_local_project_with_reporter(
     plan: &LocalDevPlan,
     reporter: &dyn ProgressReporter,
 ) -> Result<i32> {
+    let skip_install = local_dependencies_are_current(plan);
+    let skip_astro_build = plan.app_type == AppType::Static && plan.runtime == Runtime::Astro;
     for (step, command) in [
         ("install dependencies", plan.install_command.as_deref()),
         ("build", plan.build_command.as_deref()),
     ]
     .into_iter()
+    .filter(|(step, _)| {
+        !(*step == "install dependencies" && skip_install)
+            && !(*step == "build" && skip_astro_build)
+    })
     .filter_map(|(step, command)| command.map(|command| (step, command)))
     {
         if command.trim().is_empty() {

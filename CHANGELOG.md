@@ -6,6 +6,13 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.10]
+
+- Skip the redundant Astro production build during `ciao run`; Astro dev still
+  compiles current source files and keeps HMR active.
+- Reuse local JavaScript dependencies while package manifests and lockfiles
+  are unchanged.
+
 ## [v0.1.9]
 
 - Prevent concurrent `ciao run` sessions for the same project from removing
