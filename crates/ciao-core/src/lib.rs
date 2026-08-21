@@ -7701,6 +7701,28 @@ mod tests {
     }
 
     #[test]
+    fn node_service_without_build_script_keeps_build_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"node-no-build\"\n",
+        )
+        .unwrap();
+
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.runtime, Runtime::Node);
+        assert_eq!(plan.app_type, AppType::Service);
+        assert_eq!(plan.build_command, None);
+        assert_eq!(plan.run_command.as_deref(), Some("npm start"));
+        assert_eq!(plan.install_command.as_deref(), Some("npm install"));
+    }
+
+    #[test]
     fn release_keep_is_read_from_project_config() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();

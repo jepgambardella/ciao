@@ -124,7 +124,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
                 Runtime::Node,
                 AppType::Service,
                 Some(install.to_owned()),
-                Some(format!("{runner} run build")),
+                package_script(root, "build").map(|_| format!("{runner} run build")),
                 start_script,
                 Some(3000),
                 None,

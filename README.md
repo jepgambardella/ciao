@@ -176,7 +176,8 @@ For a temporary test on this computer, use:
 ciao run
 ```
 
-Ciao detects the project, installs and builds it, then starts it on
+Ciao detects the project, installs dependencies, runs the detected build when
+the project defines one, then starts it on
 `http://<project>.localhost`. Ciao keeps the app on an internal loopback port
 and uses the local Caddy proxy to hide it. Ciao prints one address and tells you
 how to stop the server. For Astro, Ciao starts the Astro development server
