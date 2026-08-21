@@ -6,6 +6,18 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.16] - 2026-08-21
+
+- Do not require a TTY for Cloudflare Tunnel deploys when the local account is
+  already authenticated. When the first login is missing, print the official
+  login URL and the exact `cloudflared tunnel login` command instead of a
+  generic terminal error.
+- Keep JSON deploy output machine-readable by sending Cloudflare setup notices
+  to stderr.
+- Use the release manifest's effective port as the single source for the
+  generated service start script, candidate healthcheck and activation checks;
+  add a regression test for `[run].port`.
+
 ## [v0.1.15] - 2026-08-21
 
 - Add project-owned Cloudflare Tunnel declarations with `[tunnel] hostname`

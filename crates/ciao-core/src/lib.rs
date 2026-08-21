@@ -4783,8 +4783,9 @@ pub fn cloudflare_tunnel_setup_with_config(
     let cert = cloudflared_dir.join("cert.pem");
     if !cert.is_file() {
         let output = run_local_interactive_script(&format!(
-            "set -eu\n{} tunnel login\n",
-            shell_quote(&cloudflared)
+            "set -eu\n{} tunnel login --loginURL {}\n",
+            shell_quote(&cloudflared),
+            shell_quote(CLOUDFLARE_LOGIN_URL)
         ))?;
         if output.status != 0 {
             return Err(CiaoError::LocalCommand {
@@ -5181,6 +5182,23 @@ fn cloudflared_executable() -> Option<PathBuf> {
         .map(PathBuf::from)
         .find(|path| path.is_file())
     })
+}
+
+const CLOUDFLARE_LOGIN_URL: &str = "https://dash.cloudflare.com/argotunnel";
+
+/// Return whether the local Cloudflare account login is already available.
+///
+/// Creating or routing a tunnel can then run without a terminal. The first
+/// login still needs an interactive `cloudflared tunnel login` callback.
+pub fn cloudflare_tunnel_login_ready() -> bool {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cloudflared/cert.pem").is_file())
+        .unwrap_or(false)
+}
+
+pub fn cloudflare_tunnel_login_url() -> &'static str {
+    CLOUDFLARE_LOGIN_URL
 }
 
 fn ensure_local_cloudflared() -> Result<String> {
@@ -6465,11 +6483,13 @@ fn deploy_unlocked(
                 .map(|_| ())
             })?;
         } else {
-            let port = port.expect("service plans have a port");
+            let service_port = manifest.port.ok_or_else(|| {
+                CiaoError::Config("service release manifest has no port".to_owned())
+            })?;
             let start_script = start_script(
                 &release_path,
                 release_start_command(plan)?,
-                port,
+                service_port,
                 &format!("{root}/{}/shared/env", plan.name),
             )?;
             progress_step(reporter, "prepare service release", || {
@@ -6517,7 +6537,7 @@ fn deploy_unlocked(
                     // checked immediately after the restart in activation.
                     Ok(())
                 } else if platform.os == HostOs::MacOs {
-                    run_macos_candidate(transport, &user, &release_path, port, &plan.health)
+                    run_macos_candidate(transport, &user, &release_path, service_port, &plan.health)
                 } else {
                     let candidate_unit = slot_service_unit_name(
                         &plan.name,
@@ -6539,7 +6559,7 @@ fn deploy_unlocked(
                         &candidate_unit,
                         LifecycleAction::Start,
                     )?;
-                    remote_healthcheck(transport, port, &plan.health)?;
+                    remote_healthcheck(transport, service_port, &plan.health)?;
                     Ok(())
                 }
             })?;
@@ -6622,7 +6642,7 @@ fn deploy_unlocked(
                         );
                     }
                     write_active_slot(transport, &root, &plan.name, slot)?;
-                    remote_healthcheck(transport, port, &plan.health)
+                    remote_healthcheck(transport, service_port, &plan.health)
                 } else {
                     if fixed_port && platform.os == HostOs::Linux {
                         // A previous blue/green release may still own the
@@ -6670,7 +6690,7 @@ fn deploy_unlocked(
                         &stable_unit,
                         LifecycleAction::Restart,
                     )?;
-                    remote_healthcheck(transport, port, &plan.health)
+                    remote_healthcheck(transport, service_port, &plan.health)
                 }
             })?;
         }
@@ -8246,6 +8266,32 @@ mod tests {
         .unwrap();
         let error = detect_project(directory.path()).unwrap_err();
         assert!(error.to_string().contains("between 1024 and 65535"));
+    }
+
+    #[test]
+    fn explicit_run_port_reaches_manifest_and_generated_start_script() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"fixed-port\"\n[run]\nport = 41002\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        let manifest = ReleaseManifest::from_plan("r1".to_owned(), directory.path(), &plan);
+        assert_eq!(manifest.port, Some(41002));
+        let script = start_script(
+            "/var/lib/ciao/apps/fixed-port/releases/r1",
+            manifest.run_command.as_deref().unwrap(),
+            manifest.port.unwrap(),
+            "/var/lib/ciao/apps/fixed-port/shared/env",
+        )
+        .unwrap();
+        assert!(script.contains("export PORT=41002\n"));
     }
 
     #[test]

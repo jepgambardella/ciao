@@ -589,11 +589,15 @@ fn run(cli: Cli) -> Result<()> {
                         .to_owned(),
                 ));
             }
-            if cloudflare_declared && !args.dry_run && !interactive_output {
-                return Err(CiaoError::Config(
-                    "Cloudflare Tunnel setup requires an interactive terminal; run the deploy from a terminal"
-                        .to_owned(),
-                ));
+            if cloudflare_declared
+                && !args.dry_run
+                && !interactive_output
+                && !cloudflare_tunnel_login_ready()
+            {
+                return Err(CiaoError::Config(format!(
+                    "Cloudflare login is required before a non-interactive deploy. Open {} and run `cloudflared tunnel login`, then rerun Ciao",
+                    cloudflare_tunnel_login_url()
+                )));
             }
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
@@ -732,6 +736,13 @@ fn run(cli: Cli) -> Result<()> {
                         "! deployment succeeded, but local .ciao routing was not configured: {error}"
                     );
                 }
+                if let Err(error) = offer_github_setup(&path, &args.host, &result.app, cli.json) {
+                    eprintln!(
+                        "! deployment succeeded, but GitHub auto-deploy was not configured: {error}"
+                    );
+                }
+            }
+            if cloudflare_declared && !args.dry_run && !cli.json {
                 if let Some((_, tunnel)) = declared_tunnel.as_ref() {
                     if let Err(error) =
                         setup_cloudflare_tunnel_with_config(&transport, &result.app, tunnel)
@@ -746,11 +757,6 @@ fn run(cli: Cli) -> Result<()> {
                             "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
                         );
                     }
-                }
-                if let Err(error) = offer_github_setup(&path, &args.host, &result.app, cli.json) {
-                    eprintln!(
-                        "! deployment succeeded, but GitHub auto-deploy was not configured: {error}"
-                    );
                 }
             }
             Ok(())
@@ -1355,8 +1361,8 @@ fn offer_remote_local_domain(transport: &OpenSshTransport, app: &str) -> Result<
 fn setup_cloudflare_tunnel(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
     let platform = transport.inspect()?;
     let result = cloudflare_tunnel_setup(transport, &platform.os, app, domain)?;
-    println!("✓ public domain: https://{}", result.domain);
-    println!("  {}", result.message);
+    eprintln!("✓ public domain: https://{}", result.domain);
+    eprintln!("  {}", result.message);
     Ok(())
 }
 
@@ -1367,8 +1373,8 @@ fn setup_cloudflare_tunnel_with_config(
 ) -> Result<()> {
     let platform = transport.inspect()?;
     let result = cloudflare_tunnel_setup_with_config(transport, &platform.os, app, config)?;
-    println!("✓ public domain: https://{}", result.domain);
-    println!("  {}", result.message);
+    eprintln!("✓ public domain: https://{}", result.domain);
+    eprintln!("  {}", result.message);
     Ok(())
 }
 
