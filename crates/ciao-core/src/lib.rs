@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -20,6 +20,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+mod audit;
+mod domain;
+mod env;
+mod hooks;
+mod operations;
+mod project;
+mod service_slots;
+mod transaction;
+pub use audit::{host_audit, AuditItem, HostAuditResult};
+pub use domain::{
+    add_domain, configure_domain_for_cloudflare, configure_remote_ciao_domain, remove_domain,
+    validate_domain,
+};
+use domain::{
+    caddy_fragment_with_scheme, caddy_reload_script, configure_domain,
+    configure_release_caddy_route, existing_domain_is_plain_http, read_existing_domain,
+    remove_domain_fragment,
+};
+#[cfg(test)]
+use env::env_file_line;
+pub use env::{
+    diff_env, generate_env, pull_env, push_env, set_env, unset_env, validate_env_key, EnvDiff,
+    EnvGenerateResult,
+};
+use hooks::{run_local_hook, run_remote_hook};
+pub use operations::{
+    app_logs, app_status, follow_app_logs, lifecycle_action, list_apps, list_releases, remove_app,
+    rollback, rollback_to,
+};
+pub use project::{detect_project, detect_project_components};
+use service_slots::{
+    active_slot_path, read_active_slot, slot_service_unit_name, write_active_slot,
+};
+pub use transaction::{deploy_full_stack_with_mode, FullStackDeployResult};
 
 pub const APP_ROOT: &str = "/var/lib/ciao/apps";
 pub const CONFIG_ENV: &str = "CIAO_CONFIG";
@@ -127,6 +162,16 @@ pub enum HostOs {
     Linux,
     MacOs,
     Unknown(String),
+}
+
+impl HostOs {
+    fn service_manager_name(&self) -> &str {
+        match self {
+            Self::Linux => "systemd",
+            Self::MacOs => "launchd",
+            Self::Unknown(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +354,20 @@ pub struct ProjectPlan {
     pub local_name: Option<String>,
     pub local_port: Option<u16>,
     pub local_command: Option<String>,
+    pub release_keep: usize,
+    #[serde(default)]
+    pub hooks: HooksConfig,
+}
+
+/// Fixed lifecycle hooks declared by the project author in `ciao.toml`.
+/// Hooks are shell commands and run in the same trust boundary as build and
+/// start commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HooksConfig {
+    pub pre_upload: Option<String>,
+    pub pre_activate: Option<String>,
+    pub post_activate: Option<String>,
+    pub on_rollback: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -318,6 +377,13 @@ struct ProjectConfig {
     run: Option<RunConfig>,
     health: Option<HealthConfigFile>,
     dev: Option<DevConfig>,
+    releases: Option<ReleasesConfig>,
+    hooks: Option<HooksConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ReleasesConfig {
+    keep: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2565,25 +2631,6 @@ fn validate_github_segment(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_env_key(key: &str) -> Result<()> {
-    let valid = !key.is_empty()
-        && key
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    if !valid {
-        return Err(CiaoError::InvalidIdentifier {
-            field: "environment variable",
-            value: key.to_owned(),
-            reason: "must match [A-Za-z_][A-Za-z0-9_]*",
-        });
-    }
-    Ok(())
-}
-
 pub fn validate_ssh_target(value: &str) -> Result<()> {
     if value.is_empty()
         || value.starts_with('-')
@@ -2633,480 +2680,6 @@ pub fn validate_profile(profile: &str) -> Result<()> {
             "unknown MCP profile `{profile}`; expected read-only, operator or admin"
         )))
     }
-}
-
-pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
-    let config_path = root.join("ciao.toml");
-    let config: ProjectConfig = if config_path.exists() {
-        toml::from_str(&fs::read_to_string(&config_path)?)
-            .map_err(|error| CiaoError::Config(error.to_string()))?
-    } else {
-        ProjectConfig::default()
-    };
-    let name = config
-        .app
-        .as_ref()
-        .and_then(|app| app.name.clone())
-        .or_else(|| {
-            root.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .ok_or_else(|| CiaoError::Detection("project has no usable name".to_owned()))?;
-    validate_identifier("app name", &name)?;
-
-    let (runtime, app_type, install, build, run, port, static_directory) = if root
-        .join("Cargo.toml")
-        .exists()
-    {
-        let binary = cargo_package_name(root).unwrap_or_else(|| name.clone());
-        (
-            Runtime::Rust,
-            AppType::Service,
-            None,
-            Some("cargo build --release".to_owned()),
-            config
-                .run
-                .as_ref()
-                .and_then(|run| run.command.clone())
-                .or_else(|| Some(format!("./target/release/{binary}"))),
-            config.run.as_ref().and_then(|run| run.port).or(Some(3000)),
-            None,
-        )
-    } else if root.join("go.mod").exists() {
-        (
-            Runtime::Go,
-            AppType::Service,
-            None,
-            Some("go build -o app .".to_owned()),
-            config
-                .run
-                .as_ref()
-                .and_then(|run| run.command.clone())
-                .or_else(|| Some("./app".to_owned())),
-            config.run.as_ref().and_then(|run| run.port).or(Some(3000)),
-            None,
-        )
-    } else if is_python_project(root) {
-        let install = match config
-            .build
-            .as_ref()
-            .and_then(|build| build.install.clone())
-        {
-            Some(command) => Some(command),
-            None => Some(python_install_command(root)?),
-        };
-        let run = match config.run.as_ref().and_then(|run| run.command.clone()) {
-            Some(command) => Some(command),
-            None => Some(python_run_command(root)?),
-        };
-        (
-            Runtime::Python,
-            AppType::Service,
-            install,
-            None,
-            run,
-            config.run.as_ref().and_then(|run| run.port).or(Some(8000)),
-            None,
-        )
-    } else if root.join("bun.lock").exists() || root.join("bun.lockb").exists() {
-        (
-            Runtime::Bun,
-            AppType::Service,
-            Some("bun install --frozen-lockfile".to_owned()),
-            Some("bun run build".to_owned()),
-            Some("bun start".to_owned()),
-            Some(3000),
-            None,
-        )
-    } else if root.join("package.json").exists() {
-        let (install, runner) = if root.join("pnpm-lock.yaml").exists() {
-            ("pnpm install --frozen-lockfile", "pnpm")
-        } else if root.join("yarn.lock").exists() {
-            ("yarn install --frozen-lockfile", "yarn")
-        } else if root.join("package-lock.json").exists() {
-            ("npm ci", "npm")
-        } else {
-            ("npm install", "npm")
-        };
-        if is_astro_project(root)? {
-            if astro_is_server_output(root)? {
-                (
-                    Runtime::Astro,
-                    AppType::Service,
-                    Some(install.to_owned()),
-                    Some(format!("{runner} run build")),
-                    Some(format!("{runner} start")),
-                    Some(3000),
-                    None,
-                )
-            } else {
-                (
-                    Runtime::Astro,
-                    AppType::Static,
-                    Some(install.to_owned()),
-                    Some(format!("{runner} run build")),
-                    None,
-                    None,
-                    Some("dist".to_owned()),
-                )
-            }
-        } else {
-            (
-                Runtime::Node,
-                AppType::Service,
-                Some(install.to_owned()),
-                Some(format!("{runner} run build")),
-                Some(format!("{runner} start")),
-                Some(3000),
-                None,
-            )
-        }
-    } else if let Some(directory) = ["dist", "build", "public"]
-        .into_iter()
-        .find(|directory| root.join(directory).is_dir())
-    {
-        (
-            Runtime::Static,
-            AppType::Static,
-            None,
-            None,
-            None,
-            None,
-            Some(directory.to_owned()),
-        )
-    } else {
-        return Err(CiaoError::Detection(
-                "no supported project marker found (Cargo.toml, go.mod, package.json, Python files or dist/build/public)".to_owned(),
-            ));
-    };
-
-    let port_explicit = config.run.as_ref().and_then(|run| run.port).is_some();
-    let mut plan = ProjectPlan {
-        name,
-        runtime,
-        app_type,
-        install_command: install,
-        build_command: build,
-        run_command: run,
-        port,
-        health: HealthConfig::default(),
-        static_directory,
-        port_explicit,
-        local_name: None,
-        local_port: None,
-        local_command: None,
-    };
-    if let Some(app) = config.app.as_ref().and_then(|app| app.app_type.as_deref()) {
-        plan.app_type = match app {
-            "service" => AppType::Service,
-            "static" => AppType::Static,
-            other => {
-                return Err(CiaoError::Config(format!(
-                    "unsupported app.type `{other}`; use service or static"
-                )))
-            }
-        };
-        if plan.app_type == AppType::Static {
-            plan.run_command = None;
-            plan.port = None;
-            plan.static_directory = ["dist", "build", "public"]
-                .into_iter()
-                .find(|directory| root.join(directory).is_dir())
-                .map(str::to_owned)
-                .or_else(|| (plan.runtime == Runtime::Astro).then_some("dist".to_owned()));
-            if plan.static_directory.is_none() {
-                return Err(CiaoError::Detection(
-                    "static app.type requires dist, build or public".to_owned(),
-                ));
-            }
-        }
-    }
-    if let Some(build) = config.build {
-        plan.install_command = build.install.or(plan.install_command);
-        plan.build_command = build.command.or(plan.build_command);
-    }
-    if let Some(run) = config.run {
-        plan.run_command = run.command.or(plan.run_command);
-        plan.port = run.port.or(plan.port);
-    }
-    if let Some(health) = config.health {
-        plan.health.path = health.path.unwrap_or(plan.health.path);
-        plan.health.expected_status = health
-            .expected_status
-            .unwrap_or(plan.health.expected_status);
-        if let Some(timeout) = health.timeout {
-            plan.health.timeout_seconds = parse_duration_seconds(&timeout)?;
-        }
-    }
-    let mut local_name = None;
-    let mut local_port = None;
-    let mut local_command = None;
-    if let Some(dev) = config.dev {
-        if let Some(name) = dev.name {
-            validate_local_name(&name)?;
-            local_name = Some(name);
-        }
-        if let Some(command) = dev.command {
-            if command.trim().is_empty() {
-                return Err(CiaoError::Config("dev.command cannot be empty".to_owned()));
-            }
-            local_command = Some(command);
-        }
-        if let Some(port) = dev.port {
-            local_port = Some(port);
-            plan.port_explicit = true;
-        }
-    }
-    plan.local_name = local_name;
-    plan.local_port = local_port;
-    plan.local_command = local_command;
-    if plan.app_type == AppType::Static {
-        plan.run_command = None;
-        plan.port = None;
-    }
-    if !plan.health.path.starts_with('/') || plan.health.path.contains(['\n', '\r', ' ']) {
-        return Err(CiaoError::Config(
-            "health.path must be an absolute URL path without whitespace".to_owned(),
-        ));
-    }
-    if plan.health.path.contains(['#', '?']) || plan.health.path.contains("..") {
-        return Err(CiaoError::Config(
-            "health.path must not contain query, fragment or parent-path segments".to_owned(),
-        ));
-    }
-    Ok(plan)
-}
-
-/// Detect the common two-directory full-stack layout without requiring a
-/// project file:
-///
-/// ```text
-/// project/
-///   backend/   (Flask or another supported Python service)
-///   frontend/  (Next, Astro or another supported Node app)
-/// ```
-///
-/// The deploy engine still receives one `ProjectPlan` at a time. This API
-/// keeps component detection explicit and lets callers choose a safe
-/// orchestration policy instead of silently combining two processes.
-pub fn detect_project_components(root: &Path) -> Result<Vec<ProjectComponent>> {
-    let root_name = root_project_name(root)?;
-    validate_identifier("app name", &root_name)?;
-
-    let candidates = [
-        (
-            ProjectRole::Backend,
-            &["backend", "api", "server"] as &[&str],
-        ),
-        (
-            ProjectRole::Frontend,
-            &["frontend", "web", "client", "ui"] as &[&str],
-        ),
-    ];
-    let mut components = Vec::new();
-    for (role, directories) in candidates {
-        for directory in directories {
-            let path = root.join(directory);
-            if !path.is_dir() || !project_marker_exists(&path) {
-                continue;
-            }
-            let mut plan = match detect_project(&path) {
-                Ok(plan) => plan,
-                Err(_) => continue,
-            };
-            let configured_name = path.join("ciao.toml").is_file();
-            if !configured_name {
-                plan.name = format!("{root_name}-{directory}");
-                validate_identifier("app name", &plan.name)?;
-            }
-            components.push(ProjectComponent {
-                name: plan.name.clone(),
-                role,
-                path,
-                plan,
-            });
-            break;
-        }
-    }
-    if components
-        .iter()
-        .any(|component| component.role == ProjectRole::Backend)
-        && components
-            .iter()
-            .any(|component| component.role == ProjectRole::Frontend)
-    {
-        Ok(components)
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-fn root_project_name(root: &Path) -> Result<String> {
-    if root.join("ciao.toml").is_file() {
-        let config: ProjectConfig = toml::from_str(&fs::read_to_string(root.join("ciao.toml"))?)
-            .map_err(|error| CiaoError::Config(error.to_string()))?;
-        if let Some(name) = config.app.and_then(|app| app.name) {
-            return Ok(name);
-        }
-    }
-    root.file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .ok_or_else(|| CiaoError::Detection("project has no usable name".to_owned()))
-}
-
-fn project_marker_exists(root: &Path) -> bool {
-    [
-        "Cargo.toml",
-        "go.mod",
-        "package.json",
-        "bun.lock",
-        "bun.lockb",
-        "requirements.txt",
-        "pyproject.toml",
-        "Pipfile",
-        "setup.py",
-        "app.py",
-        "main.py",
-        "dist",
-        "build",
-        "public",
-    ]
-    .into_iter()
-    .any(|file| root.join(file).exists())
-}
-
-fn is_astro_project(root: &Path) -> Result<bool> {
-    let contents = fs::read_to_string(root.join("package.json"))
-        .map_err(|error| CiaoError::Detection(format!("cannot read package.json: {error}")))?;
-    let package: serde_json::Value = serde_json::from_str(&contents)
-        .map_err(|error| CiaoError::Detection(format!("invalid package.json: {error}")))?;
-    Ok(["dependencies", "devDependencies", "peerDependencies"]
-        .into_iter()
-        .filter_map(|section| package.get(section))
-        .any(|section| section.get("astro").is_some())
-        || [
-            "astro.config.mjs",
-            "astro.config.js",
-            "astro.config.ts",
-            "astro.config.cjs",
-        ]
-        .into_iter()
-        .any(|file| root.join(file).is_file()))
-}
-
-fn is_python_project(root: &Path) -> bool {
-    [
-        "requirements.txt",
-        "pyproject.toml",
-        "Pipfile",
-        "setup.py",
-        "app.py",
-        "main.py",
-        "wsgi.py",
-        "manage.py",
-    ]
-    .into_iter()
-    .any(|file| root.join(file).is_file())
-}
-
-fn python_install_command(root: &Path) -> Result<String> {
-    if root.join("requirements.txt").is_file() {
-        return Ok(
-            "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt".to_owned(),
-        );
-    }
-    if root.join("pyproject.toml").is_file() || root.join("setup.py").is_file() {
-        return Ok(
-            "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install .".to_owned(),
-        );
-    }
-    Err(CiaoError::Detection(
-        "Python app needs requirements.txt, pyproject.toml or setup.py".to_owned(),
-    ))
-}
-
-fn python_dependency_declared(root: &Path, dependency: &str) -> bool {
-    let mut contents = String::new();
-    if let Ok(value) = fs::read_to_string(root.join("requirements.txt")) {
-        contents.push_str(&value);
-        contents.push('\n');
-    }
-    if let Ok(value) = fs::read_to_string(root.join("pyproject.toml")) {
-        contents.push_str(&value);
-    }
-    contents.lines().any(|line| {
-        let line = line.trim().to_ascii_lowercase();
-        let line = line.split('#').next().unwrap_or_default().trim();
-        line == dependency
-            || line.starts_with(&format!("{dependency}=="))
-            || line.starts_with(&format!("{dependency}>"))
-            || line.starts_with(&format!("{dependency}<"))
-            || line.starts_with(&format!("{dependency}~"))
-            || line.starts_with(&format!("{dependency}["))
-            || line.contains(&format!("'{dependency}'"))
-            || line.contains(&format!("\"{dependency}\""))
-    })
-}
-
-fn python_entrypoint(root: &Path) -> Option<&'static str> {
-    [
-        ("app.py", "app"),
-        ("main.py", "main"),
-        ("wsgi.py", "wsgi"),
-        ("run.py", "run"),
-    ]
-    .into_iter()
-    .find(|(file, _)| root.join(file).is_file())
-    .map(|(_, module)| module)
-}
-
-fn python_run_command(root: &Path) -> Result<String> {
-    let module = python_entrypoint(root).ok_or_else(|| {
-        CiaoError::Detection(
-            "Python app entrypoint not found; add app.py, main.py, wsgi.py or a [run] command to ciao.toml"
-                .to_owned(),
-        )
-    })?;
-    if python_dependency_declared(root, "gunicorn") {
-        return Ok(format!(
-            ".venv/bin/gunicorn --bind \"$HOST:$PORT\" {module}:app"
-        ));
-    }
-    if python_dependency_declared(root, "uvicorn") {
-        return Ok(format!(
-            ".venv/bin/uvicorn {module}:app --host \"$HOST\" --port \"$PORT\""
-        ));
-    }
-    if python_dependency_declared(root, "flask") {
-        return Ok(format!(
-            ".venv/bin/python -m flask --app {module} run --host \"$HOST\" --port \"$PORT\""
-        ));
-    }
-    Ok(format!(".venv/bin/python {module}.py"))
-}
-
-fn astro_is_server_output(root: &Path) -> Result<bool> {
-    for file in [
-        "astro.config.mjs",
-        "astro.config.js",
-        "astro.config.ts",
-        "astro.config.cjs",
-    ] {
-        let path = root.join(file);
-        if path.is_file() {
-            let contents = fs::read_to_string(path)
-                .map_err(|error| CiaoError::Detection(format!("cannot read {file}: {error}")))?;
-            let normalized = contents.replace(['\'', '"', '`', ' ', '\n', '\r', '\t'], "");
-            if normalized.contains("output:server")
-                || normalized.contains("output:hybrid")
-                || normalized.contains("output=server")
-                || normalized.contains("output=hybrid")
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 pub fn local_domain(name: &str) -> Result<String> {
@@ -3283,6 +2856,8 @@ pub struct ReleaseManifest {
     pub static_directory: Option<String>,
     pub health: HealthConfig,
     pub created_at_unix: u64,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 fn release_start_command(plan: &ProjectPlan) -> Result<&str> {
@@ -3309,6 +2884,7 @@ impl ReleaseManifest {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            hooks: plan.hooks.clone(),
         }
     }
 
@@ -3423,8 +2999,15 @@ impl OpenSshTransport {
 
     fn ssh_command(&self, command: &CommandSpec) -> Command {
         let mut process = Command::new("ssh");
+        let control_path = std::env::temp_dir().join("ciao-ssh-%C");
         process
             .arg("-T")
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=60")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
@@ -3457,6 +3040,99 @@ impl OpenSshTransport {
     /// pipeline is constructed from user input.
     pub fn upload_tar(&self, source: &Path, destination: &str) -> Result<()> {
         self.upload_tar_with_progress(source, destination, &NoopProgressReporter)
+    }
+
+    /// Synchronize a source tree when both ends have rsync, falling back to
+    /// the streaming tar implementation otherwise. The staging directory is
+    /// disposable, so `--delete` is safe and makes the destination an exact
+    /// filtered mirror of the source snapshot.
+    pub fn upload_source_with_progress(
+        &self,
+        source: &Path,
+        destination: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
+        if !source.is_dir() {
+            return Err(CiaoError::Config(format!(
+                "project path `{}` is not a directory",
+                source.display()
+            )));
+        }
+        validate_upload_destination(destination)?;
+        if find_executable("rsync").is_some()
+            && self
+                .exec(CommandSpec::fixed(
+                    "command",
+                    &["-v", "rsync"],
+                    "probe remote rsync",
+                ))
+                .is_ok()
+        {
+            let mut ssh_args = vec![
+                "-T".to_owned(),
+                "-o".to_owned(),
+                "BatchMode=yes".to_owned(),
+                "-o".to_owned(),
+                format!("ConnectTimeout={}", self.connect_timeout_seconds),
+                "-o".to_owned(),
+                "ControlMaster=auto".to_owned(),
+                "-o".to_owned(),
+                "ControlPersist=60".to_owned(),
+                "-o".to_owned(),
+                format!(
+                    "ControlPath={}",
+                    std::env::temp_dir().join("ciao-ssh-%C").display()
+                ),
+            ];
+            if self.identity_file.is_some() {
+                ssh_args.extend(["-o".to_owned(), "IdentitiesOnly=yes".to_owned()]);
+                if let Some(identity) = &self.identity_file {
+                    ssh_args.extend(["-i".to_owned(), identity.display().to_string()]);
+                }
+            }
+            let ssh = ssh_args
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut command = Command::new("rsync");
+            command.args(["-az", "--delete", "--partial", "-e", &ssh]);
+            for pattern in [
+                ".git",
+                ".ciao",
+                "target",
+                "node_modules",
+                ".env",
+                ".env.*",
+                ".envrc",
+                ".dev.vars",
+                "*.pem",
+                "*.key",
+                ".ssh",
+                "._*",
+                ".DS_Store",
+            ] {
+                command.arg(format!("--exclude={pattern}"));
+            }
+            for pattern in upload_ignore_patterns(source) {
+                command.arg(format!("--exclude={pattern}"));
+            }
+            command
+                .arg(format!("{}/", source.display()))
+                .arg(format!("{}:{destination}/", self.target));
+            reporter.updated("upload source (rsync)");
+            let output = command.output().map_err(|error| CiaoError::Transport {
+                stage: "upload source with rsync".to_owned(),
+                message: error.to_string(),
+                details: String::new(),
+            })?;
+            if output.status.success() {
+                reporter.updated("upload source (rsync complete)");
+                return Ok(());
+            }
+            reporter.updated("rsync unavailable; falling back to tar upload");
+        }
+        self.upload_tar_with_progress(source, destination, reporter)
     }
 
     pub fn upload_tar_with_progress(
@@ -4164,8 +3840,15 @@ pub fn prepare_host_for_deploy_interactive(
 
 fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
     let mut process = Command::new("ssh");
+    let control_path = std::env::temp_dir().join("ciao-ssh-%C");
     process
         .arg("-tt")
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPersist=60")
+        .arg("-o")
+        .arg(format!("ControlPath={}", control_path.display()))
         .arg("-o")
         .arg(format!(
             "ConnectTimeout={}",
@@ -4227,6 +3910,36 @@ fn run_interactive_ssh_script(
             exit: exit_code(status),
             stdout: String::new(),
             stderr: "interactive SSH/sudo command was not completed".to_owned(),
+        })
+    }
+}
+
+fn run_interactive_ssh_stream(
+    transport: &OpenSshTransport,
+    stage: &str,
+    script: &str,
+) -> Result<()> {
+    let mut process = interactive_ssh_command(transport);
+    process
+        .arg("sh")
+        .arg("-c")
+        .arg(shell_quote(&format!("sudo -v\n{script}")))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = process.status().map_err(|error| CiaoError::Transport {
+        stage: stage.to_owned(),
+        message: error.to_string(),
+        details: String::new(),
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CiaoError::LocalCommand {
+            stage: stage.to_owned(),
+            exit: exit_code(status),
+            stdout: String::new(),
+            stderr: "interactive SSH stream was not completed".to_owned(),
         })
     }
 }
@@ -4294,20 +4007,6 @@ fn command_script_with_home(
 
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn env_file_line(key: &str, value: &str) -> String {
-    let escaped = value
-        .chars()
-        .flat_map(|character| {
-            if matches!(character, '\\' | '"' | '$' | '`') {
-                vec!['\\', character]
-            } else {
-                vec![character]
-            }
-        })
-        .collect::<String>();
-    format!(r#"{key}="{escaped}""#)
 }
 
 pub fn run_local_script(script: &[u8]) -> Result<CommandOutput> {
@@ -5965,54 +5664,6 @@ fn ensure_runtime(
     Ok(())
 }
 
-pub fn healthcheck(host: &str, port: u16, health: &HealthConfig) -> Result<()> {
-    if !health.path.starts_with('/')
-        || health.path.contains(['\n', '\r', ' ', '#', '?'])
-        || health.path.contains("..")
-    {
-        return Err(CiaoError::Config(
-            "health.path must be a safe absolute URL path".to_owned(),
-        ));
-    }
-    let address = format!("{host}:{port}");
-    let mut addresses = address
-        .to_socket_addrs()
-        .map_err(|error| CiaoError::Transport {
-            stage: "healthcheck".to_owned(),
-            message: "could not resolve candidate address".to_owned(),
-            details: format!(": {error}"),
-        })?;
-    let socket = addresses.next().ok_or_else(|| CiaoError::Transport {
-        stage: "healthcheck".to_owned(),
-        message: "candidate address has no socket".to_owned(),
-        details: String::new(),
-    })?;
-    let mut stream =
-        TcpStream::connect_timeout(&socket, Duration::from_secs(health.timeout_seconds.max(1)))?;
-    stream.set_read_timeout(Some(Duration::from_secs(health.timeout_seconds.max(1))))?;
-    stream.set_write_timeout(Some(Duration::from_secs(health.timeout_seconds.max(1))))?;
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        health.path
-    );
-    stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let status = response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(0);
-    if status != health.expected_status {
-        return Err(CiaoError::Deployment {
-            stage: "healthcheck".to_owned(),
-            message: format!("expected HTTP {}, got {status}", health.expected_status),
-            previous_release: "unknown".to_owned(),
-        });
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationResult {
     pub app: String,
@@ -6229,6 +5880,11 @@ fn deploy_unlocked(
             ),
         });
     }
+    if let Some(command) = plan.hooks.pre_upload.as_deref() {
+        progress_step(reporter, "pre-upload hook", || {
+            run_local_hook(source, command)
+        })?;
+    }
     let platform = progress_step(reporter, "prepare deployment", || transport.inspect())?;
     let root = host_app_root(&platform.os);
     let previous_release = read_current_release(transport, &root, &plan.name)?;
@@ -6244,6 +5900,17 @@ fn deploy_unlocked(
             previous_release.as_deref(),
             plan.port,
         )?)
+    };
+    let active_slot = if plan.app_type == AppType::Service && platform.os == HostOs::Linux {
+        read_active_slot(transport, &root, &plan.name)?
+    } else {
+        None
+    };
+    let candidate_slot = match active_slot {
+        Some('a') => Some('b'),
+        Some('b') => Some('a'),
+        None if plan.app_type == AppType::Service && platform.os == HostOs::Linux => Some('a'),
+        _ => None,
     };
     progress_step(reporter, "prepare remote layout", || {
         ensure_remote_layout(transport, &platform.os, &plan.name, &release)
@@ -6288,7 +5955,7 @@ fn deploy_unlocked(
                     shell_quote(&staging)
                 ),
             )?;
-            transport.upload_tar_with_progress(source, &staging, reporter)?;
+            transport.upload_source_with_progress(source, &staging, reporter)?;
             remote_script(
                 transport,
                 "finalize release",
@@ -6351,6 +6018,19 @@ fn deploy_unlocked(
                 )
                 .map(|_| ())
             })?;
+            if let Some(command) = plan.hooks.pre_activate.as_deref() {
+                progress_step(reporter, "pre-activate hook", || {
+                    run_remote_hook(
+                        transport,
+                        &user,
+                        command,
+                        &release_path,
+                        &build_home,
+                        &build_env,
+                        "run pre-activate hook",
+                    )
+                })?;
+            }
             progress_step(reporter, "activate static release", || {
                 harden_release(transport, &platform.os, &release_path)?;
                 remote_script(
@@ -6406,11 +6086,14 @@ fn deploy_unlocked(
                     )
                 })?;
             }
-            let candidate_unit = service_unit_name(&plan.name, true);
             progress_step(reporter, "candidate healthcheck", || {
                 if platform.os == HostOs::MacOs {
                     run_macos_candidate(transport, &user, &release_path, port, &plan.health)
                 } else {
+                    let candidate_unit = slot_service_unit_name(
+                        &plan.name,
+                        candidate_slot.expect("Linux service deployments have a candidate slot"),
+                    )?;
                     install_service(
                         transport,
                         &platform.os,
@@ -6418,7 +6101,7 @@ fn deploy_unlocked(
                         &user,
                         &release_path,
                         &format!("{root}/{}/shared/env", plan.name),
-                        true,
+                        false,
                         "./start",
                     )?;
                     service_action(
@@ -6428,41 +6111,127 @@ fn deploy_unlocked(
                         LifecycleAction::Start,
                     )?;
                     remote_healthcheck(transport, port, &plan.health)?;
-                    service_action(
-                        transport,
-                        &platform.os,
-                        &candidate_unit,
-                        LifecycleAction::Stop,
-                    )?;
-                    remove_service(transport, &platform.os, &candidate_unit)
+                    Ok(())
                 }
             })?;
+            if let Some(command) = plan.hooks.pre_activate.as_deref() {
+                progress_step(reporter, "pre-activate hook", || {
+                    run_remote_hook(
+                        transport,
+                        &user,
+                        command,
+                        &release_path,
+                        &build_home,
+                        &build_env,
+                        "run pre-activate hook",
+                    )
+                })?;
+            }
             progress_step(reporter, "activate service release", || {
                 harden_release(transport, &platform.os, &release_path)?;
                 let stable_unit = service_unit_name(&plan.name, false);
-                install_service(
+                if platform.os == HostOs::Linux {
+                    let slot =
+                        candidate_slot.expect("Linux service deployments have a candidate slot");
+                    let candidate_unit = slot_service_unit_name(&plan.name, slot)?;
+                    configure_release_caddy_route(
+                        transport,
+                        &platform.os,
+                        &root,
+                        &plan.name,
+                        &release,
+                        &local_domain(&plan.name)?,
+                        true,
+                    )?;
+                    if let Some(domain) = effective_domain {
+                        let cloudflare =
+                            existing_domain_is_plain_http(transport, &plan.name).unwrap_or(false);
+                        configure_release_caddy_route(
+                            transport,
+                            &platform.os,
+                            &root,
+                            &plan.name,
+                            &release,
+                            domain,
+                            cloudflare,
+                        )?;
+                    }
+                    remote_script(
+                        transport,
+                        "activate release",
+                        &switch_current_script(&platform.os, &root, &plan.name, &release_path),
+                    )?;
+                    // Keep the compatibility unit enabled for reboot recovery,
+                    // but route live traffic through the active slot first.
+                    install_service(
+                        transport,
+                        &platform.os,
+                        &stable_unit,
+                        &user,
+                        &format!("{root}/{}/current", plan.name),
+                        &format!("{root}/{}/shared/env", plan.name),
+                        false,
+                        "./start",
+                    )?;
+                    disable_service(transport, &platform.os, &stable_unit)?;
+                    enable_service(transport, &platform.os, &candidate_unit)?;
+                    if let Some(old_slot) = active_slot {
+                        let old_unit = slot_service_unit_name(&plan.name, old_slot)?;
+                        let _ = service_action(
+                            transport,
+                            &platform.os,
+                            &old_unit,
+                            LifecycleAction::Stop,
+                        );
+                        let _ = disable_service(transport, &platform.os, &old_unit);
+                    } else {
+                        let _ = service_action(
+                            transport,
+                            &platform.os,
+                            &stable_unit,
+                            LifecycleAction::Stop,
+                        );
+                    }
+                    write_active_slot(transport, &root, &plan.name, slot)?;
+                    remote_healthcheck(transport, port, &plan.health)
+                } else {
+                    install_service(
+                        transport,
+                        &platform.os,
+                        &stable_unit,
+                        &user,
+                        &format!("{root}/{}/current", plan.name),
+                        &format!("{root}/{}/shared/env", plan.name),
+                        false,
+                        "./start",
+                    )?;
+                    remote_script(
+                        transport,
+                        "activate release",
+                        &switch_current_script(&platform.os, &root, &plan.name, &release_path),
+                    )?;
+                    enable_service(transport, &platform.os, &stable_unit)?;
+                    service_action(
+                        transport,
+                        &platform.os,
+                        &stable_unit,
+                        LifecycleAction::Restart,
+                    )?;
+                    remote_healthcheck(transport, port, &plan.health)
+                }
+            })?;
+        }
+        if let Some(command) = plan.hooks.post_activate.as_deref() {
+            progress_step(reporter, "post-activate hook", || {
+                run_remote_hook(
                     transport,
-                    &platform.os,
-                    &stable_unit,
                     &user,
-                    &format!("{root}/{}/current", plan.name),
-                    &format!("{root}/{}/shared/env", plan.name),
-                    false,
-                    "./start",
-                )?;
-                remote_script(
-                    transport,
-                    "activate release",
-                    &switch_current_script(&platform.os, &root, &plan.name, &release_path),
-                )?;
-                enable_service(transport, &platform.os, &stable_unit)?;
-                service_action(
-                    transport,
-                    &platform.os,
-                    &stable_unit,
-                    LifecycleAction::Restart,
-                )?;
-                remote_healthcheck(transport, port, &plan.health)
+                    command,
+                    &release_path,
+                    &build_home,
+                    &build_env,
+                    "run post-activate hook",
+                )
             })?;
         }
         progress_step(reporter, "configure local Ciao domain", || {
@@ -6476,18 +6245,33 @@ fn deploy_unlocked(
                     configure_domain(transport, &plan.name, domain)
                 }
             })?;
+            progress_step(reporter, "domain smoke check", || {
+                remote_domain_healthcheck(transport, domain, &plan.health)
+            })?;
         }
         progress_step(reporter, "prune old releases", || {
-            prune_releases(transport, &root, &plan.name, 5)
+            prune_releases(transport, &root, &plan.name, plan.release_keep)
         })?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = result {
-        let _ = remove_service(
-            transport,
-            &platform.os,
-            &service_unit_name(&plan.name, true),
-        );
+        let candidate_cleanup_unit = if platform.os == HostOs::Linux {
+            candidate_slot
+                .and_then(|slot| slot_service_unit_name(&plan.name, slot).ok())
+                .unwrap_or_else(|| service_unit_name(&plan.name, true))
+        } else {
+            service_unit_name(&plan.name, true)
+        };
+        let active_after_error = if platform.os == HostOs::Linux {
+            read_active_slot(transport, &root, &plan.name)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if active_after_error != candidate_slot {
+            let _ = remove_service(transport, &platform.os, &candidate_cleanup_unit);
+        }
         let current_after_error = read_current_release(transport, &root, &plan.name)
             .ok()
             .flatten();
@@ -6495,12 +6279,54 @@ fn deploy_unlocked(
             if current_after_error.as_deref() == Some(release.as_str()) {
                 let _ = switch_current(transport, &root, &plan.name, previous);
                 if plan.app_type == AppType::Service {
-                    let _ = service_action(
-                        transport,
-                        &platform.os,
-                        &service_unit_name(&plan.name, false),
-                        LifecycleAction::Restart,
-                    );
+                    if platform.os == HostOs::Linux {
+                        if let Some(slot) = active_slot {
+                            let old_unit = slot_service_unit_name(&plan.name, slot).ok();
+                            let new_unit = candidate_slot.and_then(|candidate| {
+                                slot_service_unit_name(&plan.name, candidate).ok()
+                            });
+                            if let Some(unit) = new_unit {
+                                let _ = service_action(
+                                    transport,
+                                    &platform.os,
+                                    &unit,
+                                    LifecycleAction::Stop,
+                                );
+                                let _ = disable_service(transport, &platform.os, &unit);
+                            }
+                            if let Some(unit) = old_unit {
+                                let _ = service_action(
+                                    transport,
+                                    &platform.os,
+                                    &unit,
+                                    LifecycleAction::Start,
+                                );
+                                let _ = write_active_slot(transport, &root, &plan.name, slot);
+                            }
+                        } else {
+                            let _ = service_action(
+                                transport,
+                                &platform.os,
+                                &service_unit_name(&plan.name, false),
+                                LifecycleAction::Restart,
+                            );
+                            let _ = remote_script(
+                                transport,
+                                "clear active service slot",
+                                &format!(
+                                    "set -eu\nsudo -n rm -f {}\n",
+                                    shell_quote(&active_slot_path(&root, &plan.name))
+                                ),
+                            );
+                        }
+                    } else {
+                        let _ = service_action(
+                            transport,
+                            &platform.os,
+                            &service_unit_name(&plan.name, false),
+                            LifecycleAction::Restart,
+                        );
+                    }
                 }
                 if let Some(domain) = retained_domain.as_deref() {
                     let _ = if existing_domain_is_plain_http(transport, &plan.name).unwrap_or(false)
@@ -6547,19 +6373,55 @@ fn deploy_unlocked(
                 &platform.os,
                 &service_unit_name(&plan.name, false),
             );
+            if platform.os == HostOs::Linux {
+                for slot in ['a', 'b'] {
+                    if let Ok(unit) = slot_service_unit_name(&plan.name, slot) {
+                        let _ = remove_service(transport, &platform.os, &unit);
+                    }
+                }
+                let _ = remote_script(
+                    transport,
+                    "clear active service slot",
+                    &format!(
+                        "set -eu\nsudo -n rm -f {}\n",
+                        shell_quote(&active_slot_path(&root, &plan.name))
+                    ),
+                );
+            }
         }
         // Cleanup performs its own remote current-release check. Keeping that
         // check and the removal in one SSH command avoids a stale local read
         // leaving a partial release behind when cancellation interrupts a
         // preceding SSH session.
         let _ = cleanup_release(transport, &platform.os, &plan.name, &release);
+        let rollback_hook_message = if previous_release.is_some() {
+            plan.hooks
+                .on_rollback
+                .as_deref()
+                .and_then(|command| {
+                    run_remote_hook(
+                        transport,
+                        &user,
+                        command,
+                        &format!("{root}/{}/current", plan.name),
+                        &build_home,
+                        &build_env,
+                        "run rollback hook",
+                    )
+                    .err()
+                })
+                .map(|error| format!("; on-rollback hook failed: {error}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let active_message = previous_release
             .as_deref()
             .map(|previous| format!("previous release `{previous}` was restored when possible"))
             .unwrap_or_else(|| "no previous release existed".to_owned());
         return Err(CiaoError::Deployment {
             stage: "deploy".to_owned(),
-            message: format!("{}; {active_message}", error),
+            message: format!("{}; {active_message}{rollback_hook_message}", error),
             previous_release: previous_release.unwrap_or_else(|| "none".to_owned()),
         });
     }
@@ -6572,619 +6434,6 @@ fn deploy_unlocked(
         dry_run: false,
         message: format!("✓ release {release} active"),
     })
-}
-
-pub fn app_status(transport: &OpenSshTransport, app: &str) -> Result<StatusResult> {
-    validate_identifier("app name", app)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?;
-    let manifest = release
-        .as_deref()
-        .map(|release| read_release_manifest(transport, &root, app, release))
-        .transpose()?;
-    let status = match manifest.as_ref().map(|manifest| &manifest.app_type) {
-        Some(AppType::Static) => "active".to_owned(),
-        Some(AppType::Service) | None => match &platform.os {
-            HostOs::Linux | HostOs::MacOs => {
-                service_state(transport, &platform.os, &service_unit_name(app, false))?
-            }
-            HostOs::Unknown(_) => "unsupported".to_owned(),
-        },
-    };
-    Ok(StatusResult {
-        app: app.to_owned(),
-        status: status.clone(),
-        release,
-        port: manifest.as_ref().and_then(|manifest| manifest.port),
-        app_type: manifest.map(|manifest| manifest.app_type),
-        service_manager: match platform.os {
-            HostOs::Linux => "systemd".to_owned(),
-            HostOs::MacOs => "launchd".to_owned(),
-            HostOs::Unknown(value) => value,
-        },
-        message: format!("{app}: {status}"),
-    })
-}
-
-pub fn list_apps(transport: &OpenSshTransport) -> Result<Vec<StatusResult>> {
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let output = remote_script(
-        transport,
-        "list applications",
-        &format!(
-            "set -eu\nif sudo -n test -d {}; then for path in {}/*; do if sudo -n test -d \"$path\"; then basename \"$path\"; fi; done; fi\n",
-            shell_quote(&root),
-            shell_quote(&root)
-        ),
-    )?;
-    let mut apps = Vec::new();
-    for app in output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|app| !app.is_empty())
-    {
-        validate_identifier("app name", app)?;
-        apps.push(app_status(transport, app)?);
-    }
-    apps.sort_by(|left, right| left.app.cmp(&right.app));
-    Ok(apps)
-}
-
-pub fn list_releases(transport: &OpenSshTransport, app: &str) -> Result<Vec<ReleaseInfo>> {
-    validate_identifier("app name", app)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let current = read_current_release(transport, &root, app)?;
-    let output = remote_script(
-        transport,
-        "list releases",
-        &format!(
-            "set -eu\nif sudo -n test -d {root}/{app}/releases; then for path in {root}/{app}/releases/*; do if sudo -n test -d \"$path\"; then basename \"$path\"; fi; done; fi\n",
-            root = shell_quote(&root),
-            app = shell_quote(app)
-        ),
-    )?;
-    let mut releases = Vec::new();
-    for release in output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|release| !release.is_empty())
-    {
-        validate_identifier("release", release)?;
-        let manifest = read_release_manifest(transport, &root, app, release)?;
-        releases.push(ReleaseInfo {
-            app: app.to_owned(),
-            release: release.to_owned(),
-            active: current.as_deref() == Some(release),
-            runtime: manifest.runtime,
-            app_type: manifest.app_type,
-            port: manifest.port,
-            created_at_unix: manifest.created_at_unix,
-        });
-    }
-    releases.sort_by(|left, right| right.release.cmp(&left.release));
-    Ok(releases)
-}
-
-pub fn app_logs(
-    transport: &OpenSshTransport,
-    app: &str,
-    follow: bool,
-    since: Option<&str>,
-) -> Result<LogsResult> {
-    validate_identifier("app name", app)?;
-    let platform = transport.inspect()?;
-    if follow {
-        return Err(CiaoError::Config(
-            "`logs --follow` is not available over synchronous SSH; omit it for a bounded snapshot"
-                .to_owned(),
-        ));
-    }
-    let root = host_app_root(&platform.os);
-    if let Some(release) = read_current_release(transport, &root, app)? {
-        let manifest = read_release_manifest(transport, &root, app, &release)?;
-        if manifest.app_type == AppType::Static {
-            return Err(CiaoError::Config(format!(
-                "app `{app}` is static and has no service logs"
-            )));
-        }
-    }
-    let result = match platform.os {
-        HostOs::Linux => {
-            let mut args = vec![
-                "-u".to_owned(),
-                service_unit_name(app, false),
-                "--no-pager".to_owned(),
-            ];
-            if let Some(since) = since {
-                validate_since(since)?;
-                args.extend(["--since".to_owned(), since.to_owned()]);
-            }
-            let command = CommandSpec {
-                program: "sudo".to_owned(),
-                args: {
-                    let mut sudo_args = vec!["-n".to_owned(), "journalctl".to_owned()];
-                    sudo_args.extend(args);
-                    sudo_args
-                },
-                stdin: None,
-                stage: "read logs".to_owned(),
-                full_output: false,
-            };
-            transport.exec(command.clone())?
-        }
-        HostOs::MacOs => {
-            if let Some(since) = since {
-                validate_since(since)?;
-                return Err(CiaoError::Config(
-                    "`logs --since` is not available for macOS file-backed logs; omit it for a bounded snapshot".to_owned(),
-                ));
-            }
-            let command = CommandSpec::fixed("sh", &["-s"], "read logs").with_stdin(
-                format!(
-                    "set -eu\nstdout=/Library/Ciao/logs/{app}.out\nstderr=/Library/Ciao/logs/{app}.err\nif test -f \"$stdout\"; then cat \"$stdout\"; fi\nif test -f \"$stderr\"; then cat \"$stderr\" >&2; fi\n",
-                    app = shell_quote(app),
-                )
-                .into_bytes(),
-            );
-            transport.exec(command)?
-        }
-        HostOs::Unknown(_) => {
-            return Err(CiaoError::Config("unsupported host OS for logs".to_owned()))
-        }
-    };
-    Ok(LogsResult {
-        app: app.to_owned(),
-        logs: result.stdout,
-        message: format!("logs for {app}"),
-    })
-}
-
-pub fn lifecycle_action(
-    transport: &OpenSshTransport,
-    app: &str,
-    action: LifecycleAction,
-) -> Result<OperationResult> {
-    validate_identifier("app name", app)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    if let Some(release) = read_current_release(transport, &root, app)? {
-        let manifest = read_release_manifest(transport, &root, app, &release)?;
-        if manifest.app_type == AppType::Static {
-            return Err(CiaoError::Config(format!(
-                "app `{app}` is static and has no service lifecycle"
-            )));
-        }
-    }
-    let unit = service_unit_name(app, false);
-    service_action(transport, &platform.os, &unit, action)?;
-    Ok(OperationResult {
-        app: app.to_owned(),
-        action: action.as_str().to_owned(),
-        changed: true,
-        message: format!("✓ {action:?} {app}"),
-    })
-}
-
-pub fn rollback(transport: &OpenSshTransport, app: &str) -> Result<OperationResult> {
-    validate_identifier("app name", app)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let current = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
-    let previous = previous_release(transport, &root, app, &current)?.ok_or_else(|| {
-        CiaoError::Config(format!(
-            "app `{app}` has no previous release to roll back to"
-        ))
-    })?;
-    let current_manifest = read_release_manifest(transport, &root, app, &current)?;
-    let manifest = read_release_manifest(transport, &root, app, &previous)?;
-    let previous_path = format!("{root}/{app}/releases/{previous}");
-    let current_path = format!("{root}/{app}/releases/{current}");
-    let retained_domain = read_existing_domain(transport, app)?;
-    if manifest.app_type == AppType::Service {
-        validate_release_candidate(transport, &platform.os, app, &previous_path, &manifest)?;
-    }
-    let activation = (|| {
-        remote_script(
-            transport,
-            "rollback activation",
-            &switch_current_script(&platform.os, &root, app, &previous_path),
-        )?;
-        if manifest.app_type == AppType::Service {
-            service_action(
-                transport,
-                &platform.os,
-                &service_unit_name(app, false),
-                LifecycleAction::Restart,
-            )?;
-            remote_healthcheck(
-                transport,
-                manifest
-                    .port
-                    .ok_or_else(|| CiaoError::Config("rollback release has no port".to_owned()))?,
-                &manifest.health,
-            )?;
-        }
-        if let Some(domain) = retained_domain.as_deref() {
-            if existing_domain_is_plain_http(transport, app)? {
-                configure_domain_for_cloudflare(transport, app, domain)?;
-            } else {
-                add_domain(transport, app, domain)?;
-            }
-        }
-        configure_remote_ciao_domain(transport, app)?;
-        Ok::<(), CiaoError>(())
-    })();
-    if let Err(error) = activation {
-        let restore = (|| {
-            remote_script(
-                transport,
-                "restore active release after rollback failure",
-                &switch_current_script(&platform.os, &root, app, &current_path),
-            )?;
-            if current_manifest.app_type == AppType::Service {
-                service_action(
-                    transport,
-                    &platform.os,
-                    &service_unit_name(app, false),
-                    LifecycleAction::Restart,
-                )?;
-                remote_healthcheck(
-                    transport,
-                    current_manifest.port.ok_or_else(|| {
-                        CiaoError::Config("active release has no port".to_owned())
-                    })?,
-                    &current_manifest.health,
-                )?;
-            }
-            if let Some(domain) = retained_domain.as_deref() {
-                if existing_domain_is_plain_http(transport, app)? {
-                    configure_domain_for_cloudflare(transport, app, domain)?;
-                } else {
-                    add_domain(transport, app, domain)?;
-                }
-            }
-            configure_remote_ciao_domain(transport, app)?;
-            Ok::<(), CiaoError>(())
-        })();
-        let recovery = match restore {
-            Ok(()) => format!("active release `{current}` was restored"),
-            Err(restore_error) => {
-                format!("active release `{current}` may require manual recovery: {restore_error}")
-            }
-        };
-        return Err(CiaoError::Deployment {
-            stage: "rollback".to_owned(),
-            message: format!("{error}; {recovery}"),
-            previous_release: current,
-        });
-    }
-    Ok(OperationResult {
-        app: app.to_owned(),
-        action: "rollback".to_owned(),
-        changed: true,
-        message: format!("✓ rolled back {app} from {current} to {previous}"),
-    })
-}
-
-pub fn set_env(transport: &OpenSshTransport, app: &str, key: &str, value: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_env_key(key)?;
-    if value.contains(['\n', '\r']) {
-        return Err(CiaoError::Config(
-            "environment values cannot contain newlines".to_owned(),
-        ));
-    }
-    if value.len() > 64 * 1024 {
-        return Err(CiaoError::Config(
-            "environment value exceeds the 64 KiB limit".to_owned(),
-        ));
-    }
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let user = service_user(transport, &platform.os, app)?;
-    let path = format!("{root}/{app}/shared/env");
-    let line = env_file_line(key, value);
-    let script = format!(
-        "set -eu\nroot={}\nfile={}\nsudo -n install -d -m 0755 \"$root\"\nsudo -n touch \"$file\"\nsudo -n chmod 0600 \"$file\"\nsudo -n sed -i.bak '/^{}=/d' \"$file\"\nprintf '%s\\n' {} | sudo -n tee -a \"$file\" >/dev/null\nsudo -n rm -f \"$file.bak\"\nsudo -n chown {} \"$file\"\n",
-        shell_quote(&format!("{root}/{app}/shared")),
-        shell_quote(&path),
-        regex_literal(key),
-        shell_quote(&line),
-        shell_quote(&user),
-    );
-    remote_script(transport, "set environment", &script)
-        .map_err(|error| redact_error(error, &[value]))?;
-    Ok(())
-}
-
-pub fn unset_env(transport: &OpenSshTransport, app: &str, key: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_env_key(key)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let path = format!("{root}/{app}/shared/env");
-    remote_script(
-        transport,
-        "unset environment",
-        &format!(
-            "set -eu\nif sudo -n test -f {}; then sudo -n sed -i.bak '/^{}=/d' {}; sudo -n rm -f {}.bak; fi\n",
-            shell_quote(&path),
-            regex_literal(key),
-            shell_quote(&path),
-            shell_quote(&path)
-        ),
-    )?;
-    Ok(())
-}
-
-pub fn add_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_domain(domain)?;
-    init_host(transport)?;
-    configure_domain(transport, app, domain)
-}
-
-fn configure_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_domain(domain)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
-    let fragment = caddy_fragment(transport, &root, app, &release, domain)?;
-    let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
-    remote_script(
-        transport,
-        "prepare Caddy directory",
-        "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
-    )?;
-    write_remote_file(
-        transport,
-        &fragment_path,
-        &fragment,
-        "root",
-        "write Caddy fragment",
-    )?;
-    remote_script(
-        transport,
-        "reload Caddy",
-        &caddy_reload_script(&platform.os),
-    )?;
-    Ok(())
-}
-
-/// Use plain HTTP between a Cloudflare Tunnel and Caddy. Cloudflare handles
-/// the public TLS connection; keeping the origin local avoids a certificate
-/// challenge loop through the tunnel.
-pub fn configure_domain_for_cloudflare(
-    transport: &OpenSshTransport,
-    app: &str,
-    domain: &str,
-) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_domain(domain)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
-    let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, domain, true)?;
-    let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
-    write_remote_file(
-        transport,
-        &fragment_path,
-        &fragment,
-        "root",
-        "write Cloudflare Caddy route",
-    )?;
-    remote_script(
-        transport,
-        "reload Caddy for Cloudflare",
-        &caddy_reload_script(&platform.os),
-    )?;
-    Ok(())
-}
-
-/// Add the stable local `.ciao` host on the remote Caddy instance. It uses a
-/// separate fragment, so a public domain configured for the same app remains
-/// active at the same time.
-pub fn configure_remote_ciao_domain(transport: &OpenSshTransport, app: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    let domain = local_domain(app)?;
-    let platform = transport.inspect()?;
-    let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
-    let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, &domain, true)?;
-    let fragment_path = format!("/etc/caddy/ciao/{app}.local.caddy");
-    remote_script(
-        transport,
-        "prepare local Ciao Caddy directory",
-        "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
-    )?;
-    write_remote_file(
-        transport,
-        &fragment_path,
-        &fragment,
-        "root",
-        "write local Ciao Caddy route",
-    )?;
-    remote_script(
-        transport,
-        "reload Caddy for local Ciao domain",
-        &caddy_reload_script(&platform.os),
-    )?;
-    Ok(())
-}
-
-fn remove_domain_fragment(transport: &OpenSshTransport, app: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    let path = format!("/etc/caddy/ciao/{app}.caddy");
-    remote_script(
-        transport,
-        "cleanup Caddy fragment",
-        &format!("set -eu\nsudo -n rm -f {}\n", shell_quote(&path)),
-    )?;
-    Ok(())
-}
-
-fn caddy_fragment(
-    transport: &OpenSshTransport,
-    root: &str,
-    app: &str,
-    release: &str,
-    domain: &str,
-) -> Result<String> {
-    caddy_fragment_with_scheme(transport, root, app, release, domain, false)
-}
-
-fn caddy_fragment_with_scheme(
-    transport: &OpenSshTransport,
-    root: &str,
-    app: &str,
-    release: &str,
-    domain: &str,
-    cloudflare_origin: bool,
-) -> Result<String> {
-    let site = if cloudflare_origin {
-        format!("http://{domain}")
-    } else {
-        domain.to_owned()
-    };
-    if let Some(static_directory) = read_release_static_directory(transport, root, app, release)? {
-        let static_root = format!("{root}/{app}/releases/{release}/{static_directory}");
-        Ok(format!(
-            "{site} {{\n    root * {}\n    file_server\n}}\n",
-            static_root
-        ))
-    } else {
-        let port = read_release_port(transport, root, app, release)?.unwrap_or(PORT_START);
-        Ok(format!(
-            "{site} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n"
-        ))
-    }
-}
-
-fn read_existing_domain(transport: &OpenSshTransport, app: &str) -> Result<Option<String>> {
-    validate_identifier("app name", app)?;
-    let path = format!("/etc/caddy/ciao/{app}.caddy");
-    let output = remote_script(
-        transport,
-        "read existing domain",
-        &format!(
-            "set -eu\nif sudo -n test -f {}; then sudo -n awk 'NR == 1 {{print $1; exit}}' {}; fi\n",
-            shell_quote(&path),
-            shell_quote(&path)
-        ),
-    )?;
-    let value = output.stdout.trim();
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        let normalized = value
-            .strip_prefix("http://")
-            .or_else(|| value.strip_prefix("https://"))
-            .unwrap_or(value)
-            .trim_end_matches('/');
-        validate_domain(normalized)?;
-        Ok(Some(normalized.to_owned()))
-    }
-}
-
-fn existing_domain_is_plain_http(transport: &OpenSshTransport, app: &str) -> Result<bool> {
-    validate_identifier("app name", app)?;
-    let path = format!("/etc/caddy/ciao/{app}.caddy");
-    let output = remote_script(
-        transport,
-        "read existing domain scheme",
-        &format!(
-            "set -eu\nif sudo -n test -f {}; then sudo -n awk 'NR == 1 {{print $1; exit}}' {}; fi\n",
-            shell_quote(&path),
-            shell_quote(&path)
-        ),
-    )?;
-    Ok(output.stdout.trim_start().starts_with("http://"))
-}
-
-pub fn remove_domain(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_domain(domain)?;
-    let existing = read_existing_domain(transport, app)?;
-    match existing.as_deref() {
-        None => return Ok(()),
-        Some(existing) if existing != domain => {
-            return Err(CiaoError::Config(format!(
-                "app `{app}` is configured for `{existing}`, not `{domain}`"
-            )))
-        }
-        Some(_) => {}
-    }
-    let platform = transport.inspect()?;
-    let path = format!("/etc/caddy/ciao/{app}.caddy");
-    remote_script(
-        transport,
-        "remove Caddy fragment",
-        &format!(
-            "set -eu\nsudo -n rm -f {}\n{}",
-            shell_quote(&path),
-            caddy_reload_script(&platform.os)
-        ),
-    )?;
-    Ok(())
-}
-
-fn caddy_reload_script(os: &HostOs) -> String {
-    let (setup, config, reload) = match os {
-        HostOs::MacOs => (
-            r#"caddy_config=''
-brew_bin=''
-for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
-    if [ -x "$candidate" ]; then brew_bin="$candidate"; break; fi
-done
-[ -n "$brew_bin" ] || { echo 'Homebrew is not available for the remote Caddy service' >&2; exit 1; }
-brew_prefix=$("$brew_bin" --prefix)
-caddy_config="$brew_prefix/etc/Caddyfile"
-"#,
-            "\"$caddy_config\"",
-            "sudo -n \"$caddy_bin\" reload --config \"$caddy_config\"",
-        ),
-        _ => ("", "/etc/caddy/Caddyfile", "sudo -n systemctl reload caddy"),
-    };
-    format!(
-        "set -eu\n{setup}sudo -n test -f {config}\nif ! sudo -n grep -Fq 'import /etc/caddy/ciao/*.caddy' {config}; then echo 'Caddyfile must import /etc/caddy/ciao/*.caddy' >&2; exit 1; fi\ncaddy_bin=$(command -v caddy || true)\nfor candidate in /opt/homebrew/bin/caddy /usr/local/bin/caddy /opt/homebrew/opt/caddy/bin/caddy /usr/bin/caddy; do if [ -z \"$caddy_bin\" ] && [ -x \"$candidate\" ]; then caddy_bin=\"$candidate\"; fi; done\nif [ -z \"$caddy_bin\" ]; then echo 'Caddy is not installed; run host initialization' >&2; exit 1; fi\nsudo -n \"$caddy_bin\" validate --config {config} && {reload}\n",
-        setup = setup,
-        config = config,
-        reload = reload,
-    )
-}
-
-pub fn validate_domain(domain: &str) -> Result<()> {
-    if domain.len() > 253
-        || domain.is_empty()
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || domain.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return Err(CiaoError::InvalidIdentifier {
-            field: "domain",
-            value: domain.to_owned(),
-            reason: "must contain DNS labels only",
-        });
-    }
-    Ok(())
 }
 
 fn host_app_root(os: &HostOs) -> String {
@@ -7332,8 +6581,8 @@ fn ensure_remote_layout(
     Ok(())
 }
 
-fn read_current_release(
-    transport: &OpenSshTransport,
+fn read_current_release<T: RemoteHost + ?Sized>(
+    transport: &T,
     root: &str,
     app: &str,
 ) -> Result<Option<String>> {
@@ -7383,8 +6632,8 @@ fn previous_release(
     }
 }
 
-fn read_release_manifest(
-    transport: &OpenSshTransport,
+fn read_release_manifest<T: RemoteHost + ?Sized>(
+    transport: &T,
     root: &str,
     app: &str,
     release: &str,
@@ -7401,8 +6650,8 @@ fn read_release_manifest(
         .map_err(|error| CiaoError::Config(format!("release manifest is invalid: {error}")))
 }
 
-fn read_release_port(
-    transport: &OpenSshTransport,
+fn read_release_port<T: RemoteHost + ?Sized>(
+    transport: &T,
     root: &str,
     app: &str,
     release: &str,
@@ -7410,8 +6659,8 @@ fn read_release_port(
     Ok(read_release_manifest(transport, root, app, release)?.port)
 }
 
-fn read_release_static_directory(
-    transport: &OpenSshTransport,
+fn read_release_static_directory<T: RemoteHost + ?Sized>(
+    transport: &T,
     root: &str,
     app: &str,
     release: &str,
@@ -7718,7 +6967,11 @@ fn run_as_user_script(
     transport.exec(command).map(|_| ())
 }
 
-fn remote_script(transport: &OpenSshTransport, stage: &str, script: &str) -> Result<CommandOutput> {
+fn remote_script<T: RemoteHost + ?Sized>(
+    transport: &T,
+    stage: &str,
+    script: &str,
+) -> Result<CommandOutput> {
     transport.exec(CommandSpec::fixed("sh", &["-s"], stage).with_stdin(script.as_bytes().to_vec()))
 }
 
@@ -7812,8 +7065,29 @@ fn enable_service(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Resu
     Ok(())
 }
 
-fn service_action(
-    transport: &OpenSshTransport,
+fn disable_service(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Result<()> {
+    validate_service_unit(unit)?;
+    match os {
+        HostOs::Linux => {
+            remote_script(
+                transport,
+                "disable service",
+                &format!(
+                    "set -eu\nsudo -n systemctl disable {} 2>/dev/null || true\n",
+                    shell_quote(unit)
+                ),
+            )?;
+        }
+        HostOs::MacOs => {}
+        HostOs::Unknown(value) => {
+            return Err(CiaoError::Config(format!("unsupported host OS `{value}`")))
+        }
+    }
+    Ok(())
+}
+
+fn service_action<T: RemoteHost + ?Sized>(
+    transport: &T,
     os: &HostOs,
     unit: &str,
     action: LifecycleAction,
@@ -7888,7 +7162,7 @@ fn remove_service(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Resu
     Ok(())
 }
 
-fn service_state(transport: &OpenSshTransport, os: &HostOs, unit: &str) -> Result<String> {
+fn service_state<T: RemoteHost + ?Sized>(transport: &T, os: &HostOs, unit: &str) -> Result<String> {
     validate_service_unit(unit)?;
     let output = match os {
         HostOs::Linux => remote_script(
@@ -7934,6 +7208,25 @@ fn remote_healthcheck(
         shell_quote(&url)
     );
     remote_script(transport, "healthcheck", &script).map(|_| ())
+}
+
+fn remote_domain_healthcheck(
+    transport: &OpenSshTransport,
+    domain: &str,
+    health: &HealthConfig,
+) -> Result<()> {
+    validate_domain(domain)?;
+    let https = format!("https://{domain}{}", health.path);
+    let http = format!("http://{domain}{}", health.path);
+    let script = format!(
+        "set -eu\nexpected={}\nactual=$(curl --silent --show-error --insecure --max-time {} --output /dev/null --write-out '%{{http_code}}' {} || true)\nif [ \"$actual\" != \"$expected\" ]; then actual=$(curl --silent --show-error --max-time {} --output /dev/null --write-out '%{{http_code}}' {} || true); fi\n[ \"$actual\" = \"$expected\" ] || {{ echo \"domain smoke check expected HTTP $expected, got $actual\" >&2; exit 1; }}\n",
+        health.expected_status,
+        health.timeout_seconds,
+        shell_quote(&https),
+        health.timeout_seconds,
+        shell_quote(&http),
+    );
+    remote_script(transport, "domain smoke check", &script).map(|_| ())
 }
 
 fn cleanup_release(
@@ -8025,22 +7318,6 @@ impl StringIfEmpty for String {
     }
 }
 
-pub fn systemd_unit(
-    app: &str,
-    user: &str,
-    working_directory: &str,
-    command: &str,
-) -> Result<String> {
-    validate_identifier("app name", app)?;
-    validate_identifier("Unix user", user)?;
-    if !working_directory.starts_with('/') || working_directory.contains(['\n', '\r']) {
-        return Err(CiaoError::Config("working directory is invalid".to_owned()));
-    }
-    Ok(format!(
-        "[Unit]\nDescription=Ciao app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile={APP_ROOT}/{app}/shared/env\nExecStart=/bin/sh -lc {command}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
-    ))
-}
-
 pub fn launchd_plist(
     app: &str,
     working_directory: &str,
@@ -8059,18 +7336,6 @@ pub fn launchd_plist(
         label = xml_escape(&label),
         user = xml_escape(user),
     ))
-}
-
-pub fn remote_path(app: &str, suffix: &str) -> Result<String> {
-    validate_identifier("app name", app)?;
-    if suffix.is_empty()
-        || !suffix.starts_with('/')
-        || suffix.contains("..")
-        || suffix.contains(['\n', '\r', ';', '|', '&', '$', '`'])
-    {
-        return Err(CiaoError::Config("invalid remote Ciao path".to_owned()));
-    }
-    Ok(format!("{APP_ROOT}/{app}{suffix}"))
 }
 
 fn validate_upload_destination(destination: &str) -> Result<()> {
@@ -8372,7 +7637,7 @@ mod tests {
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
         fs::write(
             directory.path().join("ciao.toml"),
-            "[app]\nname = \"api\"\n[build]\ninstall = \"npm ci --ignore-scripts\"\ncommand = \"npm run compile\"\n[run]\ncommand = \"node server.js\"\nport = 8080\n[health]\npath = \"/health\"\ntimeout = \"3s\"\n",
+            "[app]\nname = \"api\"\n[build]\ninstall = \"npm ci --ignore-scripts\"\ncommand = \"npm run compile\"\n[run]\ncommand = \"node server.js\"\nport = 8080\n[health]\npath = \"/health\"\ntimeout = \"3s\"\n[hooks]\npre_upload = \"scripts/backup.sh\"\npost_activate = \"ciao run-remote bin/rails db:migrate\"\n",
         )
         .unwrap();
         let plan = detect_project(directory.path()).unwrap();
@@ -8380,6 +7645,54 @@ mod tests {
         assert_eq!(plan.port, Some(8080));
         assert_eq!(plan.health.timeout_seconds, 3);
         assert_eq!(plan.build_command.as_deref(), Some("npm run compile"));
+        assert_eq!(plan.hooks.pre_upload.as_deref(), Some("scripts/backup.sh"));
+        assert_eq!(
+            plan.hooks.post_activate.as_deref(),
+            Some("ciao run-remote bin/rails db:migrate")
+        );
+    }
+
+    #[test]
+    fn node_detection_reads_start_script_instead_of_assuming_one() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"build":"node build.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"node-demo\"\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.runtime, Runtime::Node);
+        assert_eq!(plan.run_command, None);
+    }
+
+    #[test]
+    fn release_keep_is_read_from_project_config() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("package.json"), "{}\n").unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"release-demo\"\n[releases]\nkeep = 9\n",
+        )
+        .unwrap();
+        assert_eq!(detect_project(directory.path()).unwrap().release_keep, 9);
+    }
+
+    #[test]
+    fn linux_service_slots_are_distinct_and_valid() {
+        assert_eq!(
+            slot_service_unit_name("demo", 'a').unwrap(),
+            "ciao-demo-slot-a.service"
+        );
+        assert_eq!(
+            slot_service_unit_name("demo", 'b').unwrap(),
+            "ciao-demo-slot-b.service"
+        );
+        assert!(slot_service_unit_name("demo", 'c').is_err());
     }
 
     #[test]
@@ -8579,7 +7892,6 @@ mod tests {
 
     #[test]
     fn generated_service_rejects_untrusted_identifiers() {
-        assert!(systemd_unit("bad;rm", "ciao-bad", "/tmp", "./app").is_err());
         let plist = launchd_plist("good", "/tmp", "./app", "luca").unwrap();
         assert!(plist.contains("<key>UserName</key><string>luca</string>"));
         assert!(plist.contains("<key>PATH</key>"));

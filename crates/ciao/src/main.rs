@@ -43,6 +43,11 @@ enum Command {
     Apps {
         host: String,
     },
+    /// Manage one deployed application.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
+    },
     /// List immutable releases for an application.
     Releases {
         host: String,
@@ -52,7 +57,7 @@ enum Command {
     Restart(AppArgs),
     Start(AppArgs),
     Stop(AppArgs),
-    Rollback(AppArgs),
+    Rollback(RollbackArgs),
     /// Open a temporary local dashboard backed by the shared core.
     Ui {
         host: String,
@@ -94,6 +99,13 @@ enum HostCommand {
     /// Install Ciao's remote prerequisites and configure Caddy.
     Init {
         name: String,
+    },
+    /// Inspect Ciao-managed files and report read-only host drift.
+    Audit {
+        name: String,
+        /// Include expected and actual file contents for drifted entries.
+        #[arg(long)]
+        diff: bool,
     },
 }
 
@@ -199,6 +211,14 @@ struct AppArgs {
 }
 
 #[derive(Debug, Args)]
+struct RollbackArgs {
+    host: String,
+    app: String,
+    /// Target an explicit release instead of the immediately previous one.
+    release: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct LogsArgs {
     host: String,
     app: String,
@@ -209,6 +229,21 @@ struct LogsArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum AppCommand {
+    Remove(AppRemoveArgs),
+    Destroy(AppRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct AppRemoveArgs {
+    host: String,
+    app: String,
+    /// Confirm permanent removal of services, releases and Caddy routes.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Subcommand)]
 enum EnvCommand {
     Set {
         host: String,
@@ -216,6 +251,35 @@ enum EnvCommand {
         key: String,
     },
     Unset {
+        host: String,
+        app: String,
+        key: String,
+    },
+    Pull {
+        host: String,
+        app: String,
+        #[arg(long, default_value = ".env.ciao")]
+        output: PathBuf,
+        /// Include values in the local file. Without this flag only KEY= lines are written.
+        #[arg(long)]
+        with_values: bool,
+    },
+    Push {
+        host: String,
+        app: String,
+        #[arg(long, default_value = ".env.ciao")]
+        file: PathBuf,
+        /// Apply the displayed diff without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    Diff {
+        host: String,
+        app: String,
+        #[arg(long, default_value = ".env.ciao")]
+        file: PathBuf,
+    },
+    Generate {
         host: String,
         app: String,
         key: String,
@@ -413,7 +477,12 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Deploy(args) => {
             let path = args.path.canonicalize()?;
-            let mut plan = detect_single_project(&path)?;
+            let mut components = detect_project_components(&path)?;
+            let mut plan = if components.is_empty() {
+                Some(detect_project(&path)?)
+            } else {
+                None
+            };
             let (transport, app_override) = if args.ci {
                 let target =
                     ci_target_from_env(&std::env::vars().collect::<BTreeMap<String, String>>())?;
@@ -432,8 +501,16 @@ fn run(cli: Cli) -> Result<()> {
                 )
             };
             if let Some(app) = app_override {
-                validate_identifier("app name", &app)?;
-                plan.name = app;
+                if let Some(plan) = plan.as_mut() {
+                    validate_identifier("app name", &app)?;
+                    plan.name = app;
+                } else {
+                    validate_identifier("app name", &app)?;
+                    for component in &mut components {
+                        component.name = format!("{app}-{}", component.role);
+                        component.plan.name = component.name.clone();
+                    }
+                }
             }
             let progress = TerminalProgress::new();
             let interactive_output =
@@ -444,6 +521,32 @@ fn run(cli: Cli) -> Result<()> {
             if interactive_output && !args.dry_run {
                 offer_passwordless_sudo_setup(&transport)?;
             }
+            if !components.is_empty() {
+                let result = deploy_full_stack_with_mode(
+                    &transport,
+                    &path,
+                    &components,
+                    args.domain.as_deref(),
+                    args.dry_run,
+                    if !interactive_output {
+                        &NoopProgressReporter
+                    } else {
+                        &progress
+                    },
+                    if interactive_output {
+                        DeployHostMode::Interactive
+                    } else {
+                        DeployHostMode::NonInteractive
+                    },
+                )
+                .map_err(|error| actionable_deploy_error(error, &args.host))?;
+                if !cli.json && args.dry_run {
+                    eprintln!("✓ dry-run complete");
+                }
+                output(&result, cli.json, || result.message.clone());
+                return Ok(());
+            }
+            let plan = plan.expect("single project plan is present when components are empty");
             let deploy = || {
                 deploy_with_mode(
                     &transport,
@@ -528,6 +631,20 @@ fn run(cli: Cli) -> Result<()> {
             });
             Ok(())
         }
+        Command::App { command } => {
+            let args = match command {
+                AppCommand::Remove(args) | AppCommand::Destroy(args) => args,
+            };
+            if !args.yes {
+                return Err(CiaoError::Config(
+                    "app removal is destructive; rerun with `--yes` to confirm".to_owned(),
+                ));
+            }
+            let transport = authorized_transport_for(&args.host, cli.json, "removing application")?;
+            let result = remove_app(&transport, &args.app)?;
+            output(&result, cli.json, || result.message.clone());
+            Ok(())
+        }
         Command::Releases { host, app } => {
             let transport = authorized_transport_for(&host, cli.json, "listing releases")?;
             let result = list_releases(&transport, &app)?;
@@ -549,6 +666,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Logs(args) => {
             let transport =
                 authorized_transport_for(&args.host, cli.json, "reading application logs")?;
+            if args.follow {
+                if cli.json {
+                    return Err(CiaoError::Config(
+                        "`logs --follow` streams an interactive terminal and cannot use --json"
+                            .to_owned(),
+                    ));
+                }
+                follow_app_logs(&transport, &args.app, args.since.as_deref())?;
+                return Ok(());
+            }
             let result = app_logs(&transport, &args.app, args.follow, args.since.as_deref())?;
             if cli.json {
                 println!(
@@ -566,7 +693,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Rollback(args) => {
             let transport =
                 authorized_transport_for(&args.host, cli.json, "rolling back the application")?;
-            let result = rollback(&transport, &args.app)?;
+            let result = rollback_to(&transport, &args.app, args.release.as_deref())?;
             output(&result, cli.json, || result.message.clone());
             Ok(())
         }
@@ -593,6 +720,87 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     println!("✓ environment key removed for {app}: {key}");
                 }
+                Ok(())
+            }
+            EnvCommand::Pull {
+                host,
+                app,
+                output: destination,
+                with_values,
+            } => {
+                let transport =
+                    authorized_transport_for(&host, cli.json, "pulling environment variables")?;
+                let keys = pull_env(&transport, &app, &destination, with_values)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "app": app,
+                            "file": destination,
+                            "keys": keys,
+                            "with_values": with_values,
+                        }))
+                        .map_err(ser_error)?
+                    );
+                } else {
+                    println!(
+                        "✓ environment names pulled for {app} into {}",
+                        destination.display()
+                    );
+                    if !with_values {
+                        println!("  values were not downloaded; use --with-values to include them");
+                    }
+                    if !keys.is_empty() {
+                        println!("  keys: {}", keys.join(", "));
+                    }
+                }
+                Ok(())
+            }
+            EnvCommand::Push {
+                host,
+                app,
+                file,
+                yes,
+            } => {
+                let transport =
+                    authorized_transport_for(&host, cli.json, "comparing environment variables")?;
+                let diff = diff_env(&transport, &app, &file)?;
+                if !cli.json {
+                    print_env_diff(&diff, false);
+                }
+                if diff_is_empty(&diff) {
+                    if !cli.json {
+                        println!("✓ environment already matches {app}");
+                    }
+                    return Ok(());
+                }
+                confirm_env_push(&diff, yes, cli.json)?;
+                let applied = push_env(&transport, &app, &file)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({"app": app, "changed": true, "diff": applied})
+                        )
+                        .map_err(ser_error)?
+                    );
+                } else {
+                    println!("✓ environment updated for {app}");
+                }
+                Ok(())
+            }
+            EnvCommand::Diff { host, app, file } => {
+                let transport =
+                    authorized_transport_for(&host, cli.json, "comparing environment variables")?;
+                let diff = diff_env(&transport, &app, &file)?;
+                print_env_diff(&diff, cli.json);
+                Ok(())
+            }
+            EnvCommand::Generate { host, app, key } => {
+                let transport =
+                    authorized_transport_for(&host, cli.json, "generating an environment secret")?;
+                let result = generate_env(&transport, &app, &key)?;
+                output(&result, cli.json, || result.message.clone());
                 Ok(())
             }
         },
@@ -973,8 +1181,30 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
         .unwrap_or_else(|| repository.default_branch.clone());
     validate_github_branch(&branch)?;
     repository.default_branch = branch.clone();
-    let plan = detect_single_project(&root)?;
-    let app = args.app.unwrap_or(plan.name);
+    let components = detect_project_components(&root)?;
+    let plan = if components.is_empty() {
+        Some(detect_single_project(&root)?)
+    } else {
+        None
+    };
+    let default_app = plan
+        .as_ref()
+        .map(|plan| plan.name.clone())
+        .or_else(|| {
+            components.first().map(|component| {
+                component
+                    .name
+                    .strip_suffix("-backend")
+                    .unwrap_or(&component.name)
+                    .to_owned()
+            })
+        })
+        .or_else(|| {
+            root.file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| CiaoError::Detection("project has no usable name".to_owned()))?;
+    let app = args.app.unwrap_or(default_app);
     validate_identifier("app name", &app)?;
 
     let mut github = GitHubConfig::load(&github_config_path())?;
@@ -997,14 +1227,20 @@ fn github_setup(args: GithubSetupArgs, json_output: bool) -> Result<()> {
     }
 
     let ciao_version = github_latest_release_tag()?;
-    let project_type = match plan.app_type {
-        AppType::Static => "static",
-        AppType::Service => "service",
+    let (project_runtime, project_type) = match plan.as_ref() {
+        Some(plan) => (
+            plan.runtime.to_string(),
+            match plan.app_type {
+                AppType::Static => "static".to_owned(),
+                AppType::Service => "service".to_owned(),
+            },
+        ),
+        None => ("FullStack".to_owned(), "full-stack".to_owned()),
     };
     let workflow = render_github_workflow(&workflow_spec_for_project(
         &branch,
         &ciao_version,
-        plan.runtime.to_string(),
+        project_runtime,
         project_type,
     ))?;
     let workflow_path = github_workflow_path(&root);
@@ -1775,6 +2011,38 @@ fn host_command(command: HostCommand, json_output: bool) -> Result<()> {
             });
             Ok(())
         }
+        HostCommand::Audit { name, diff } => {
+            let transport = transport_for(&name)?;
+            let result = host_audit(&transport)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(ser_error)?
+                );
+            } else {
+                println!("{}", result.message);
+                for item in &result.items {
+                    println!("{} {}", status_icon(&item.status), item.path);
+                    if diff && item.status != "ok" {
+                        if let Some(expected) = &item.expected {
+                            println!("  expected: {}", expected.trim_end());
+                        }
+                        if let Some(actual) = &item.actual {
+                            println!("  actual: {}", actual.trim_end());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "ok" => "✓",
+        "orphan" => "⚠",
+        _ => "✗",
     }
 }
 
@@ -2211,4 +2479,52 @@ fn read_secret_value() -> Result<String> {
         ));
     }
     Ok(value)
+}
+
+fn diff_is_empty(diff: &EnvDiff) -> bool {
+    diff.added.is_empty() && diff.modified.is_empty() && diff.removed.is_empty()
+}
+
+fn print_env_diff(diff: &EnvDiff, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(diff).unwrap_or_else(|_| "{}".to_owned())
+        );
+        return;
+    }
+    for key in &diff.added {
+        println!("+ {key}");
+    }
+    for key in &diff.modified {
+        println!("~ {key}");
+    }
+    for key in &diff.removed {
+        println!("- {key}");
+    }
+    if diff_is_empty(diff) {
+        println!("(no changes)");
+    }
+}
+
+fn confirm_env_push(diff: &EnvDiff, yes: bool, json_output: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if json_output || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(CiaoError::Config(
+            "env push changes secrets; rerun with --yes from a terminal or provide explicit confirmation"
+                .to_owned(),
+        ));
+    }
+    let change_count = diff.added.len() + diff.modified.len() + diff.removed.len();
+    print!("Apply {change_count} environment changes? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(CiaoError::Config("environment was not changed".to_owned()))
+    }
 }

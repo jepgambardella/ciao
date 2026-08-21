@@ -3,7 +3,7 @@ members = ["crates/ciao-core", "crates/ciao"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.11"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -17,3 +17,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 toml = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

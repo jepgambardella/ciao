@@ -1965,11 +1965,12 @@ one deployable app
 one primary process
 ```
 
-Ciao may detect a conventional full-stack workspace with `backend/` and
-`frontend/` directories. It reports each component and its commands. Until a
-single transaction can activate and roll back all components together, deploy
-the components as separate Ciao apps. Never start only one half and report a
-successful full-stack deploy.
+Ciao detects a conventional full-stack workspace with `backend/` and
+`frontend/` directories. A deploy from the workspace root runs both component
+deploys in one compensating transaction: backend first, frontend second, and
+rollback of the earlier component if a later activation fails. The frontend
+receives the optional public domain; both components retain local `.ciao`
+routes. Never report success if either component is not active.
 
 Later:
 

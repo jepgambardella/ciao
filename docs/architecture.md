@@ -13,6 +13,13 @@ planning, OpenSSH transport, health checks, lifecycle and rollback. The CLI and
 MCP call those functions directly; MCP does not execute the CLI or parse human
 output. The MCP server is a local JSON-RPC-over-stdio process.
 
+The core is split by responsibility without extra crates: `project` handles
+detection, `domain` renders Caddy routes, `operations` owns status/logs/lifecycle
+and rollback, `service_slots` owns Linux A/B state, `env` owns secret-file
+operations, `hooks` owns the four lifecycle hook points, `transaction` performs
+compensating full-stack deploys, and `audit` performs read-only host drift
+checks.
+
 The local development path also uses the core: it detects the project, chooses
 and persists the internal port, renders the Caddy fragment, and runs the local
 process. The CLI only supplies the terminal-facing process loop. Resolver and
@@ -35,7 +42,9 @@ On macOS the corresponding cache is `/Library/Caches/Ciao/<app>/`. Build and
 install commands use that directory as `HOME`; release contents remain
 immutable and the user's personal home directory is never used.
 
-Linux uses a generated `ciao-<app>.service` and journald. macOS uses a
+Linux uses generated `ciao-<app>-slot-a.service` and
+`ciao-<app>-slot-b.service` units and journald. Caddy switches to the healthy
+slot before the old process is stopped. macOS uses a
 generated LaunchDaemon plist. `ciao deploy` runs the complete native bootstrap
 when the readiness check finds missing prerequisites, through one
 `ssh -tt host sh -c ...` session; the password stays
@@ -75,7 +84,8 @@ node to become connected.
 ## Deployment states
 
 ```text
-detect → upload → build → candidate → healthcheck → activate → prune
+detect → pre_upload → upload → build → candidate → healthcheck →
+pre_activate → activate → post_activate → smoke → prune
 ```
 
 Only activation changes `current` or the stable service. Build and health
@@ -83,6 +93,10 @@ failures clean the candidate and preserve the active release. A Linux service
 candidate is managed temporarily for its health check; the current macOS
 candidate path runs the candidate script directly and checks its HTTP endpoint
 before stable activation.
+
+For a detected backend/frontend workspace, the same state machine runs twice in
+one compensating transaction. If the second component fails, the first returns
+to its recorded release (or is removed when it did not exist before).
 
 Automated coverage is currently in the core unit tests and a CLI/MCP vertical
 smoke test in CI. Remote deployment coverage is a separate opt-in fixture and

@@ -6,6 +6,23 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.11] - 2026-08-21
+
+- Add interactive `logs --follow`, explicit release-target rollback and
+  destructive application removal with confirmation.
+- Add Linux blue/green service slots with Caddy route switching after the
+  candidate healthcheck.
+- Reuse SSH connections and prefer rsync for incremental source uploads, with
+  the existing tar stream as a fallback.
+- Keep Linux service-slot state in a private internal module and allow status,
+  logs, release listing and lifecycle orchestration to run against any
+  `RemoteHost` implementation.
+- Split project detection, Caddy/domain handling, environment operations,
+  lifecycle hooks, host audit and multi-component transactions into focused
+  internal modules.
+- Add compensating full-stack deploys, fixed project hooks, bulk environment
+  pull/push/diff/generate and read-only `ciao host audit`.
+
 ## [v0.1.10]
 
 - Skip the redundant Astro production build during `ciao run`; Astro dev still

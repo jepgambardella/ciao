@@ -38,11 +38,19 @@ validated identifiers and a fixed Ciao layout. Build/install/start strings
 come from the project because running the application is their purpose; they
 are delivered as a script over stdin to `sh -s`, not interpolated into an SSH
 destination or SSH option.
+Lifecycle hooks use the same project trust boundary. `pre_upload` runs locally;
+the remote hooks run as the application user from the release directory. Ciao
+supports only the four fixed hook points and does not add a plugin loader or a
+general-purpose remote shell. Hook diagnostics are bounded and sensitive
+environment values are not included in normal output.
 
 The MCP server is local stdio. Its profiles are `read-only`, `operator` and
 `admin`; no profile exposes a generic shell tool. Secret values are accepted
-only by the environment operation, transmitted through stdin, written to the
+only by the environment operations, transmitted through SSH, written to the
 remote shared environment file with mode `0600`, and omitted from diagnostics.
+Bulk environment pull downloads names by default; values require an explicit
+flag. Push displays key names only and requires confirmation. Secret generation
+uses the operating system CSPRNG and never prints the generated value.
 
 Deployment uploads to a new staging path, builds and health-checks a candidate,
 then switches the `current` symlink and service. Failures remove the candidate
@@ -82,6 +90,10 @@ when the user interrupts the command. Local temporary servers and upload
 children are also waited for and stopped on normal cancellation; Ciao does not
 leave a managed child process behind after `ciao run`, `ciao dev`, or an
 interrupted upload.
+
+`ciao host audit` is read-only. It reads generated Caddy routes, service
+definitions, sudoers policy and Ciao-owned file names over SSH and reports
+missing, changed or orphaned entries without repairing them.
 
 The test suite includes validation and generated-definition checks plus a local
 CLI/MCP smoke path. SSH tests are opt-in and disposable; they must not reboot

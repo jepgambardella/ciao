@@ -79,6 +79,7 @@ the public key during the guided host setup.
 ```bash
 ciao status home my-app
 ciao logs home my-app
+ciao app remove home my-app --yes
 ciao restart home my-app
 ciao rollback home my-app
 ```
@@ -105,11 +106,54 @@ my-app/
   frontend/  # Next, Astro or another supported Node app
 ```
 
-Run `ciao inspect` to see both components and their detected commands. Ciao
-deploys one app plan at a time today. Deploy `backend` and `frontend` as two
-normal Ciao apps until the shared transaction for multi-service projects is
-enabled. Add `ciao.toml` only when you need custom build, run, health check,
-domain or environment settings.
+Run `ciao inspect` to see both components and their detected commands. Deploy
+the monorepo root to activate backend and frontend as one compensating
+transaction. The backend is activated first; the frontend is health-checked
+second. If the second step fails, Ciao restores the backend release too. The
+`--domain` route is assigned to the frontend; each component still gets its
+own local `.ciao` route.
+
+Add `ciao.toml` only when you need custom build, run, health check, domain,
+release retention, environment or lifecycle hooks. For example:
+
+```toml
+[releases]
+keep = 8
+
+[hooks]
+pre_upload = "scripts/backup-db.sh"
+pre_activate = "ciao run-remote bin/rails db:migrate"
+post_activate = "scripts/notify-deploy.sh"
+on_rollback = "scripts/notify-rollback.sh"
+```
+
+`pre_upload` runs on the local computer. The other hooks run remotely as the
+application user, in the candidate or active release directory. Hooks are
+project commands, like build and start commands, and their output is bounded.
+
+Bulk environment management avoids copying secrets through the terminal:
+
+```bash
+ciao env pull home my-app              # names only, writes .env.ciao
+ciao env pull home my-app --with-values
+ciao env diff home my-app
+ciao env push home my-app --yes
+ciao env generate home my-app JWT_SECRET
+```
+
+`env push` shows key-only additions, changes and removals and requires
+confirmation. `env generate` uses the operating system CSPRNG and never prints
+the generated value.
+
+Inspect host drift without changing anything:
+
+```bash
+ciao host audit home
+ciao host audit home --diff
+```
+
+The audit checks Caddy imports/routes, managed service definitions, sudoers and
+orphaned Ciao files. It is read-only.
 
 ## Local development
 
@@ -124,6 +168,10 @@ Ciao detects the project, installs and builds it, then starts it on
 and uses the local Caddy proxy to hide it. Ciao prints one address and tells you
 how to stop the server. For Astro, Ciao starts the Astro development server
 after the first build, so CSS and source changes reload automatically.
+
+On Linux service deployments, Ciao keeps two service slots and flips Caddy to
+the healthy slot before stopping the old one. Source uploads use `rsync` when
+available on both ends and fall back to the portable tar stream otherwise.
 
 Run an app locally with a stable `.ciao` address:
 
