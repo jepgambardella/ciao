@@ -5485,6 +5485,14 @@ fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
             "/etc/cloudflared/config.yml has no ingress rules".to_owned(),
         ));
     }
+    // A global legacy marker can identify the first unmarked route only when
+    // the config has no per-route ownership yet. Once any route is marked,
+    // every unmarked route is manual and must remain untouched.
+    let legacy_app = if rules.iter().any(|rule| rule.managed_app.is_some()) {
+        None
+    } else {
+        legacy_app
+    };
     let mut document = CloudflareConfigDocument {
         prefix: if prefix.is_empty() {
             String::new()
@@ -9306,6 +9314,22 @@ mod tests {
         assert!(alpha < beta && beta < manual && manual < fallback);
         assert_eq!(parsed.route_for_app("beta").unwrap().1.port(), Some(41002));
         assert!(rendered.starts_with("# managed-by: ciao app=alpha\n"));
+    }
+
+    #[test]
+    fn cloudflare_global_marker_never_claims_manual_route_after_marked_routes_exist() {
+        let contents = "# managed-by: ciao app=alpha\ntunnel: shared\ncredentials-file: /etc/cloudflared/shared.json\ningress:\n  # managed-by: ciao app=alpha\n  - hostname: alpha.example.com\n    service: http://localhost:41001\n  - hostname: manual.example.com\n    service: http://localhost:41999\n  - service: http_status:404\n";
+        let mut parsed = parse_cloudflare_config(contents).unwrap();
+        parsed
+            .upsert_route("beta", "beta.example.com", 41002)
+            .unwrap();
+        let manual = parsed
+            .rules
+            .iter()
+            .find(|rule| rule.hostname.as_deref() == Some("manual.example.com"))
+            .unwrap();
+        assert_eq!(manual.managed_app, None);
+        assert_eq!(manual.port(), Some(41999));
     }
 
     #[test]

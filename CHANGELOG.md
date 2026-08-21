@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.20] - 2026-08-21
+
+- Preserve manual Cloudflare ingress routes when a legacy global ownership
+  marker appears alongside already-marked Ciao routes.
+
 ## [v0.1.19] - 2026-08-21
 
 - Make the Cloudflare Tunnel host-scoped with a deterministic `ciao-<host>`
