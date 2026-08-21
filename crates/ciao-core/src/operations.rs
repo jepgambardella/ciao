@@ -38,8 +38,8 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
     let cloudflare = cloudflare_tunnel_status(transport, app)?;
     let mut message = match cloudflare.as_ref() {
         Some(tunnel) => format!(
-            "{app}: {status}\n  Cloudflare: https://{} (port {})",
-            tunnel.hostname, tunnel.port
+            "{app}: {status}\n  Cloudflare: https://{} (tunnel {}, port {}, connector {})",
+            tunnel.hostname, tunnel.tunnel, tunnel.port, tunnel.connector
         ),
         None => format!("{app}: {status}"),
     };

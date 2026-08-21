@@ -310,6 +310,27 @@ fn audit_cloudflare_exposure(
     };
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
+    if let Some(count) = remote_cloudflared_process_count(transport)? {
+        items.push(AuditItem {
+            path: "cloudflared/processes".to_owned(),
+            status: match count {
+                0 => "down",
+                1 => "ok",
+                _ => "duplicate",
+            }
+            .to_owned(),
+            expected: Some("one cloudflared process".to_owned()),
+            actual: Some(count.to_string()),
+        });
+    }
+    if let Some(active) = remote_cloudflared_service_active(transport, &platform.os)? {
+        items.push(AuditItem {
+            path: "cloudflared/service".to_owned(),
+            status: if active { "ok" } else { "down" }.to_owned(),
+            expected: Some("active cloudflared service".to_owned()),
+            actual: Some(if active { "active" } else { "inactive" }.to_owned()),
+        });
+    }
     for (index, rule) in config.rules.iter().enumerate() {
         if rule.is_fallback() {
             continue;
@@ -336,7 +357,7 @@ fn audit_cloudflare_exposure(
         let owner_status = match owner.as_deref() {
             Some(app) if app_names.contains(app) => "ok",
             Some(_) => "orphan",
-            None => "unmanaged",
+            None => "manual",
         };
         items.push(AuditItem {
             path: format!("cloudflared/{hostname}"),
@@ -365,6 +386,19 @@ fn audit_cloudflare_exposure(
             status: hostname_status.to_owned(),
             expected: Some("resolvable public hostname".to_owned()),
             actual: Some(hostname.to_owned()),
+        });
+        let dns_target = remote_cloudflare_dns_target(transport, hostname)?;
+        let dns_status = match dns_target.as_deref() {
+            None => "unknown-dns",
+            Some("") => "missing-dns-route",
+            Some(target) if cloudflare_dns_target_matches(&config, target) => "ok",
+            Some(_) => "dns-tunnel-drift",
+        };
+        items.push(AuditItem {
+            path: format!("cloudflared/{hostname}/dns"),
+            status: dns_status.to_owned(),
+            expected: Some(format!("DNS route to tunnel {}", config.tunnel)),
+            actual: dns_target.filter(|target| !target.is_empty()),
         });
         let port_status = match remote_port_is_listening(transport, port)? {
             Some(true) => "ok",
@@ -590,6 +624,71 @@ fn remote_hostname_resolves(transport: &OpenSshTransport, hostname: &str) -> Res
             shell_quote(hostname)
         ),
     )?;
+    Ok(match output.stdout.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    })
+}
+
+fn remote_cloudflare_dns_target(
+    transport: &OpenSshTransport,
+    hostname: &str,
+) -> Result<Option<String>> {
+    validate_domain(hostname)?;
+    let output = remote_script(
+        transport,
+        "audit Cloudflare DNS route",
+        &format!(
+            "set -eu\nname={}\nif command -v dig >/dev/null 2>&1; then dig +short CNAME \"$name\" | head -n 1; elif command -v nslookup >/dev/null 2>&1; then nslookup -type=CNAME \"$name\" 2>/dev/null | awk '/canonical name/ {{print $NF; exit}}'; else printf '__CIAO_UNKNOWN__\\n'; fi\n",
+            shell_quote(hostname)
+        ),
+    )?;
+    let value = output.stdout.trim();
+    if value == "__CIAO_UNKNOWN__" {
+        Ok(None)
+    } else {
+        Ok(Some(value.trim_end_matches('.').to_owned()))
+    }
+}
+
+fn cloudflare_dns_target_matches(config: &CloudflareConfigDocument, target: &str) -> bool {
+    let target = target.trim_end_matches('.').to_ascii_lowercase();
+    let tunnel = config.tunnel.trim_end_matches('.').to_ascii_lowercase();
+    if uuid_from_text(&config.tunnel).is_none() {
+        return target.ends_with(".cfargotunnel.com");
+    }
+    target == format!("{tunnel}.cfargotunnel.com") || target.starts_with(&format!("{tunnel}."))
+}
+
+fn remote_cloudflared_process_count(transport: &OpenSshTransport) -> Result<Option<u32>> {
+    let output = remote_script(
+        transport,
+        "audit cloudflared processes",
+        "set -eu\nif command -v pgrep >/dev/null 2>&1; then pgrep -fc '[c]loudflared'; else printf '__CIAO_UNKNOWN__\\n'; fi\n",
+    )?;
+    let value = output.stdout.trim();
+    if value == "__CIAO_UNKNOWN__" {
+        Ok(None)
+    } else {
+        Ok(value.parse::<u32>().ok())
+    }
+}
+
+fn remote_cloudflared_service_active(
+    transport: &OpenSshTransport,
+    os: &HostOs,
+) -> Result<Option<bool>> {
+    let script = match os {
+        HostOs::Linux => {
+            "set -eu\nif command -v systemctl >/dev/null 2>&1; then systemctl is-active --quiet cloudflared && printf 'yes\\n' || printf 'no\\n'; else printf 'unknown\\n'; fi\n"
+        }
+        HostOs::MacOs => {
+            "set -eu\nif command -v launchctl >/dev/null 2>&1; then launchctl print system/com.cloudflare.cloudflared >/dev/null 2>&1 && printf 'yes\\n' || printf 'no\\n'; else printf 'unknown\\n'; fi\n"
+        }
+        HostOs::Unknown(_) => "printf 'unknown\\n'\n",
+    };
+    let output = remote_script(transport, "audit cloudflared service", script)?;
     Ok(match output.stdout.trim() {
         "yes" => Some(true),
         "no" => Some(false),

@@ -88,9 +88,15 @@ hostname and the active release port, preserves every other app and the final
 rollback never replaces another app's route; `ciao app remove` removes only
 the marked rule for that app and keeps the shared service while other routes
 remain. Ciao checks the public hostname with the configured `Host` header and
-shows the hostname and real port in `ciao status`. Only one `[tunnel]`
+shows the hostname, tunnel name, real port and connector state in `ciao status`.
+Only one `[tunnel]`
 declaration is accepted in a full-stack deploy; use separate Ciao apps when
 the backend and frontend need separate hostnames.
+
+On a new host the shared tunnel name is deterministic: `ciao-<host-name>`.
+Later apps reuse that same tunnel and credential file. If the host already has
+a valid Cloudflare config, Ciao adopts it without replacing manual ingress
+rules.
 
 For an existing host-level Tunnel, Ciao uses the tunnel and credentials already
 referenced by `/etc/cloudflared/config.yml`; a local Cloudflare login is only

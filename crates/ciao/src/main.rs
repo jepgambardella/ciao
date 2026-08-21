@@ -253,7 +253,7 @@ enum AppCommand {
 struct AppRemoveArgs {
     host: String,
     app: String,
-    /// Confirm permanent removal of services, releases and Caddy routes.
+    /// Confirm permanent removal, including the shared Tunnel when no route remains.
     #[arg(long)]
     yes: bool,
 }
@@ -527,7 +527,8 @@ fn run(cli: Cli) -> Result<()> {
                 let host = configured_host(&config, &args.host)?;
                 (
                     OpenSshTransport::new(host.ssh)?
-                        .with_identity_file(host.identity_file.clone())?,
+                        .with_identity_file(host.identity_file.clone())?
+                        .with_host_name(args.host.clone())?,
                     None,
                 )
             };
@@ -1984,7 +1985,9 @@ fn tailscale_policy_api_error(body: &str) -> Option<String> {
 fn transport_for(name: &str) -> Result<OpenSshTransport> {
     let config = load_config()?;
     let host = configured_host(&config, name)?;
-    OpenSshTransport::new(host.ssh)?.with_identity_file(host.identity_file)
+    OpenSshTransport::new(host.ssh)?
+        .with_identity_file(host.identity_file)?
+        .with_host_name(name)
 }
 
 fn require_noninteractive_sudo(transport: &OpenSshTransport, operation: &str) -> Result<()> {

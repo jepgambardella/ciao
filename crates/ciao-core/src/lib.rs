@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -3060,6 +3060,7 @@ pub struct OpenSshTransport {
     pub connect_timeout_seconds: u64,
     pub identity_file: Option<PathBuf>,
     control_path: PathBuf,
+    host_name: Option<String>,
 }
 
 /// Return a short, private ControlMaster path. OpenSSH expands `%C` to a
@@ -3089,7 +3090,42 @@ impl OpenSshTransport {
             connect_timeout_seconds: 10,
             identity_file: None,
             control_path: prepare_ssh_control_path()?,
+            host_name: None,
         })
+    }
+
+    /// Attach Ciao's configured host alias so host-scoped resources (such as
+    /// the shared Cloudflare Tunnel) do not depend on a mutable SSH address.
+    pub fn with_host_name(mut self, name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_identifier("host name", &name)?;
+        self.host_name = Some(name);
+        Ok(self)
+    }
+
+    fn host_scoped_tunnel_name(&self) -> String {
+        let source = self
+            .host_name
+            .as_deref()
+            .or_else(|| self.target.rsplit('@').next())
+            .unwrap_or("host");
+        let mut slug = String::new();
+        let mut separator = false;
+        for character in source.chars().flat_map(char::to_lowercase) {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character);
+                separator = false;
+            } else if !slug.is_empty() && !separator {
+                slug.push('-');
+                separator = true;
+            }
+        }
+        let slug = slug.trim_matches('-');
+        if slug.is_empty() {
+            "ciao-host".to_owned()
+        } else {
+            format!("ciao-{slug}")
+        }
     }
 
     pub fn with_identity_file(mut self, identity_file: Option<PathBuf>) -> Result<Self> {
@@ -4744,6 +4780,8 @@ pub struct CloudflareTunnelStatus {
     pub port: u16,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub connector: String,
 }
 
 /// Configure one standard, locally-managed Cloudflare Tunnel.
@@ -4776,20 +4814,31 @@ pub fn cloudflare_tunnel_setup_with_config(
     validate_identifier("app name", app)?;
     validate_domain(&config.hostname)?;
     validate_identifier("Cloudflare tunnel name", &config.tunnel)?;
+    let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
     let previous_contents = read_cloudflare_config(transport)?;
     let mut document = previous_contents
         .as_deref()
         .map(parse_cloudflare_config)
         .transpose()?;
+    let remote_credential = if document.is_none() {
+        read_remote_cloudflare_credential(transport)?
+    } else {
+        None
+    };
 
     // A shared host config is authoritative. Existing deployments must not
     // require a local cert or a local copy of the tunnel credentials: those
     // belong to the host and are already referenced by config.yml.
     let mut local_warning = None;
     let mut cloudflared = cloudflared_executable().map(|path| path.to_string_lossy().into_owned());
-    if cloudflared.is_none() && document.is_none() {
+    if cloudflared.is_none() && document.is_none() && remote_credential.is_none() {
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Err(CiaoError::Config(format!(
+                "the first shared Cloudflare Tunnel needs one local login; open {CLOUDFLARE_LOGIN_URL}, run `cloudflared tunnel login`, then retry (the app deployment itself is complete)"
+            )));
+        }
         cloudflared = Some(ensure_local_cloudflared()?);
-    } else if cloudflared.is_none() {
+    } else if cloudflared.is_none() && document.is_some() {
         local_warning = Some(
             "local cloudflared is unavailable; skipped DNS reconciliation (host config was still updated)"
                 .to_owned(),
@@ -4801,14 +4850,15 @@ pub fn cloudflare_tunnel_setup_with_config(
         .filter(|path| path.is_file());
 
     let mut credentials_to_install = None;
-    let (tunnel, dns_tunnel) = if let Some(existing) = document.as_ref() {
-        (
-            existing.tunnel.clone(),
-            existing
-                .tunnel_name
-                .clone()
-                .unwrap_or_else(|| existing.tunnel.clone()),
-        )
+    let (tunnel, dns_tunnel, config_tunnel_name) = if let Some(existing) = document.as_ref() {
+        let name = existing
+            .tunnel_name
+            .clone()
+            .unwrap_or_else(|| existing.tunnel.clone());
+        (existing.tunnel.clone(), name.clone(), name)
+    } else if let Some((tunnel_id, _remote_credentials)) = remote_credential.as_ref() {
+        let tunnel_name = transport.host_scoped_tunnel_name();
+        (tunnel_id.clone(), tunnel_id.clone(), tunnel_name)
     } else {
         let cloudflared = cloudflared.as_deref().ok_or_else(|| {
             CiaoError::Config(
@@ -4824,6 +4874,11 @@ pub fn cloudflare_tunnel_setup_with_config(
         let cloudflared_dir = home.join(".cloudflared");
         let cert = cloudflared_dir.join("cert.pem");
         if !cert.is_file() {
+            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                return Err(CiaoError::Config(format!(
+                    "Cloudflare login is required once for the first shared Tunnel; open {CLOUDFLARE_LOGIN_URL}, run `cloudflared tunnel login`, then retry"
+                )));
+            }
             let output = run_local_interactive_script(&format!(
                 "set -eu\n{} tunnel login --loginURL {}\n",
                 shell_quote(cloudflared),
@@ -4844,7 +4899,10 @@ pub fn cloudflare_tunnel_setup_with_config(
                     .to_owned(),
             ));
         }
-        let tunnel_name = config.tunnel.clone();
+        // Tunnel identity is host-scoped. The project value remains accepted
+        // for compatibility, but a new host always gets the deterministic
+        // `ciao-<host>` tunnel so later apps cannot create a second one.
+        let tunnel_name = transport.host_scoped_tunnel_name();
         let tunnel_id = find_or_create_cloudflare_tunnel(cloudflared, &tunnel_name)?;
         let credential_path = cloudflared_dir.join(format!("{tunnel_id}.json"));
         let credentials = fs::read_to_string(&credential_path).map_err(|error| {
@@ -4860,13 +4918,13 @@ pub fn cloudflare_tunnel_setup_with_config(
         }
         let remote_credentials = format!("/etc/cloudflared/{tunnel_id}.json");
         credentials_to_install = Some((remote_credentials.clone(), credentials));
-        (tunnel_id, tunnel_name)
+        (tunnel_id, tunnel_name.clone(), tunnel_name)
     };
 
     if document.is_none() {
         document = Some(CloudflareConfigDocument::new(
             &tunnel,
-            Some(&dns_tunnel),
+            Some(&config_tunnel_name),
             &format!("/etc/cloudflared/{tunnel}.json"),
         ));
     }
@@ -4910,12 +4968,17 @@ pub fn cloudflare_tunnel_setup_with_config(
                     ));
                 }
             }
-        } else if previous_contents.is_some() {
+        } else if previous_contents.is_some() || remote_credential.is_some() {
             local_warning = Some(
                 "local cloudflared login is unavailable; skipped DNS reconciliation (existing host route was preserved)"
                     .to_owned(),
             );
         }
+    } else if local_cert.is_none() {
+        local_warning = Some(
+            "local cloudflared login is unavailable; skipped DNS reconciliation (host ingress was still synchronized)"
+                .to_owned(),
+        );
     }
 
     ensure_remote_cloudflared(transport, os)?;
@@ -4978,7 +5041,7 @@ pub fn cloudflare_tunnel_setup_with_config(
     Ok(CloudflareTunnelResult {
         app: app.to_owned(),
         domain: config.hostname.clone(),
-        tunnel: dns_tunnel,
+        tunnel: config_tunnel_name,
         port,
         message: format!(
             "Cloudflare Tunnel is active for {} (port {port}; shared host ingress){}{}",
@@ -5100,6 +5163,7 @@ struct CloudflareConfigDocument {
     preamble: Vec<String>,
     tunnel: String,
     tunnel_name: Option<String>,
+    tunnel_owner: Option<String>,
     credentials: String,
     legacy_app: Option<String>,
     rules: Vec<CloudflareIngressRule>,
@@ -5117,6 +5181,7 @@ impl CloudflareConfigDocument {
             preamble: Vec::new(),
             tunnel: tunnel.to_owned(),
             tunnel_name: tunnel_name.map(str::to_owned),
+            tunnel_owner: None,
             credentials: credentials.to_owned(),
             legacy_app: None,
             rules: vec![CloudflareIngressRule::parse("  - service: http_status:404")],
@@ -5124,7 +5189,12 @@ impl CloudflareConfigDocument {
     }
 
     fn render(&self) -> String {
-        let mut output = self.prefix.clone();
+        let mut output = self
+            .tunnel_owner
+            .as_deref()
+            .map(|app| format!("# managed-by: ciao app={app}\n"))
+            .unwrap_or_default();
+        output.push_str(&self.prefix);
         output.push_str("ingress:\n");
         for line in &self.preamble {
             output.push_str(line);
@@ -5137,6 +5207,19 @@ impl CloudflareConfigDocument {
             }
         }
         output
+    }
+
+    fn ensure_catch_all_last(&mut self) {
+        let mut fallbacks = Vec::new();
+        self.rules.retain(|rule| {
+            if rule.is_fallback() {
+                fallbacks.push(rule.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.rules.extend(fallbacks);
     }
 
     fn route_owned_by_app(&self, index: usize, app: &str) -> bool {
@@ -5203,6 +5286,10 @@ impl CloudflareConfigDocument {
         // A legacy global marker is converted to per-route ownership on the
         // first successful upsert, so another app can safely share the file.
         self.legacy_app = None;
+        if self.tunnel_owner.is_none() {
+            self.tunnel_owner = Some(app.to_owned());
+        }
+        self.ensure_catch_all_last();
         Ok(before != self.render())
     }
 
@@ -5227,6 +5314,10 @@ impl CloudflareConfigDocument {
         if removed && self.legacy_app.as_deref() == Some(app) {
             self.legacy_app = None;
         }
+        if self.tunnel_owner.as_deref() == Some(app) {
+            self.tunnel_owner = self.rules.iter().find_map(|rule| rule.managed_app.clone());
+        }
+        self.ensure_catch_all_last();
         removed
     }
 }
@@ -5242,6 +5333,78 @@ fn read_cloudflare_config<T: RemoteHost + ?Sized>(transport: &T) -> Result<Optio
     } else {
         Ok(Some(output.stdout))
     }
+}
+
+fn read_remote_cloudflare_credential(
+    transport: &OpenSshTransport,
+) -> Result<Option<(String, String)>> {
+    let output = remote_script(
+        transport,
+        "find host Cloudflare Tunnel credentials",
+        "set -eu\nfor path in /etc/cloudflared/*.json; do\n    [ -f \"$path\" ] || continue\n    basename \"$path\"\ndone\n",
+    )?;
+    let mut ids = output
+        .stdout
+        .lines()
+        .filter_map(uuid_from_text)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some((
+            id.clone(),
+            format!("/etc/cloudflared/{id}.json"),
+        ))),
+        _ => Err(CiaoError::Config(
+            "multiple Cloudflare Tunnel credential files exist on the host; keep one shared tunnel credential or configure /etc/cloudflared/config.yml first"
+                .to_owned(),
+        )),
+    }
+}
+
+struct CloudflareConfigLock<'a> {
+    transport: &'a OpenSshTransport,
+    path: String,
+    owner: String,
+}
+
+impl Drop for CloudflareConfigLock<'_> {
+    fn drop(&mut self) {
+        let _ = remote_script(
+            self.transport,
+            "release Cloudflare Tunnel config lock",
+            &format!(
+                "set -eu\nif sudo -n test -f {owner_file} && [ \"$(sudo -n cat {owner_file})\" = {owner} ]; then sudo -n rm -f {owner_file} {started_file}; sudo -n rmdir {lock}; fi\n",
+                owner_file = shell_quote(&format!("{}/owner", self.path)),
+                started_file = shell_quote(&format!("{}/started", self.path)),
+                owner = shell_quote(&self.owner),
+                lock = shell_quote(&self.path),
+            ),
+        );
+    }
+}
+
+fn acquire_cloudflare_config_lock<'a>(
+    transport: &'a OpenSshTransport,
+    app: &str,
+) -> Result<CloudflareConfigLock<'a>> {
+    validate_identifier("app name", app)?;
+    let path = "/etc/cloudflared/.ciao-config-lock".to_owned();
+    let owner = format!("{}-{app}-{}", std::process::id(), release_id());
+    let script = format!(
+        "set -eu\nsudo -n install -d -m 0700 /etc/cloudflared\nnow=$(date +%s)\nif ! sudo -n mkdir -m 0700 {lock} 2>/dev/null; then started=''; if sudo -n test -f {started_file}; then started=$(sudo -n cat {started_file} || true); fi; case \"$started\" in ''|*[!0-9]*) ;; *) if [ $((now - started)) -gt 900 ]; then sudo -n rm -rf {lock}; fi;; esac; fi\nif ! sudo -n mkdir -m 0700 {lock} 2>/dev/null; then echo 'another Ciao Cloudflare config update is already running' >&2; exit 73; fi\nprintf '%s\\n' {owner} | sudo -n tee {owner_file} >/dev/null\nprintf '%s\\n' \"$now\" | sudo -n tee {started_file} >/dev/null\n",
+        lock = shell_quote(&path),
+        owner = shell_quote(&owner),
+        owner_file = shell_quote(&format!("{path}/owner")),
+        started_file = shell_quote(&format!("{path}/started")),
+    );
+    remote_script(transport, "acquire Cloudflare Tunnel config lock", &script)?;
+    Ok(CloudflareConfigLock {
+        transport,
+        path,
+        owner,
+    })
 }
 
 fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
@@ -5268,7 +5431,8 @@ fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
         CiaoError::Config("/etc/cloudflared/config.yml has no credentials-file".to_owned())
     })?;
     let tunnel_name = value_for("# tunnel-name:");
-    let legacy_app = value_for("# managed-by: ciao app=").or_else(|| {
+    let tunnel_owner = value_for("# managed-by: ciao app=");
+    let legacy_app = tunnel_owner.clone().or_else(|| {
         tunnel_name
             .as_deref()
             .and_then(|name| name.strip_prefix("ciao-"))
@@ -5321,7 +5485,7 @@ fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
             "/etc/cloudflared/config.yml has no ingress rules".to_owned(),
         ));
     }
-    Ok(CloudflareConfigDocument {
+    let mut document = CloudflareConfigDocument {
         prefix: if prefix.is_empty() {
             String::new()
         } else {
@@ -5330,10 +5494,13 @@ fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
         preamble,
         tunnel,
         tunnel_name,
+        tunnel_owner,
         credentials,
         legacy_app,
         rules,
-    })
+    };
+    document.ensure_catch_all_last();
+    Ok(document)
 }
 
 fn cloudflare_route_owner(document: &CloudflareConfigDocument, index: usize) -> Option<String> {
@@ -5366,6 +5533,7 @@ pub(crate) fn cloudflare_tunnel_status<T: RemoteHost + ?Sized>(
         return Ok(None);
     };
     validate_domain(&hostname)?;
+    let connector = cloudflared_connector_state(transport)?;
     Ok(Some(CloudflareTunnelStatus {
         hostname,
         tunnel: config
@@ -5374,7 +5542,28 @@ pub(crate) fn cloudflare_tunnel_status<T: RemoteHost + ?Sized>(
             .unwrap_or_else(|| config.tunnel.clone()),
         port,
         managed: route.managed_app.as_deref() == Some(app),
+        connector,
     }))
+}
+
+fn cloudflared_connector_state<T: RemoteHost + ?Sized>(transport: &T) -> Result<String> {
+    let platform = transport.inspect()?;
+    let script = match platform.os {
+        HostOs::Linux => {
+            "set -eu\nif command -v systemctl >/dev/null 2>&1; then systemctl is-active cloudflared 2>/dev/null || true; else printf 'unknown\\n'; fi\n"
+        }
+        HostOs::MacOs => {
+            "set -eu\nif command -v launchctl >/dev/null 2>&1 && launchctl print system/com.cloudflare.cloudflared >/dev/null 2>&1; then printf 'active\\n'; else printf 'inactive\\n'; fi\n"
+        }
+        HostOs::Unknown(_) => "printf 'unknown\\n'\n",
+    };
+    let output = remote_script(transport, "read Cloudflare Tunnel connector state", script)?;
+    let state = output.stdout.trim();
+    Ok(if state.is_empty() {
+        "unknown".to_owned()
+    } else {
+        state.to_owned()
+    })
 }
 
 pub(crate) fn sync_cloudflare_tunnel_if_present(
@@ -5382,6 +5571,7 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
     app: &str,
 ) -> Result<bool> {
     validate_identifier("app name", app)?;
+    let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
@@ -5426,6 +5616,7 @@ pub(crate) fn remove_cloudflare_tunnel_if_owned(
     app: &str,
 ) -> Result<bool> {
     validate_identifier("app name", app)?;
+    let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
@@ -5530,7 +5721,7 @@ fn restore_cloudflare_config(transport: &OpenSshTransport, app: &str, contents: 
 
 fn cloudflared_reload_script(os: &HostOs) -> String {
     match os {
-        HostOs::Linux => "set -eu\nsudo -n systemctl reload cloudflared\n".to_owned(),
+        HostOs::Linux => "set -eu\nsudo -n systemctl reload cloudflared 2>/dev/null || sudo -n systemctl restart cloudflared\n".to_owned(),
         HostOs::MacOs => "set -eu\nsudo -n launchctl kill HUP system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared\n".to_owned(),
         HostOs::Unknown(_) => String::new(),
     }
@@ -9072,6 +9263,19 @@ mod tests {
         assert_eq!(route.hostname.as_deref(), Some("tv.example.com"));
         assert_eq!(route.port(), Some(41002));
         assert_eq!(parsed.rules.len(), 2);
+        assert!(contents.starts_with("# managed-by: ciao app=demo\n"));
+    }
+
+    #[test]
+    fn cloudflare_tunnel_name_is_stable_for_the_configured_host() {
+        let transport = OpenSshTransport::new("luca@100.121.27.41")
+            .unwrap()
+            .with_host_name("luca-hp_elitedesk")
+            .unwrap();
+        assert_eq!(
+            transport.host_scoped_tunnel_name(),
+            "ciao-luca-hp-elitedesk"
+        );
     }
 
     #[test]
@@ -9101,6 +9305,7 @@ mod tests {
         let fallback = rendered.find("http_status:404").unwrap();
         assert!(alpha < beta && beta < manual && manual < fallback);
         assert_eq!(parsed.route_for_app("beta").unwrap().1.port(), Some(41002));
+        assert!(rendered.starts_with("# managed-by: ciao app=alpha\n"));
     }
 
     #[test]
@@ -9129,6 +9334,19 @@ mod tests {
         assert!(!rendered.contains("alpha.example.com"));
         assert!(rendered.contains("beta.example.com"));
         assert!(rendered.contains("http_status:404"));
+    }
+
+    #[test]
+    fn cloudflare_merge_moves_catch_all_to_the_end() {
+        let contents = "tunnel: shared\ncredentials-file: /etc/cloudflared/shared.json\ningress:\n  - service: http_status:404\n  # managed-by: ciao app=alpha\n  - hostname: alpha.example.com\n    service: http://localhost:41001\n";
+        let mut parsed = parse_cloudflare_config(contents).unwrap();
+        parsed
+            .upsert_route("alpha", "alpha.example.com", 41002)
+            .unwrap();
+        let rendered = parsed.render();
+        assert!(
+            rendered.find("alpha.example.com").unwrap() < rendered.find("http_status:404").unwrap()
+        );
     }
 
     #[test]

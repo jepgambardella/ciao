@@ -6,6 +6,20 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.19] - 2026-08-21
+
+- Make the Cloudflare Tunnel host-scoped with a deterministic `ciao-<host>`
+  name; subsequent apps reuse the same tunnel, credentials and connector.
+- Add a host-level lock around Cloudflare config read/merge/write/remove and
+  recover locks left by an interrupted update after a bounded lease.
+- Preserve manual ingress rules, mark the managed tunnel block and every Ciao
+  route with ownership comments, and keep the catch-all rule last.
+- Prefer existing `/etc/cloudflared/*.json` credentials on the target and
+  avoid TTY-only login or installation paths in non-interactive deploys.
+- Extend `ciao status` with tunnel name, real port and connector state; extend
+  `ciao host audit` with DNS target, connector service and duplicate-process
+  checks.
+
 ## [v0.1.18] - 2026-08-21
 
 - Merge Cloudflare Tunnel ingress at host scope: every deploy upserts only the
