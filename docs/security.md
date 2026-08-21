@@ -76,7 +76,9 @@ installs Tailscale only on the target when needed, requires the normal
 Tailscale sign-in and Funnel approval flow, and routes only the selected Ciao
 app through a dedicated Caddy fragment. Funnel terminates HTTPS at Tailscale
 and forwards to Caddy on `127.0.0.1:80`; Ciao does not open the application
-port in the host firewall. Removing the app disables the Ciao-owned Funnel
+port in the host firewall. Service apps must declare their application port in
+`ciao.toml` under `[run].port` so the generated Caddy route is unambiguous;
+static apps do not need one. Removing the app disables the Ciao-owned Funnel
 route before deleting its Caddy fragment. Funnel is public to anyone on the
 Internet, so it is never enabled by a normal `ciao deploy`.
 

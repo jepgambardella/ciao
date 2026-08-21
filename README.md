@@ -84,6 +84,17 @@ prints a stable `https://<host>.<tailnet>.ts.net` URL. Funnel is public to the
 whole Internet. To turn this route off, run `sudo tailscale funnel --https=443 off`
 on the host.
 
+For service apps, declare the application port in `ciao.toml` before using
+Funnel:
+
+```toml
+[run]
+port = 3000
+```
+
+This is the app port. Funnel itself forwards through Caddy on `127.0.0.1:80`.
+Static apps do not need a service port.
+
 Use a normal SSH key for later commands. Ciao can create the key and install
 the public key during the guided host setup.
 

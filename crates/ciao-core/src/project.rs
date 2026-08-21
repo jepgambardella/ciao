@@ -149,7 +149,8 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
             ));
     };
 
-    let port_explicit = config.run.as_ref().and_then(|run| run.port).is_some();
+    let deploy_port_explicit = config.run.as_ref().and_then(|run| run.port).is_some();
+    let port_explicit = deploy_port_explicit;
     let hooks = config.hooks.unwrap_or_default();
     validate_hooks(&hooks)?;
     let mut plan = ProjectPlan {
@@ -163,6 +164,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         health: HealthConfig::default(),
         static_directory,
         port_explicit,
+        deploy_port_explicit,
         local_name: None,
         local_port: None,
         local_command: None,

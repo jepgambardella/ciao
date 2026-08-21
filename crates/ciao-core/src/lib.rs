@@ -354,6 +354,12 @@ pub struct ProjectPlan {
     pub health: HealthConfig,
     pub static_directory: Option<String>,
     pub port_explicit: bool,
+    /// Whether the remote service port was explicitly set in `[run]`.
+    ///
+    /// This is separate from `port_explicit`, which also records local
+    /// development overrides from `[dev]` and `ciao run --port`.
+    #[serde(default)]
+    pub deploy_port_explicit: bool,
     pub local_name: Option<String>,
     pub local_port: Option<u16>,
     pub local_command: Option<String>,
@@ -7673,6 +7679,7 @@ mod tests {
         let plan = detect_project(directory.path()).unwrap();
         assert_eq!(plan.name, "api");
         assert_eq!(plan.port, Some(8080));
+        assert!(plan.deploy_port_explicit);
         assert_eq!(plan.health.timeout_seconds, 3);
         assert_eq!(plan.build_command.as_deref(), Some("npm run compile"));
         assert_eq!(plan.hooks.pre_upload.as_deref(), Some("scripts/backup.sh"));
@@ -7720,6 +7727,7 @@ mod tests {
         assert_eq!(plan.build_command, None);
         assert_eq!(plan.run_command.as_deref(), Some("npm start"));
         assert_eq!(plan.install_command.as_deref(), Some("npm install"));
+        assert!(!plan.deploy_port_explicit);
     }
 
     #[test]

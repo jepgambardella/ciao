@@ -4,7 +4,8 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
-No changes yet.
+- Require service deployments using Funnel to declare `[run].port` in
+  `ciao.toml`; static Funnel apps remain exempt.
 
 ## [v0.1.12] - 2026-08-21
 

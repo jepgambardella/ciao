@@ -497,6 +497,9 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
+            if matches!(args.action, Some(DeployAction::Funnel)) {
+                validate_funnel_port(&components, plan.as_ref())?;
+            }
             let (transport, app_override) = if args.ci {
                 let target =
                     ci_target_from_env(&std::env::vars().collect::<BTreeMap<String, String>>())?;
@@ -1136,6 +1139,31 @@ fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<Fun
             enable_tailscale_funnel(transport, app)
         }
     }
+}
+
+fn validate_funnel_port(components: &[ProjectComponent], plan: Option<&ProjectPlan>) -> Result<()> {
+    let plan = if components.is_empty() {
+        plan.ok_or_else(|| {
+            CiaoError::Detection("Funnel deployment has no detected project plan".to_owned())
+        })?
+    } else {
+        components
+            .iter()
+            .find(|component| component.role == ProjectRole::Frontend)
+            .or_else(|| components.last())
+            .map(|component| &component.plan)
+            .ok_or_else(|| {
+                CiaoError::Detection("Funnel deployment has no detected component".to_owned())
+            })?
+    };
+    if plan.app_type == AppType::Static || plan.deploy_port_explicit {
+        return Ok(());
+    }
+    let suggested_port = plan.port.unwrap_or(3000);
+    Err(CiaoError::Config(format!(
+        "`deploy funnel` requires an explicit service port in ciao.toml for `{}`; add:\n\n[run]\nport = {suggested_port}\n\nThis is the application port. Funnel itself forwards through Caddy on 127.0.0.1:80.",
+        plan.name
+    )))
 }
 
 fn tailscale_funnel_approval_url(error: &CiaoError) -> Option<String> {
