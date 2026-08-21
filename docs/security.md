@@ -80,7 +80,19 @@ port in the host firewall. Service apps must declare their application port in
 `ciao.toml` under `[run].port` so the generated Caddy route is unambiguous;
 static apps do not need one. Removing the app disables the Ciao-owned Funnel
 route before deleting its Caddy fragment. Funnel is public to anyone on the
-Internet, so it is never enabled by a normal `ciao deploy`.
+Internet, so it is never enabled by a normal `ciao deploy` unless the project
+declares `[funnel] enabled = true`. Service apps using Funnel must declare
+`[run].port`; Ciao treats that as a stable application port and uses the
+single service unit path, with a short restart instead of trying to bind two
+blue/green candidates to the same port. Funnel still terminates at Caddy on
+`127.0.0.1:80`.
+
+Funnel authentication defaults to a random token path. The token is generated
+with the target CSPRNG, stored root-only with mode `0600`, and never printed
+except as part of the one-time public URL shown by the explicit Funnel setup.
+Set `[app] public = true` and `[funnel] auth = "none"` only when the service is
+intentionally public. Ciao refreshes the Caddy Funnel route and runs a local
+Host-header smoke check after every activation and rollback.
 
 GitHub auto-deploy is opt-in. It stores only the dedicated CI private key and
 the trusted known-hosts material in GitHub Actions secrets; Ciao's local integration state
@@ -103,8 +115,16 @@ leave a managed child process behind after `ciao run`, `ciao dev`, or an
 interrupted upload.
 
 `ciao host audit` is read-only. It reads generated Caddy routes, service
-definitions, sudoers policy and Ciao-owned file names over SSH and reports
-missing, changed or orphaned entries without repairing them.
+definitions, sudoers policy, Ciao-owned file names and Tailscale Funnel/Serve
+status over SSH. It reports dead local ports, unresolved hostnames, public
+routes without declared authentication and orphaned entries without repairing
+them. Application removal rewrites JSON Serve configuration only for the
+application's historical local ports; unrelated Tailscale rules are left
+untouched. After a machine rename, `ciao host cleanup <host> --yes` can remove
+stale local Ciao-range Serve endpoints while preserving ports referenced by
+retained releases. The explicit flag is required because it rewrites the
+remote Serve configuration. Ciao also warns when service source appears to
+bind `0.0.0.0`; that check is advisory and never rewrites application code.
 
 The test suite includes validation and generated-definition checks plus a local
 CLI/MCP smoke path. SSH tests are opt-in and disposable; they must not reboot

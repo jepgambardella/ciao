@@ -94,8 +94,41 @@ port = 3000
 
 This is the app port. Funnel itself forwards through Caddy on `127.0.0.1:80`.
 Static apps do not need a service port. During a Linux blue/green redeploy,
-Ciao may use a second internal candidate port; external traffic should target
-the Caddy/Funnel endpoint, not a release port directly.
+Ciao keeps this explicit port stable and restarts the service in place; apps
+without `[run].port` use blue/green internal ports. External traffic should
+always target the Caddy/Funnel endpoint, not a release port directly.
+
+For a declared Funnel that is enabled after every deploy, use the secure
+default token route:
+
+```toml
+[app]
+public = false
+
+[funnel]
+enabled = true
+auth = "token" # the default; Ciao prints the generated URL once
+```
+
+Only an explicitly public app may disable the token:
+
+```toml
+[app]
+public = true
+
+[funnel]
+enabled = true
+auth = "none"
+```
+
+Ciao keeps Funnel on the machine hostname and synchronizes its Caddy upstream
+after every deploy and rollback. A host can expose one Ciao Funnel hostname at
+a time; use separate hosts for separate public apps.
+
+Ciao also prints an advisory when it finds an explicit `0.0.0.0` bind in a
+service source file. `HOST=127.0.0.1` is exported to the generated start
+script, but some frameworks ignore it; bind explicitly to loopback when Caddy
+or Funnel must be the only entry point.
 
 Use a normal SSH key for later commands. Ciao can create the key and install
 the public key during the guided host setup.
@@ -179,7 +212,20 @@ ciao host audit home --diff
 ```
 
 The audit checks Caddy imports/routes, managed service definitions, sudoers and
-orphaned Ciao files. It is read-only.
+orphaned Ciao files. It also inspects Tailscale Funnel/Serve rules and flags
+dead local ports, hostnames that no longer resolve, and public Funnel routes
+without declared authentication. It is read-only.
+
+After renaming a machine, remove only stale local Ciao endpoints from the
+editable Tailscale Serve configuration with an explicit confirmation:
+
+```bash
+ciao host cleanup home --yes
+```
+
+The cleanup is limited to Ciao's managed port range and preserves ports still
+referenced by retained releases. It never rewrites Tailscale configuration
+without `--yes`.
 
 ## Local development
 

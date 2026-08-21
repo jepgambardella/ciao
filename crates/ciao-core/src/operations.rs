@@ -72,6 +72,11 @@ pub fn remove_app(transport: &OpenSshTransport, app: &str) -> Result<OperationRe
     let manifest = read_current_release(transport, &root, app)?
         .map(|release| read_release_manifest(transport, &root, app, &release))
         .transpose()?;
+    let serve_ports = list_releases(transport, app)?
+        .into_iter()
+        .filter_map(|release| release.port)
+        .collect::<Vec<_>>();
+    cleanup_tailscale_serve_for_ports(transport, app, &serve_ports)?;
     if !manifest
         .as_ref()
         .is_some_and(|manifest| manifest.app_type == AppType::Static)
@@ -347,7 +352,11 @@ pub fn rollback_to(
     } else {
         None
     };
-    let rollback_slot = active_slot.map(opposite_slot).transpose()?;
+    let rollback_slot = if manifest.port_explicit {
+        None
+    } else {
+        active_slot.map(opposite_slot).transpose()?
+    };
     let previous_path = format!("{root}/{app}/releases/{previous}");
     let current_path = format!("{root}/{app}/releases/{current}");
     let retained_domain = read_existing_domain(transport, app)?;
@@ -381,6 +390,27 @@ pub fn rollback_to(
                     &manifest.health,
                 )?;
             } else {
+                if manifest.port_explicit && platform.os == HostOs::Linux {
+                    for slot in ['a', 'b'] {
+                        if let Ok(slot_unit) = slot_service_unit_name(app, slot) {
+                            let _ = service_action(
+                                transport,
+                                &platform.os,
+                                &slot_unit,
+                                LifecycleAction::Stop,
+                            );
+                            let _ = disable_service(transport, &platform.os, &slot_unit);
+                        }
+                    }
+                    remote_script(
+                        transport,
+                        "clear active service slot",
+                        &format!(
+                            "set -eu\nsudo -n rm -f {}\n",
+                            shell_quote(&active_slot_path(&root, app))
+                        ),
+                    )?;
+                }
                 let unit = service_unit_name(app, false);
                 let user = service_user(transport, &platform.os, app)?;
                 install_service(
@@ -404,13 +434,12 @@ pub fn rollback_to(
                 )?;
             }
             if let Some(slot) = active_slot {
-                let old_unit = slot_service_unit_name(app, slot)?;
-                let rollback_slot = rollback_slot.ok_or_else(|| {
-                    CiaoError::Config("active service slot has no rollback slot".to_owned())
-                })?;
-                service_action(transport, &platform.os, &old_unit, LifecycleAction::Stop)?;
-                disable_service(transport, &platform.os, &old_unit)?;
-                write_active_slot(transport, &root, app, rollback_slot)?;
+                if let Some(rollback_slot) = rollback_slot {
+                    let old_unit = slot_service_unit_name(app, slot)?;
+                    service_action(transport, &platform.os, &old_unit, LifecycleAction::Stop)?;
+                    disable_service(transport, &platform.os, &old_unit)?;
+                    write_active_slot(transport, &root, app, rollback_slot)?;
+                }
             }
         } else if current_manifest.app_type == AppType::Service {
             let old_unit = match active_slot {
@@ -436,6 +465,7 @@ pub fn rollback_to(
             }
         }
         configure_remote_ciao_domain(transport, app)?;
+        sync_tailscale_funnel_route_if_present(transport, app)?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = activation {
@@ -446,7 +476,41 @@ pub fn rollback_to(
                 &switch_current_script(&platform.os, &root, app, &current_path),
             )?;
             if current_manifest.app_type == AppType::Service {
-                let unit = if let Some(slot) = active_slot {
+                let unit = if current_manifest.port_explicit && platform.os == HostOs::Linux {
+                    for slot in ['a', 'b'] {
+                        if let Ok(slot_unit) = slot_service_unit_name(app, slot) {
+                            let _ = service_action(
+                                transport,
+                                &platform.os,
+                                &slot_unit,
+                                LifecycleAction::Stop,
+                            );
+                            let _ = disable_service(transport, &platform.os, &slot_unit);
+                        }
+                    }
+                    remote_script(
+                        transport,
+                        "clear active service slot",
+                        &format!(
+                            "set -eu\nsudo -n rm -f {}\n",
+                            shell_quote(&active_slot_path(&root, app))
+                        ),
+                    )?;
+                    let unit = service_unit_name(app, false);
+                    let user = service_user(transport, &platform.os, app)?;
+                    install_service(
+                        transport,
+                        &platform.os,
+                        &unit,
+                        &user,
+                        &current_path,
+                        &format!("{root}/{app}/shared/env"),
+                        false,
+                        "./start",
+                    )?;
+                    enable_service(transport, &platform.os, &unit)?;
+                    unit
+                } else if let Some(slot) = active_slot {
                     let user = service_user(transport, &platform.os, app)?;
                     let unit = slot_service_unit_name(app, slot)?;
                     install_service(
@@ -506,6 +570,7 @@ pub fn rollback_to(
                 }
             }
             configure_remote_ciao_domain(transport, app)?;
+            sync_tailscale_funnel_route_if_present(transport, app)?;
             Ok::<(), CiaoError>(())
         })();
         let recovery = match restore {

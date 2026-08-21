@@ -6,6 +6,21 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.14] - 2026-08-21
+
+- Treat `[run].port` as a stable service port and verify explicit-port services
+  after activation instead of silently replacing it with an allocator port.
+- Synchronize Funnel Caddy routes after deploy and rollback, including a
+  loopback Host-header smoke check and a guard against conflicting Ciao Funnel
+  hostnames.
+- Add secure-by-default Funnel token paths, declarative `[funnel]` settings and
+  read-only Tailscale Funnel/Serve findings to `ciao host audit`.
+- Remove Ciao-owned historical Serve endpoints during application removal
+  without rewriting unrelated Tailscale configuration; add explicit
+  `ciao host cleanup <host> --yes` for rename cleanup.
+- Warn when service source appears to bind `0.0.0.0`, while keeping the check
+  advisory and leaving application code unchanged.
+
 ## [v0.1.13] - 2026-08-21
 
 - Require service deployments using Funnel to declare `[run].port` in

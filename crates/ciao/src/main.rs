@@ -107,6 +107,13 @@ enum HostCommand {
         #[arg(long)]
         diff: bool,
     },
+    /// Remove stale Ciao-range Tailscale Serve endpoints after a rename.
+    Cleanup {
+        name: String,
+        /// Required because this rewrites the remote Serve configuration.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -481,6 +488,11 @@ fn run(cli: Cli) -> Result<()> {
                     plan.run_command.as_deref().unwrap_or("static files")
                 )
             });
+            if !cli.json {
+                if let Some(warning) = plan.binding_warning.as_deref() {
+                    eprintln!("⚠ {warning}");
+                }
+            }
             Ok(())
         }
         Command::Deploy(args) => {
@@ -497,7 +509,12 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
-            if matches!(args.action, Some(DeployAction::Funnel)) {
+            if matches!(args.action, Some(DeployAction::Funnel))
+                || plan.as_ref().is_some_and(|plan| plan.funnel.enabled)
+                || components
+                    .iter()
+                    .any(|component| component.plan.funnel.enabled)
+            {
                 validate_funnel_port(&components, plan.as_ref())?;
             }
             let (transport, app_override) = if args.ci {
@@ -529,9 +546,32 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            if !cli.json {
+                if let Some(plan) = plan.as_ref() {
+                    if let Some(warning) = plan.binding_warning.as_deref() {
+                        eprintln!("⚠ {warning}");
+                    }
+                }
+                for component in &components {
+                    if let Some(warning) = component.plan.binding_warning.as_deref() {
+                        eprintln!("⚠ {}: {warning}", component.name);
+                    }
+                }
+            }
             let progress = TerminalProgress::new();
             let interactive_output =
                 !cli.json && !args.ci && io::stdin().is_terminal() && io::stderr().is_terminal();
+            let funnel_declared = matches!(args.action, Some(DeployAction::Funnel))
+                || components
+                    .iter()
+                    .any(|component| component.plan.funnel.enabled)
+                || plan.as_ref().is_some_and(|plan| plan.funnel.enabled);
+            if funnel_declared && !args.dry_run && !interactive_output {
+                return Err(CiaoError::Config(
+                    "Funnel setup requires an interactive terminal for the Tailscale approval flow; run the deploy from a terminal"
+                        .to_owned(),
+                ));
+            }
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
             }
@@ -569,7 +609,11 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!(
                         "Would enable a public Tailscale Funnel for `{app}` after deployment."
                     );
-                } else if matches!(args.action, Some(DeployAction::Funnel)) {
+                } else if matches!(args.action, Some(DeployAction::Funnel))
+                    || components
+                        .iter()
+                        .any(|component| component.plan.funnel.enabled)
+                {
                     let app = result
                         .components
                         .last()
@@ -625,7 +669,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             output(&result, cli.json, || result.message.clone());
             if !args.ci && !args.dry_run && interactive_output {
-                if matches!(args.action, Some(DeployAction::Funnel)) {
+                if matches!(args.action, Some(DeployAction::Funnel)) || plan.funnel.enabled {
                     let funnel = setup_tailscale_funnel(&transport, &result.app)?;
                     println!("{}", funnel.message);
                 }
@@ -2156,13 +2200,29 @@ fn host_command(command: HostCommand, json_output: bool) -> Result<()> {
             }
             Ok(())
         }
+        HostCommand::Cleanup { name, yes } => {
+            if !yes {
+                return Err(CiaoError::Config(
+                    "host exposure cleanup rewrites Tailscale Serve configuration; rerun with `--yes`"
+                        .to_owned(),
+                ));
+            }
+            let transport = transport_for(&name)?;
+            let changed = cleanup_tailscale_serve_orphans(&transport)?;
+            if changed {
+                println!("✓ stale Ciao-range Tailscale Serve endpoints removed on {name}");
+            } else {
+                println!("✓ no stale Ciao-range Tailscale Serve endpoints found on {name}");
+            }
+            Ok(())
+        }
     }
 }
 
 fn status_icon(status: &str) -> &'static str {
     match status {
         "ok" => "✓",
-        "orphan" => "⚠",
+        "orphan" | "unavailable" | "unknown-port" | "unknown-hostname" => "⚠",
         _ => "✗",
     }
 }

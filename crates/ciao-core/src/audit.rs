@@ -42,6 +42,7 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
         caddy_contents.contains("import /etc/caddy/ciao/*.caddy"),
         "import /etc/caddy/ciao/*.caddy",
     );
+    audit_tailscale_exposures(transport, &mut items)?;
 
     let app_names = apps
         .iter()
@@ -87,15 +88,52 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
         if let Some(actual) = read_remote_file(transport, &funnel_path, "audit Funnel route")? {
             if let Ok(target) = tailscale_target(transport) {
                 if let Some(hostname) = target.hostname {
-                    let expected =
-                        funnel_caddy_fragment(transport, &root, &app.app, &release, &hostname)?;
-                    let status = if actual == expected { "ok" } else { "drift" };
+                    let token = match manifest.funnel.auth {
+                        FunnelAuth::Token => read_funnel_token(transport, &root, &app.app)?,
+                        FunnelAuth::None => None,
+                    };
+                    let expected = funnel_caddy_fragment(
+                        transport,
+                        &root,
+                        &app.app,
+                        &release,
+                        &hostname,
+                        token.as_deref(),
+                    )?;
+                    let status = if manifest.funnel.auth == FunnelAuth::Token && token.is_none() {
+                        "missing-token"
+                    } else if actual == expected {
+                        "ok"
+                    } else {
+                        "drift"
+                    };
                     items.push(AuditItem {
                         path: funnel_path,
                         status: status.to_owned(),
-                        expected: Some(expected),
-                        actual: Some(actual),
+                        expected: Some("managed Funnel route (redacted)".to_owned()),
+                        actual: Some("managed Funnel route (redacted)".to_owned()),
                     });
+                    if let Some(port) = caddy_upstream_port(&actual) {
+                        let port_status = match remote_port_is_listening(transport, port)? {
+                            Some(true) => "ok",
+                            Some(false) => "dead-port",
+                            None => "unknown-port",
+                        };
+                        items.push(AuditItem {
+                            path: format!("tailscale/funnel/{}/upstream", app.app),
+                            status: port_status.to_owned(),
+                            expected: Some("active Caddy upstream port".to_owned()),
+                            actual: Some(port.to_string()),
+                        });
+                    }
+                    if !manifest.public && manifest.funnel.auth == FunnelAuth::None {
+                        items.push(AuditItem {
+                            path: format!("tailscale/funnel/{}/auth", app.app),
+                            status: "public-without-auth".to_owned(),
+                            expected: Some("token auth or [app] public = true".to_owned()),
+                            actual: Some("Funnel auth = none".to_owned()),
+                        });
+                    }
                 } else {
                     items.push(AuditItem {
                         path: funnel_path,
@@ -211,6 +249,202 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
         } else {
             format!("⚠ host audit: {drift_count} drift item(s)")
         },
+    })
+}
+
+fn audit_tailscale_exposures(
+    transport: &OpenSshTransport,
+    items: &mut Vec<AuditItem>,
+) -> Result<()> {
+    for kind in ["funnel", "serve"] {
+        let status = match tailscale_exposure_status(transport, kind) {
+            Ok(status) => status,
+            Err(error) => {
+                items.push(AuditItem {
+                    path: format!("tailscale/{kind}"),
+                    status: "unavailable".to_owned(),
+                    expected: Some(format!("readable Tailscale {kind} status")),
+                    actual: Some(error.to_string()),
+                });
+                continue;
+            }
+        };
+        let Some(status) = status else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        collect_exposure_targets(&status, &mut targets);
+        targets.sort();
+        targets.dedup();
+        items.push(AuditItem {
+            path: format!("tailscale/{kind}"),
+            status: "ok".to_owned(),
+            expected: Some(format!("managed or declared {kind} rules")),
+            actual: Some(format!("{} rule target(s)", targets.len())),
+        });
+        for (index, target) in targets.iter().enumerate() {
+            let status = if let Some(port) = local_target_port(target) {
+                match remote_port_is_listening(transport, port)? {
+                    Some(true) => "ok",
+                    Some(false) => "dead-port",
+                    None => "unknown-port",
+                }
+            } else if let Some(hostname) = target_hostname(target) {
+                match remote_hostname_resolves(transport, &hostname)? {
+                    Some(true) => "ok",
+                    Some(false) => "unresolved-hostname",
+                    None => "unknown-hostname",
+                }
+            } else {
+                "ok"
+            };
+            items.push(AuditItem {
+                path: format!("tailscale/{kind}/{index}"),
+                status: status.to_owned(),
+                expected: Some("active local target or resolvable hostname".to_owned()),
+                actual: Some(target.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn tailscale_exposure_status(
+    transport: &OpenSshTransport,
+    kind: &str,
+) -> Result<Option<serde_json::Value>> {
+    let command = CommandSpec::fixed("sh", &["-s"], format!("read Tailscale {kind} status"))
+        .with_stdin(
+            format!(
+                "set -eu\nfor candidate in /usr/local/bin/tailscale /usr/local/opt/tailscale/bin/tailscale /opt/homebrew/bin/tailscale /opt/homebrew/opt/tailscale/bin/tailscale /usr/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do\n    if [ -x \"$candidate\" ]; then exec \"$candidate\" {kind} status --json; fi\ndone\nif command -v tailscale >/dev/null 2>&1; then exec tailscale {kind} status --json; fi\necho 'Tailscale CLI was not found on the target' >&2\nexit 127\n"
+            )
+            .into_bytes(),
+        )
+        .with_full_output();
+    let output = match transport.exec(command) {
+        Ok(output) => output,
+        Err(CiaoError::RemoteCommand { stdout, stderr, .. }) => {
+            if let Some(value) = tailscale_status_value(&stdout, &stderr) {
+                return Ok(Some(value));
+            }
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            if combined.contains("not found")
+                || combined.contains("no configuration")
+                || combined.contains("no serve")
+                || combined.contains("no funnel")
+            {
+                return Ok(None);
+            }
+            return Err(CiaoError::RemoteCommand {
+                stage: format!("read Tailscale {kind} status"),
+                exit: 1,
+                stdout,
+                stderr,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(tailscale_status_value(&output.stdout, &output.stderr))
+}
+
+fn collect_exposure_targets(value: &serde_json::Value, targets: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value)
+            if value.contains("://")
+                || value.contains("127.0.0.1:")
+                || value.contains("localhost:")
+                || value.contains(".ts.net") =>
+        {
+            targets.push(value.clone());
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_exposure_targets(value, targets);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_exposure_targets(value, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn local_target_port(target: &str) -> Option<u16> {
+    let host = target
+        .split_once("://")
+        .map(|(_, value)| value)
+        .unwrap_or(target)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = host.rsplit_once(':')?;
+    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+        return None;
+    }
+    port.parse().ok()
+}
+
+fn target_hostname(target: &str) -> Option<String> {
+    let host = target
+        .split_once("://")
+        .map(|(_, value)| value)
+        .unwrap_or(target)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('[');
+    let hostname = host.split(':').next().unwrap_or_default();
+    if hostname.is_empty() || hostname == "127.0.0.1" || hostname == "localhost" {
+        None
+    } else if hostname.contains('.') {
+        Some(hostname.trim_end_matches(']').to_owned())
+    } else {
+        None
+    }
+}
+
+fn caddy_upstream_port(fragment: &str) -> Option<u16> {
+    let value = fragment.split("127.0.0.1:").nth(1)?;
+    value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn remote_port_is_listening(transport: &OpenSshTransport, port: u16) -> Result<Option<bool>> {
+    let output = remote_script(
+        transport,
+        "audit exposed port",
+        &format!(
+            "set -eu\nport={}\nif command -v ss >/dev/null 2>&1; then listeners=$(ss -ltnH 2>/dev/null | awk '{{print $4}}'); elif command -v lsof >/dev/null 2>&1; then listeners=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {{print $9}}'); elif command -v netstat >/dev/null 2>&1; then listeners=$(netstat -ltn 2>/dev/null | awk 'NR > 2 {{print $4}}'); else printf 'unknown\\n'; exit 0; fi\nif printf '%s\\n' \"$listeners\" | grep -Eq \"([.:])$port$\"; then printf 'yes\\n'; else printf 'no\\n'; fi\n",
+            port
+        ),
+    )?;
+    Ok(match output.stdout.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    })
+}
+
+fn remote_hostname_resolves(transport: &OpenSshTransport, hostname: &str) -> Result<Option<bool>> {
+    validate_domain(hostname)?;
+    let output = remote_script(
+        transport,
+        "audit exposed hostname",
+        &format!(
+            "set -eu\nname={}\nif command -v getent >/dev/null 2>&1; then getent ahosts \"$name\" >/dev/null 2>&1 && printf 'yes\\n' || printf 'no\\n'; elif command -v dscacheutil >/dev/null 2>&1; then dscacheutil -q host -a name \"$name\" | grep -q '^ip_address:' && printf 'yes\\n' || printf 'no\\n'; else printf 'unknown\\n'; fi\n",
+            shell_quote(hostname)
+        ),
+    )?;
+    Ok(match output.stdout.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
     })
 }
 

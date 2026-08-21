@@ -46,8 +46,11 @@ pub use env::{
     diff_env, generate_env, pull_env, push_env, set_env, unset_env, validate_env_key, EnvDiff,
     EnvGenerateResult,
 };
-use funnel::disable_tailscale_funnel;
-pub use funnel::{enable_tailscale_funnel, FunnelResult};
+use funnel::{
+    cleanup_tailscale_serve_for_ports, disable_tailscale_funnel, read_funnel_token,
+    sync_tailscale_funnel_route_if_present,
+};
+pub use funnel::{cleanup_tailscale_serve_orphans, enable_tailscale_funnel, FunnelResult};
 use hooks::{run_local_hook, run_remote_hook};
 pub use operations::{
     app_logs, app_status, follow_app_logs, lifecycle_action, list_apps, list_releases, remove_app,
@@ -325,6 +328,31 @@ pub enum AppType {
     Static,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FunnelAuth {
+    #[default]
+    Token,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunnelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auth: FunnelAuth,
+}
+
+impl Default for FunnelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth: FunnelAuth::Token,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthConfig {
     pub path: String,
@@ -352,6 +380,10 @@ pub struct ProjectPlan {
     pub run_command: Option<String>,
     pub port: Option<u16>,
     pub health: HealthConfig,
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub funnel: FunnelConfig,
     pub static_directory: Option<String>,
     pub port_explicit: bool,
     /// Whether the remote service port was explicitly set in `[run]`.
@@ -366,6 +398,11 @@ pub struct ProjectPlan {
     pub release_keep: usize,
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// Advisory warning when project code appears to bind all interfaces.
+    /// Ciao still exports `HOST=127.0.0.1`; frameworks that ignore it can
+    /// bypass the Caddy/Funnel protection layer.
+    #[serde(default)]
+    pub binding_warning: Option<String>,
 }
 
 /// Fixed lifecycle hooks declared by the project author in `ciao.toml`.
@@ -384,6 +421,7 @@ struct ProjectConfig {
     app: Option<AppConfig>,
     build: Option<BuildConfig>,
     run: Option<RunConfig>,
+    funnel: Option<FunnelConfigFile>,
     health: Option<HealthConfigFile>,
     dev: Option<DevConfig>,
     releases: Option<ReleasesConfig>,
@@ -398,8 +436,15 @@ struct ReleasesConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AppConfig {
     name: Option<String>,
+    public: Option<bool>,
     #[serde(rename = "type")]
     app_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FunnelConfigFile {
+    enabled: Option<bool>,
+    auth: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2858,12 +2903,21 @@ pub struct ReleaseManifest {
     pub runtime: Runtime,
     pub app_type: AppType,
     pub port: Option<u16>,
+    /// The port came from the deployment `[run]` configuration. Explicit
+    /// ports use the stable service unit path instead of a second blue/green
+    /// listener, because two processes cannot bind the same port at once.
+    #[serde(default)]
+    pub port_explicit: bool,
     pub source_path: String,
     pub install_command: Option<String>,
     pub build_command: Option<String>,
     pub run_command: Option<String>,
     pub static_directory: Option<String>,
     pub health: HealthConfig,
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub funnel: FunnelConfig,
     pub created_at_unix: u64,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -2883,12 +2937,15 @@ impl ReleaseManifest {
             runtime: plan.runtime.clone(),
             app_type: plan.app_type.clone(),
             port: plan.port,
+            port_explicit: plan.deploy_port_explicit,
             source_path: source_path.display().to_string(),
             install_command: plan.install_command.clone(),
             build_command: plan.build_command.clone(),
             run_command: plan.run_command.clone(),
             static_directory: plan.static_directory.clone(),
             health: plan.health.clone(),
+            public: plan.public,
+            funnel: plan.funnel.clone(),
             created_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -5881,6 +5938,8 @@ fn deploy_unlocked(
         };
         let planned_port = if plan.app_type == AppType::Static {
             None
+        } else if plan.deploy_port_explicit {
+            plan.port
         } else {
             Some(
                 plan.port
@@ -5923,6 +5982,7 @@ fn deploy_unlocked(
             &plan.name,
             previous_release.as_deref(),
             plan.port,
+            plan.deploy_port_explicit,
         )?)
     };
     let active_slot = if plan.app_type == AppType::Service && platform.os == HostOs::Linux {
@@ -5930,7 +5990,9 @@ fn deploy_unlocked(
     } else {
         None
     };
+    let fixed_port = plan.app_type == AppType::Service && plan.deploy_port_explicit;
     let candidate_slot = match active_slot {
+        _ if fixed_port => None,
         Some('a') => Some('b'),
         Some('b') => Some('a'),
         None if plan.app_type == AppType::Service && platform.os == HostOs::Linux => Some('a'),
@@ -6111,7 +6173,12 @@ fn deploy_unlocked(
                 })?;
             }
             progress_step(reporter, "candidate healthcheck", || {
-                if platform.os == HostOs::MacOs {
+                if fixed_port {
+                    // The stable explicit port cannot be bound by a second
+                    // candidate while the current service is running. It is
+                    // checked immediately after the restart in activation.
+                    Ok(())
+                } else if platform.os == HostOs::MacOs {
                     run_macos_candidate(transport, &user, &release_path, port, &plan.health)
                 } else {
                     let candidate_unit = slot_service_unit_name(
@@ -6154,7 +6221,7 @@ fn deploy_unlocked(
             progress_step(reporter, "activate service release", || {
                 harden_release(transport, &platform.os, &release_path)?;
                 let stable_unit = service_unit_name(&plan.name, false);
-                if platform.os == HostOs::Linux {
+                if platform.os == HostOs::Linux && !fixed_port {
                     let slot =
                         candidate_slot.expect("Linux service deployments have a candidate slot");
                     let candidate_unit = slot_service_unit_name(&plan.name, slot)?;
@@ -6219,6 +6286,30 @@ fn deploy_unlocked(
                     write_active_slot(transport, &root, &plan.name, slot)?;
                     remote_healthcheck(transport, port, &plan.health)
                 } else {
+                    if fixed_port && platform.os == HostOs::Linux {
+                        // A previous blue/green release may still own the
+                        // configured port in a slot. Stop both slot units
+                        // before starting the stable fixed-port unit.
+                        for slot in ['a', 'b'] {
+                            if let Ok(unit) = slot_service_unit_name(&plan.name, slot) {
+                                let _ = service_action(
+                                    transport,
+                                    &platform.os,
+                                    &unit,
+                                    LifecycleAction::Stop,
+                                );
+                                let _ = disable_service(transport, &platform.os, &unit);
+                            }
+                        }
+                        remote_script(
+                            transport,
+                            "clear active service slot",
+                            &format!(
+                                "set -eu\nsudo -n rm -f {}\n",
+                                shell_quote(&active_slot_path(&root, &plan.name))
+                            ),
+                        )?;
+                    }
                     install_service(
                         transport,
                         &platform.os,
@@ -6260,6 +6351,9 @@ fn deploy_unlocked(
         }
         progress_step(reporter, "configure local Ciao domain", || {
             configure_remote_ciao_domain(transport, &plan.name)
+        })?;
+        progress_step(reporter, "synchronize Funnel route", || {
+            sync_tailscale_funnel_route_if_present(transport, &plan.name).map(|_| ())
         })?;
         if let Some(domain) = effective_domain {
             progress_step(reporter, "configure domain", || {
@@ -6309,6 +6403,16 @@ fn deploy_unlocked(
                             let new_unit = candidate_slot.and_then(|candidate| {
                                 slot_service_unit_name(&plan.name, candidate).ok()
                             });
+                            if fixed_port {
+                                let stable_unit = service_unit_name(&plan.name, false);
+                                let _ = service_action(
+                                    transport,
+                                    &platform.os,
+                                    &stable_unit,
+                                    LifecycleAction::Stop,
+                                );
+                                let _ = disable_service(transport, &platform.os, &stable_unit);
+                            }
                             if let Some(unit) = new_unit {
                                 let _ = service_action(
                                     transport,
@@ -6361,6 +6465,7 @@ fn deploy_unlocked(
                     };
                 }
                 let _ = configure_remote_ciao_domain(transport, &plan.name);
+                let _ = sync_tailscale_funnel_route_if_present(transport, &plan.name);
             }
         } else {
             if effective_domain.is_some() {
@@ -6698,12 +6803,39 @@ fn allocate_port(
     app: &str,
     current: Option<&str>,
     requested: Option<u16>,
+    explicit: bool,
 ) -> Result<u16> {
     let current_port = current.and_then(|release| {
         read_release_port(transport, root, app, release)
             .ok()
             .flatten()
     });
+    if explicit {
+        let requested = requested.ok_or_else(|| {
+            CiaoError::Config("[run].port is required for an explicit service port".to_owned())
+        })?;
+        if !(1024..=u16::MAX).contains(&requested) {
+            return Err(CiaoError::Config(
+                "[run].port must be between 1024 and 65535".to_owned(),
+            ));
+        }
+        if current_port != Some(requested) {
+            let output = remote_script(
+                transport,
+                "check configured service port",
+                &format!(
+                    "set -eu\nport={}\nif command -v ss >/dev/null 2>&1; then listeners=$(ss -ltnH 2>/dev/null | awk '{{print $4}}'); elif command -v lsof >/dev/null 2>&1; then listeners=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {{print $9}}'); elif command -v netstat >/dev/null 2>&1; then listeners=$(netstat -ltn 2>/dev/null | awk 'NR > 2 {{print $4}}'); else echo 'port check requires ss, lsof or netstat' >&2; exit 1; fi\nif printf '%s\\n' \"$listeners\" | grep -Eq \"([.:])$port$\"; then printf 'busy\\n'; else printf 'free\\n'; fi\n",
+                    requested
+                ),
+            )?;
+            if output.stdout.trim() == "busy" {
+                return Err(CiaoError::Config(format!(
+                    "configured service port {requested} is already in use on the host"
+                )));
+            }
+        }
+        return Ok(requested);
+    }
     let start = match (requested, current_port) {
         (Some(port), Some(active)) if port == active => {
             if port >= PORT_END {
@@ -7699,6 +7831,55 @@ mod tests {
     }
 
     #[test]
+    fn funnel_defaults_to_token_and_none_requires_public_declaration() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("package.json"), "{}\n").unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"secure-funnel\"\n[funnel]\nenabled = true\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert!(plan.funnel.enabled);
+        assert_eq!(plan.funnel.auth, FunnelAuth::Token);
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"public-funnel\"\npublic = true\n[funnel]\nauth = \"none\"\n",
+        )
+        .unwrap();
+        let public_plan = detect_project(directory.path()).unwrap();
+        assert_eq!(public_plan.funnel.auth, FunnelAuth::None);
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"unsafe-funnel\"\n[funnel]\nauth = \"none\"\n",
+        )
+        .unwrap();
+        let error = detect_project(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("public = true"));
+    }
+
+    #[test]
+    fn explicit_deploy_port_is_validated_and_not_replaced_by_allocator_range() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("package.json"), "{}\n").unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"fixed-port\"\n[run]\ncommand = \"node server.js\"\nport = 3000\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(plan.port, Some(3000));
+        assert!(plan.deploy_port_explicit);
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"bad-port\"\n[run]\nport = 80\n",
+        )
+        .unwrap();
+        let error = detect_project(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("between 1024 and 65535"));
+    }
+
+    #[test]
     fn node_detection_reads_start_script_instead_of_assuming_one() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
@@ -7737,6 +7918,31 @@ mod tests {
         assert_eq!(plan.run_command.as_deref(), Some("npm start"));
         assert_eq!(plan.install_command.as_deref(), Some("npm install"));
         assert!(!plan.deploy_port_explicit);
+    }
+
+    #[test]
+    fn binding_warning_detects_explicit_all_interface_bind() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("server.js"),
+            "server.listen(PORT, '0.0.0.0');\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"bind-warning\"\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert!(plan
+            .binding_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("server.js")));
     }
 
     #[test]

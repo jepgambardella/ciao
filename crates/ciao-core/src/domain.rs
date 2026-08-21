@@ -134,22 +134,47 @@ pub(super) fn caddy_fragment_with_scheme(
     domain: &str,
     cloudflare_origin: bool,
 ) -> Result<String> {
+    caddy_fragment_with_token(
+        transport,
+        root,
+        app,
+        release,
+        domain,
+        cloudflare_origin,
+        None,
+    )
+}
+
+pub(crate) fn caddy_fragment_with_token(
+    transport: &OpenSshTransport,
+    root: &str,
+    app: &str,
+    release: &str,
+    domain: &str,
+    cloudflare_origin: bool,
+    token: Option<&str>,
+) -> Result<String> {
     let site = if cloudflare_origin {
         format!("http://{domain}")
     } else {
         domain.to_owned()
     };
-    if let Some(static_directory) = read_release_static_directory(transport, root, app, release)? {
+    let handler = if let Some(static_directory) =
+        read_release_static_directory(transport, root, app, release)?
+    {
         let static_root = format!("{root}/{app}/releases/{release}/{static_directory}");
-        Ok(format!(
-            "{site} {{\n    root * {}\n    file_server\n}}\n",
-            static_root
-        ))
+        format!("root * {static_root}\n    file_server")
     } else {
         let port = read_release_port(transport, root, app, release)?.unwrap_or(PORT_START);
+        format!("reverse_proxy 127.0.0.1:{port}")
+    };
+    if let Some(token) = token {
+        validate_identifier("Funnel token", token)?;
         Ok(format!(
-            "{site} {{\n    reverse_proxy 127.0.0.1:{port}\n}}\n"
+            "{site} {{\n    handle_path /{token}* {{\n        {handler}\n    }}\n}}\n"
         ))
+    } else {
+        Ok(format!("{site} {{\n    {handler}\n}}\n"))
     }
 }
 
@@ -161,8 +186,9 @@ pub(crate) fn funnel_caddy_fragment(
     app: &str,
     release: &str,
     hostname: &str,
+    token: Option<&str>,
 ) -> Result<String> {
-    caddy_fragment_with_scheme(transport, root, app, release, hostname, true)
+    caddy_fragment_with_token(transport, root, app, release, hostname, true, token)
 }
 
 pub(super) fn configure_release_caddy_route(

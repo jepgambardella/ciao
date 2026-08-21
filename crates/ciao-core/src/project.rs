@@ -10,6 +10,12 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
     } else {
         ProjectConfig::default()
     };
+    let public = config
+        .app
+        .as_ref()
+        .and_then(|app| app.public)
+        .unwrap_or(false);
+    let funnel = parse_funnel_config(config.funnel.as_ref(), public)?;
     let name = config
         .app
         .as_ref()
@@ -162,6 +168,8 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         run_command: run,
         port,
         health: HealthConfig::default(),
+        public,
+        funnel,
         static_directory,
         port_explicit,
         deploy_port_explicit,
@@ -175,6 +183,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
             .unwrap_or(5)
             .max(1),
         hooks,
+        binding_warning: None,
     };
     if let Some(app) = config.app.as_ref().and_then(|app| app.app_type.as_deref()) {
         plan.app_type = match app {
@@ -244,6 +253,21 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         plan.run_command = None;
         plan.port = None;
     }
+    if plan.app_type == AppType::Service && plan.deploy_port_explicit {
+        match plan.port {
+            Some(port) if (1024..=u16::MAX).contains(&port) => {}
+            Some(_) => {
+                return Err(CiaoError::Config(
+                    "[run].port must be between 1024 and 65535".to_owned(),
+                ))
+            }
+            None => {
+                return Err(CiaoError::Config(
+                    "[run].port must be set for an explicit service port".to_owned(),
+                ))
+            }
+        }
+    }
     if !plan.health.path.starts_with('/') || plan.health.path.contains(['\n', '\r', ' ']) {
         return Err(CiaoError::Config(
             "health.path must be an absolute URL path without whitespace".to_owned(),
@@ -254,7 +278,130 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
             "health.path must not contain query, fragment or parent-path segments".to_owned(),
         ));
     }
+    plan.binding_warning = detect_binding_warning(root, &plan);
     Ok(plan)
+}
+
+/// Look for the common explicit all-interface bind forms in application
+/// source. This is intentionally advisory: Ciao cannot prove a framework's
+/// effective bind address without starting it, and a warning is safer than
+/// rewriting project code or silently changing its behavior.
+fn detect_binding_warning(root: &Path, plan: &ProjectPlan) -> Option<String> {
+    if plan.app_type != AppType::Service {
+        return None;
+    }
+    let mut stack = vec![(root.to_path_buf(), 0_u8)];
+    let mut inspected = 0_usize;
+    while let Some((directory, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if inspected >= 256 {
+                break;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if depth < 3 && !is_binding_scan_ignored(path.file_name()) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() || !is_binding_source_file(&path) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > 512 * 1024 {
+                continue;
+            }
+            inspected += 1;
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if contents.lines().any(binding_line_is_explicit) {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                return Some(format!(
+                    "source `{relative}` appears to bind 0.0.0.0; bind the service to 127.0.0.1 so LAN clients cannot bypass Caddy/Funnel"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn is_binding_scan_ignored(name: Option<&std::ffi::OsStr>) -> bool {
+    matches!(
+        name.and_then(|name| name.to_str()),
+        Some(".git" | "node_modules" | "target" | "dist" | "build" | ".venv" | "venv")
+    )
+}
+
+fn is_binding_source_file(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+        || matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("cjs" | "go" | "js" | "jsx" | "mjs" | "py" | "rs" | "ts" | "tsx")
+        )
+}
+
+fn binding_line_is_explicit(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("0.0.0.0") {
+        return false;
+    }
+    lower.contains("host")
+        || lower.contains("bind")
+        || lower.contains("listen")
+        || lower.contains("serve")
+        || lower.contains("run")
+        || lower.contains("0.0.0.0:")
+}
+
+fn parse_funnel_config(config: Option<&FunnelConfigFile>, public: bool) -> Result<FunnelConfig> {
+    let Some(config) = config else {
+        return Ok(FunnelConfig {
+            enabled: false,
+            auth: if public {
+                FunnelAuth::None
+            } else {
+                FunnelAuth::Token
+            },
+        });
+    };
+    let auth = match config
+        .auth
+        .as_deref()
+        .unwrap_or(if public { "none" } else { "token" })
+    {
+        "token" => FunnelAuth::Token,
+        "none" if public => FunnelAuth::None,
+        "none" => {
+            return Err(CiaoError::Config(
+                "[funnel].auth = \"none\" requires [app] public = true".to_owned(),
+            ))
+        }
+        other => {
+            return Err(CiaoError::Config(format!(
+                "unsupported [funnel].auth `{other}`; use `token` or `none`"
+            )))
+        }
+    };
+    Ok(FunnelConfig {
+        enabled: config.enabled.unwrap_or(false),
+        auth,
+    })
 }
 
 /// Detect the common two-directory full-stack layout without requiring a
