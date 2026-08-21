@@ -4,6 +4,10 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [v0.1.12] - 2026-08-21
+
 - Add `ciao deploy <host> funnel` to install Tailscale when needed, configure a
   dedicated Caddy route and print a public Funnel URL after approval.
 - Deploy Node services without a `build` script: dependencies are installed and
