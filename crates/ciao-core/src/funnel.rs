@@ -33,8 +33,10 @@ pub fn enable_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Resul
     validate_domain(&hostname)?;
 
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let manifest = read_release_manifest(transport, &root, app, &release)?;
     ensure_single_funnel_hostname(transport, app)?;
     let token = match manifest.funnel.auth {
@@ -46,13 +48,16 @@ pub fn enable_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Resul
     let fragment_path = funnel_fragment_path(app);
     let previous = read_remote_file(transport, &fragment_path, "read existing Funnel route")?;
 
-    write_remote_file(
+    if let Err(error) = write_remote_file(
         transport,
         &fragment_path,
         &fragment,
         "root",
         "write Tailscale Funnel Caddy route",
-    )?;
+    ) {
+        restore_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
     if let Err(error) = remote_script(
         transport,
         "reload Caddy for Tailscale Funnel",
@@ -114,8 +119,10 @@ pub(crate) fn sync_tailscale_funnel_route_if_present(
     })?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let manifest = read_release_manifest(transport, &root, app, &release)?;
     let existing_token = read_funnel_token(transport, &root, app)?;
     let token = match manifest.funnel.auth {
@@ -131,18 +138,34 @@ pub(crate) fn sync_tailscale_funnel_route_if_present(
         funnel_caddy_fragment(transport, &root, app, &release, &hostname, token.as_deref())?;
     let changed = previous != fragment;
     if changed {
-        write_remote_file(
+        if let Err(error) = write_remote_file(
             transport,
             &fragment_path,
             &fragment,
             "root",
             "synchronize Tailscale Funnel Caddy route",
-        )?;
-        remote_script(
+        ) {
+            restore_fragment(
+                transport,
+                &fragment_path,
+                Some(previous.as_str()),
+                &platform.os,
+            );
+            return Err(error);
+        }
+        if let Err(error) = remote_script(
             transport,
             "reload Caddy for synchronized Funnel route",
             &caddy_reload_script(&platform.os),
-        )?;
+        ) {
+            restore_fragment(
+                transport,
+                &fragment_path,
+                Some(previous.as_str()),
+                &platform.os,
+            );
+            return Err(error);
+        }
     }
     remote_funnel_healthcheck(transport, &hostname, &manifest.health, token.as_deref())?;
     Ok(changed)

@@ -18,27 +18,36 @@ pub(super) fn configure_domain(
     validate_domain(domain)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let fragment = caddy_fragment(transport, &root, app, &release, domain)?;
     let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
+    let previous = read_remote_file(transport, &fragment_path, "read existing Caddy route")?;
     remote_script(
         transport,
         "prepare Caddy directory",
         "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
     )?;
-    write_remote_file(
+    if let Err(error) = write_remote_file(
         transport,
         &fragment_path,
         &fragment,
         "root",
         "write Caddy fragment",
-    )?;
-    remote_script(
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
+    if let Err(error) = remote_script(
         transport,
         "reload Caddy",
         &caddy_reload_script(&platform.os),
-    )?;
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -54,22 +63,31 @@ pub fn configure_domain_for_cloudflare(
     validate_domain(domain)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, domain, true)?;
     let fragment_path = format!("/etc/caddy/ciao/{app}.caddy");
-    write_remote_file(
+    let previous = read_remote_file(transport, &fragment_path, "read existing Caddy route")?;
+    if let Err(error) = write_remote_file(
         transport,
         &fragment_path,
         &fragment,
         "root",
         "write Cloudflare Caddy route",
-    )?;
-    remote_script(
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
+    if let Err(error) = remote_script(
         transport,
         "reload Caddy for Cloudflare",
         &caddy_reload_script(&platform.os),
-    )?;
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -81,27 +99,36 @@ pub fn configure_remote_ciao_domain(transport: &OpenSshTransport, app: &str) -> 
     let domain = local_domain(app)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let fragment = caddy_fragment_with_scheme(transport, &root, app, &release, &domain, true)?;
     let fragment_path = format!("/etc/caddy/ciao/{app}.local.caddy");
+    let previous = read_remote_file(transport, &fragment_path, "read existing local Ciao route")?;
     remote_script(
         transport,
         "prepare local Ciao Caddy directory",
         "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
     )?;
-    write_remote_file(
+    if let Err(error) = write_remote_file(
         transport,
         &fragment_path,
         &fragment,
         "root",
         "write local Ciao Caddy route",
-    )?;
-    remote_script(
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
+    if let Err(error) = remote_script(
         transport,
         "reload Caddy for local Ciao domain",
         &caddy_reload_script(&platform.os),
-    )?;
+    ) {
+        restore_caddy_fragment(transport, &fragment_path, previous.as_deref(), &platform.os);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -203,14 +230,54 @@ pub(super) fn configure_release_caddy_route(
     let fragment = caddy_fragment_with_scheme(transport, root, app, release, domain, local)?;
     let suffix = if local { ".local.caddy" } else { ".caddy" };
     let path = format!("/etc/caddy/ciao/{app}{suffix}");
+    let previous = read_remote_file(transport, &path, "read existing Caddy route")?;
     remote_script(
         transport,
         "prepare Caddy directory",
         "set -eu\nsudo -n install -d -m 0755 /etc/caddy/ciao\n",
     )?;
-    write_remote_file(transport, &path, &fragment, "root", "write Caddy route")?;
-    remote_script(transport, "reload Caddy", &caddy_reload_script(os))?;
+    if let Err(error) = write_remote_file(transport, &path, &fragment, "root", "write Caddy route")
+    {
+        restore_caddy_fragment(transport, &path, previous.as_deref(), os);
+        return Err(error);
+    }
+    if let Err(error) = remote_script(transport, "reload Caddy", &caddy_reload_script(os)) {
+        restore_caddy_fragment(transport, &path, previous.as_deref(), os);
+        return Err(error);
+    }
     Ok(())
+}
+
+/// Restore the last known-good fragment after a Caddy validation/reload
+/// failure. The deploy path treats proxy configuration as best effort, so a
+/// broken candidate must not leave a half-written route behind.
+fn restore_caddy_fragment(
+    transport: &OpenSshTransport,
+    path: &str,
+    previous: Option<&str>,
+    os: &HostOs,
+) {
+    let restore = match previous {
+        Some(contents) => write_remote_file(
+            transport,
+            path,
+            contents,
+            "root",
+            "restore previous Caddy route",
+        ),
+        None => remote_script(
+            transport,
+            "remove failed Caddy route",
+            &format!("set -eu\nsudo -n rm -f {}\n", shell_quote(path)),
+        )
+        .map(|_| ()),
+    };
+    let _ = restore;
+    let _ = remote_script(
+        transport,
+        "reload Caddy after failed route update",
+        &caddy_reload_script(os),
+    );
 }
 
 pub(super) fn read_existing_domain<T: RemoteHost + ?Sized>(

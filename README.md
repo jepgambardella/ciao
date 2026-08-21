@@ -101,6 +101,11 @@ prints a stable `https://<host>.<tailnet>.ts.net` URL. Funnel is public to the
 whole Internet. To turn this route off, run `sudo tailscale funnel --https=443 off`
 on the host.
 
+The deploy does not require a TTY when the target is already connected to
+Tailscale and Funnel is already approved. In CI or another non-interactive run,
+an unauthenticated target returns the exact Tailscale login or approval URL;
+complete it once, then rerun the deploy.
+
 For service apps, declare the application port in `ciao.toml` before using
 Funnel:
 
@@ -141,6 +146,13 @@ auth = "none"
 Ciao keeps Funnel on the machine hostname and synchronizes its Caddy upstream
 after every deploy and rollback. A host can expose one Ciao Funnel hostname at
 a time; use separate hosts for separate public apps.
+
+On Linux, status and release listings read the release from the active systemd
+slot. If an interrupted deploy left `current` or `active-slot` stale, Ciao
+reports the serving release and repairs the bookkeeping during the next deploy
+or rollback. Activation verifies the final symlink target; proxy reload errors
+are reported as warnings and restore the previous route, so a healthy service
+is not rolled back only because Caddy or a tunnel is unavailable.
 
 Ciao also prints an advisory when it finds an explicit `0.0.0.0` bind in a
 service source file. `HOST=127.0.0.1` is exported to the generated start
@@ -215,6 +227,8 @@ project commands, like build and start commands, and their output is bounded.
 Bulk environment management avoids copying secrets through the terminal:
 
 ```bash
+printf '%s' 'secret-value' | ciao env set home my-app API_TOKEN
+ciao env set home my-app API_TOKEN=secret-value # convenient for non-secret values
 ciao env pull home my-app              # names only, writes .env.ciao
 ciao env pull home my-app --with-values
 ciao env diff home my-app
@@ -224,7 +238,8 @@ ciao env generate home my-app JWT_SECRET
 
 `env push` shows key-only additions, changes and removals and requires
 confirmation. `env generate` uses the operating system CSPRNG and never prints
-the generated value.
+the generated value. `env set` accepts either `KEY=value` or a bare `KEY`; the
+bare form reads the value from stdin and is the safer choice for secrets.
 
 Inspect host drift without changing anything:
 

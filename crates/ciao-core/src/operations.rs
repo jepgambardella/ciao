@@ -6,7 +6,12 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
     validate_identifier("app name", app)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?;
+    let current_release = read_current_release(transport, &root, app)?;
+    let active_service = active_service(transport, &platform.os, &root, app)?;
+    let release = active_service
+        .as_ref()
+        .and_then(|service| service.release.clone())
+        .or_else(|| current_release.clone());
     let manifest = release
         .as_deref()
         .map(|release| read_release_manifest(transport, &root, app, release))
@@ -15,24 +20,36 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
         Some(AppType::Static) => "active".to_owned(),
         Some(AppType::Service) | None => match &platform.os {
             HostOs::Linux | HostOs::MacOs => {
-                let unit = if let Some(slot) = read_active_slot(transport, &root, app)? {
-                    slot_service_unit_name(app, slot)?
-                } else {
-                    service_unit_name(app, false)
-                };
+                let unit = active_service
+                    .as_ref()
+                    .map(|service| service.unit.clone())
+                    .or_else(|| {
+                        read_active_slot(transport, &root, app)
+                            .ok()
+                            .flatten()
+                            .and_then(|slot| slot_service_unit_name(app, slot).ok())
+                    })
+                    .unwrap_or_else(|| service_unit_name(app, false));
                 service_state(transport, &platform.os, &unit)?
             }
             HostOs::Unknown(_) => "unsupported".to_owned(),
         },
     };
     let cloudflare = cloudflare_tunnel_status(transport, app)?;
-    let message = match cloudflare.as_ref() {
+    let mut message = match cloudflare.as_ref() {
         Some(tunnel) => format!(
             "{app}: {status}\n  Cloudflare: https://{} (port {})",
             tunnel.hostname, tunnel.port
         ),
         None => format!("{app}: {status}"),
     };
+    if current_release.as_deref() != release.as_deref() {
+        if let (Some(current), Some(active)) = (current_release.as_deref(), release.as_deref()) {
+            message.push_str(&format!(
+                "\n  release drift: current points to {current}, active service serves {active}"
+            ));
+        }
+    }
     Ok(StatusResult {
         app: app.to_owned(),
         status: status.clone(),
@@ -78,9 +95,11 @@ pub fn remove_app(transport: &OpenSshTransport, app: &str) -> Result<OperationRe
     validate_identifier("app name", app)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let manifest = read_current_release(transport, &root, app)?
-        .map(|release| read_release_manifest(transport, &root, app, &release))
-        .transpose()?;
+    let current = read_current_release(transport, &root, app)?;
+    let manifest =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .map(|release| read_release_manifest(transport, &root, app, &release))
+            .transpose()?;
     let serve_ports = list_releases(transport, app)?
         .into_iter()
         .filter_map(|release| release.port)
@@ -138,6 +157,8 @@ pub fn list_releases<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
     let current = read_current_release(transport, &root, app)?;
+    let active_release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?;
     let output = remote_script(
         transport,
         "list releases",
@@ -159,7 +180,7 @@ pub fn list_releases<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result
         releases.push(ReleaseInfo {
             app: app.to_owned(),
             release: release.to_owned(),
-            active: current.as_deref() == Some(release),
+            active: active_release.as_deref() == Some(release),
             runtime: manifest.runtime,
             app_type: manifest.app_type,
             port: manifest.port,
@@ -185,7 +206,10 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
         ));
     }
     let root = host_app_root(&platform.os);
-    if let Some(release) = read_current_release(transport, &root, app)? {
+    let current = read_current_release(transport, &root, app)?;
+    if let Some(release) =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+    {
         let manifest = read_release_manifest(transport, &root, app, &release)?;
         if manifest.app_type == AppType::Static {
             return Err(CiaoError::Config(format!(
@@ -195,7 +219,9 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
     }
     let result = match platform.os {
         HostOs::Linux => {
-            let unit = if let Some(slot) = read_active_slot(transport, &root, app)? {
+            let unit = if let Some(active) = active_service(transport, &platform.os, &root, app)? {
+                active.unit
+            } else if let Some(slot) = read_active_slot(transport, &root, app)? {
                 slot_service_unit_name(app, slot)?
             } else {
                 service_unit_name(app, false)
@@ -260,7 +286,9 @@ pub fn follow_app_logs(transport: &OpenSshTransport, app: &str, since: Option<&s
                 .transpose()?
                 .unwrap_or_default();
             let root = host_app_root(&platform.os);
-            let unit = if let Some(slot) = read_active_slot(transport, &root, app)? {
+            let unit = if let Some(active) = active_service(transport, &platform.os, &root, app)? {
+                active.unit
+            } else if let Some(slot) = read_active_slot(transport, &root, app)? {
                 slot_service_unit_name(app, slot)?
             } else {
                 service_unit_name(app, false)
@@ -297,7 +325,10 @@ pub fn lifecycle_action<T: RemoteHost + ?Sized>(
     validate_identifier("app name", app)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    if let Some(release) = read_current_release(transport, &root, app)? {
+    let current = read_current_release(transport, &root, app)?;
+    if let Some(release) =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+    {
         let manifest = read_release_manifest(transport, &root, app, &release)?;
         if manifest.app_type == AppType::Static {
             return Err(CiaoError::Config(format!(
@@ -305,7 +336,9 @@ pub fn lifecycle_action<T: RemoteHost + ?Sized>(
             )));
         }
     }
-    let unit = if let Some(slot) = read_active_slot(transport, &root, app)? {
+    let unit = if let Some(active) = active_service(transport, &platform.os, &root, app)? {
+        active.unit
+    } else if let Some(slot) = read_active_slot(transport, &root, app)? {
         slot_service_unit_name(app, slot)?
     } else {
         service_unit_name(app, false)
@@ -331,7 +364,12 @@ pub fn rollback_to(
     validate_identifier("app name", app)?;
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let current = read_current_release(transport, &root, app)?
+    let current_symlink = read_current_release(transport, &root, app)?;
+    let active_service_state = active_service(transport, &platform.os, &root, app)?;
+    let current = active_service_state
+        .as_ref()
+        .and_then(|service| service.release.clone())
+        .or(current_symlink)
         .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let previous = match target_release {
         Some(target) => {
@@ -358,7 +396,13 @@ pub fn rollback_to(
     let current_manifest = read_release_manifest(transport, &root, app, &current)?;
     let manifest = read_release_manifest(transport, &root, app, &previous)?;
     let active_slot = if platform.os == HostOs::Linux {
-        read_active_slot(transport, &root, app)?
+        let service_slot = active_service_state
+            .as_ref()
+            .and_then(|service| active_slot_from_unit(&service.unit));
+        match service_slot {
+            Some(slot) => Some(slot),
+            None => read_active_slot(transport, &root, app)?,
+        }
     } else {
         None
     };
@@ -477,6 +521,7 @@ pub fn rollback_to(
         configure_remote_ciao_domain(transport, app)?;
         sync_tailscale_funnel_route_if_present(transport, app)?;
         sync_cloudflare_tunnel_if_present(transport, app)?;
+        reconcile_current_to_active(transport, &platform.os, &root, app)?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = activation {
@@ -583,6 +628,7 @@ pub fn rollback_to(
             configure_remote_ciao_domain(transport, app)?;
             sync_tailscale_funnel_route_if_present(transport, app)?;
             sync_cloudflare_tunnel_if_present(transport, app)?;
+            reconcile_current_to_active(transport, &platform.os, &root, app)?;
             Ok::<(), CiaoError>(())
         })();
         let recovery = match restore {
@@ -611,10 +657,17 @@ pub fn rollback_to(
             "run rollback hook",
         )?;
     }
+    let active_after_rollback = active_service(transport, &platform.os, &root, app)
+        .ok()
+        .and_then(|service| service.and_then(|value| value.release))
+        .or_else(|| read_current_release(transport, &root, app).ok().flatten())
+        .unwrap_or_else(|| previous.clone());
     Ok(OperationResult {
         app: app.to_owned(),
         action: "rollback".to_owned(),
         changed: true,
-        message: format!("✓ rolled back {app} from {current} to {previous}"),
+        message: format!(
+            "✓ rolled back {app} from {current} to {previous}; active release `{active_after_rollback}`"
+        ),
     })
 }

@@ -6,6 +6,26 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.17] - 2026-08-21
+
+- Fix Linux `current` activation: replace the symlink with `mv -fT`, verify the
+  final target, and remove abandoned temporary pointers from app and release
+  directories.
+- Read the release and port served by the active systemd unit for `status`,
+  `apps`, `releases`, logs, rollback, Funnel and Cloudflare synchronization;
+  reconcile stale `current` and slot markers and report the real release after
+  rollback recovery.
+- Make Caddy, Funnel and Cloudflare route refreshes transactional. A failed
+  proxy reload restores the previous fragment/config and no longer rolls back
+  an otherwise healthy application deploy; the result includes a warning.
+- Keep the previous service slot alive when a Caddy route cannot be reloaded,
+  avoiding an unnecessary traffic black hole.
+- Allow non-interactive Funnel setup to return the exact Tailscale login or
+  approval URL. Native Cloudflare Tunnel setup can continue without a working
+  local `:443` Caddy listener.
+- Accept `ciao env set HOST=value` while preserving the stdin form for secrets;
+  document both forms and add parser coverage.
+
 ## [v0.1.16] - 2026-08-21
 
 - Do not require a TTY for Cloudflare Tunnel deploys when the local account is

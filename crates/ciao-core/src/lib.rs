@@ -58,7 +58,8 @@ pub use operations::{
 };
 pub use project::{detect_project, detect_project_components};
 use service_slots::{
-    active_slot_path, opposite_slot, read_active_slot, slot_service_unit_name, write_active_slot,
+    active_service, active_slot_from_unit, active_slot_path, opposite_slot, read_active_slot,
+    reconcile_current_to_active, slot_service_unit_name, write_active_slot,
 };
 pub use transaction::{deploy_full_stack_with_mode, FullStackDeployResult};
 
@@ -4866,7 +4867,12 @@ pub fn cloudflare_tunnel_setup_with_config(
         ),
     )?;
     let port = active_cloudflare_port(transport, app)?;
-    configure_domain_for_cloudflare(transport, app, &config.hostname)?;
+    // Cloudflare can proxy directly to the active loopback port. Keep the
+    // optional Caddy route in sync when possible, but do not make a native
+    // Tunnel depend on a local :443 listener or a healthy Caddy admin API.
+    let caddy_warning = configure_domain_for_cloudflare(transport, app, &config.hostname)
+        .err()
+        .map(|error| format!("; Caddy route skipped: {error}"));
     let remote_config = "/etc/cloudflared/config.yml";
     let contents = cloudflare_config_contents(
         app,
@@ -4899,8 +4905,9 @@ pub fn cloudflare_tunnel_setup_with_config(
         tunnel: tunnel_name,
         port,
         message: format!(
-            "Cloudflare Tunnel is active for {} (port {port})",
-            config.hostname
+            "Cloudflare Tunnel is active for {} (port {port}){}",
+            config.hostname,
+            caddy_warning.as_deref().unwrap_or_default()
         ),
     })
 }
@@ -4924,8 +4931,10 @@ fn cloudflare_config_contents(
 fn active_cloudflare_port<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<u16> {
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     let manifest = read_release_manifest(transport, &root, app, &release)?;
     Ok(manifest.port.unwrap_or(80))
 }
@@ -4933,8 +4942,10 @@ fn active_cloudflare_port<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> R
 fn read_active_health<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<HealthConfig> {
     let platform = transport.inspect()?;
     let root = host_app_root(&platform.os);
-    let release = read_current_release(transport, &root, app)?
-        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let current = read_current_release(transport, &root, app)?;
+    let release =
+        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+            .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
     Ok(read_release_manifest(transport, &root, app, &release)?.health)
 }
 
@@ -5089,18 +5100,38 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
             &config.hostname,
             port,
         );
-        write_remote_file(
+        let restore = || {
+            let _ = write_remote_file(
+                transport,
+                "/etc/cloudflared/config.yml",
+                &contents,
+                "root",
+                "restore previous Cloudflare Tunnel configuration",
+            );
+            let _ = remote_script(
+                transport,
+                "reload Cloudflare Tunnel after restore",
+                &cloudflared_reload_script(&platform.os),
+            );
+        };
+        if let Err(error) = write_remote_file(
             transport,
             "/etc/cloudflared/config.yml",
             &updated,
             "root",
             "synchronize Cloudflare Tunnel ingress",
-        )?;
-        remote_script(
+        ) {
+            restore();
+            return Err(error);
+        }
+        if let Err(error) = remote_script(
             transport,
             "reload Cloudflare Tunnel",
             &cloudflared_reload_script(&platform.os),
-        )?;
+        ) {
+            restore();
+            return Err(error);
+        }
     }
     let health = read_active_health(transport, app)?;
     cloudflare_public_healthcheck(transport, &config.hostname, &health)?;
@@ -6327,7 +6358,14 @@ fn deploy_unlocked(
     let platform = progress_step(reporter, "prepare deployment", || transport.inspect())?;
     let root = host_app_root(&platform.os);
     let previous_release = read_current_release(transport, &root, &plan.name)?;
-    let retained_domain = read_existing_domain(transport, &plan.name)?;
+    let mut warnings = Vec::new();
+    let retained_domain = match read_existing_domain(transport, &plan.name) {
+        Ok(domain) => domain,
+        Err(error) => {
+            warnings.push(format!("existing domain route could not be read: {error}"));
+            None
+        }
+    };
     let effective_domain = domain.or(retained_domain.as_deref());
     let port = if plan.app_type == AppType::Static {
         None
@@ -6583,7 +6621,8 @@ fn deploy_unlocked(
                     let slot =
                         candidate_slot.expect("Linux service deployments have a candidate slot");
                     let candidate_unit = slot_service_unit_name(&plan.name, slot)?;
-                    configure_release_caddy_route(
+                    let mut proxy_ready = true;
+                    if let Err(error) = configure_release_caddy_route(
                         transport,
                         &platform.os,
                         &root,
@@ -6591,11 +6630,14 @@ fn deploy_unlocked(
                         &release,
                         &local_domain(&plan.name)?,
                         true,
-                    )?;
+                    ) {
+                        proxy_ready = false;
+                        warnings.push(format!("local Ciao route unavailable: {error}"));
+                    }
                     if let Some(domain) = effective_domain {
                         let cloudflare =
                             existing_domain_is_plain_http(transport, &plan.name).unwrap_or(false);
-                        configure_release_caddy_route(
+                        if let Err(error) = configure_release_caddy_route(
                             transport,
                             &platform.os,
                             &root,
@@ -6603,7 +6645,10 @@ fn deploy_unlocked(
                             &release,
                             domain,
                             cloudflare,
-                        )?;
+                        ) {
+                            proxy_ready = false;
+                            warnings.push(format!("domain route unavailable: {error}"));
+                        }
                     }
                     remote_script(
                         transport,
@@ -6624,21 +6669,28 @@ fn deploy_unlocked(
                     )?;
                     disable_service(transport, &platform.os, &stable_unit)?;
                     enable_service(transport, &platform.os, &candidate_unit)?;
-                    if let Some(old_slot) = active_slot {
-                        let old_unit = slot_service_unit_name(&plan.name, old_slot)?;
-                        let _ = service_action(
-                            transport,
-                            &platform.os,
-                            &old_unit,
-                            LifecycleAction::Stop,
-                        );
-                        let _ = disable_service(transport, &platform.os, &old_unit);
+                    if proxy_ready || active_slot.is_none() {
+                        if let Some(old_slot) = active_slot {
+                            let old_unit = slot_service_unit_name(&plan.name, old_slot)?;
+                            let _ = service_action(
+                                transport,
+                                &platform.os,
+                                &old_unit,
+                                LifecycleAction::Stop,
+                            );
+                            let _ = disable_service(transport, &platform.os, &old_unit);
+                        } else {
+                            let _ = service_action(
+                                transport,
+                                &platform.os,
+                                &stable_unit,
+                                LifecycleAction::Stop,
+                            );
+                        }
                     } else {
-                        let _ = service_action(
-                            transport,
-                            &platform.os,
-                            &stable_unit,
-                            LifecycleAction::Stop,
+                        warnings.push(
+                            "previous service slot kept running because a Caddy route was not reloaded"
+                                .to_owned(),
                         );
                     }
                     write_active_slot(transport, &root, &plan.name, slot)?;
@@ -6694,6 +6746,9 @@ fn deploy_unlocked(
                 }
             })?;
         }
+        progress_step(reporter, "reconcile active release", || {
+            reconcile_current_to_active(transport, &platform.os, &root, &plan.name).map(|_| ())
+        })?;
         if let Some(command) = plan.hooks.post_activate.as_deref() {
             progress_step(reporter, "post-activate hook", || {
                 run_remote_hook(
@@ -6707,26 +6762,36 @@ fn deploy_unlocked(
                 )
             })?;
         }
-        progress_step(reporter, "configure local Ciao domain", || {
+        if let Err(error) = progress_step(reporter, "configure local Ciao domain", || {
             configure_remote_ciao_domain(transport, &plan.name)
-        })?;
-        progress_step(reporter, "synchronize Funnel route", || {
+        }) {
+            warnings.push(format!("local Ciao route unavailable: {error}"));
+        }
+        if let Err(error) = progress_step(reporter, "synchronize Funnel route", || {
             sync_tailscale_funnel_route_if_present(transport, &plan.name).map(|_| ())
-        })?;
-        progress_step(reporter, "synchronize Cloudflare Tunnel", || {
+        }) {
+            warnings.push(format!("Funnel route not synchronized: {error}"));
+        }
+        if let Err(error) = progress_step(reporter, "synchronize Cloudflare Tunnel", || {
             sync_cloudflare_tunnel_if_present(transport, &plan.name).map(|_| ())
-        })?;
+        }) {
+            warnings.push(format!("Cloudflare Tunnel not synchronized: {error}"));
+        }
         if let Some(domain) = effective_domain {
-            progress_step(reporter, "configure domain", || {
+            if let Err(error) = progress_step(reporter, "configure domain", || {
                 if existing_domain_is_plain_http(transport, &plan.name)? {
                     configure_domain_for_cloudflare(transport, &plan.name, domain)
                 } else {
                     configure_domain(transport, &plan.name, domain)
                 }
-            })?;
-            progress_step(reporter, "domain smoke check", || {
+            }) {
+                warnings.push(format!("domain route unavailable: {error}"));
+            }
+            if let Err(error) = progress_step(reporter, "domain smoke check", || {
                 remote_domain_healthcheck(transport, domain, &plan.health)
-            })?;
+            }) {
+                warnings.push(format!("domain smoke check skipped: {error}"));
+            }
         }
         progress_step(reporter, "prune old releases", || {
             prune_releases(transport, &root, &plan.name, plan.release_keep)
@@ -6885,6 +6950,7 @@ fn deploy_unlocked(
         // leaving a partial release behind when cancellation interrupts a
         // preceding SSH session.
         let _ = cleanup_release(transport, &platform.os, &plan.name, &release);
+        let _ = reconcile_current_to_active(transport, &platform.os, &root, &plan.name);
         let rollback_hook_message = if previous_release.is_some() {
             plan.hooks
                 .on_rollback
@@ -6906,10 +6972,30 @@ fn deploy_unlocked(
         } else {
             String::new()
         };
-        let active_message = previous_release
-            .as_deref()
-            .map(|previous| format!("previous release `{previous}` was restored when possible"))
-            .unwrap_or_else(|| "no previous release existed".to_owned());
+        let current_after_recovery = read_current_release(transport, &root, &plan.name)
+            .ok()
+            .flatten();
+        let active_after_recovery = effective_release_for_app(
+            transport,
+            &platform.os,
+            &root,
+            &plan.name,
+            current_after_recovery.as_deref(),
+        )
+        .ok()
+        .flatten();
+        let active_message = match (previous_release.as_deref(), active_after_recovery.as_deref()) {
+            (Some(previous), Some(active)) => format!(
+                "previous release `{previous}` was requested; active release after recovery: `{active}`"
+            ),
+            (Some(previous), None) => format!(
+                "previous release `{previous}` was requested; no active release after recovery"
+            ),
+            (None, Some(active)) => {
+                format!("no previous release existed; active release after recovery: `{active}`")
+            }
+            (None, None) => "no previous or active release exists after recovery".to_owned(),
+        };
         return Err(CiaoError::Deployment {
             stage: "deploy".to_owned(),
             message: format!("{}; {active_message}{rollback_hook_message}", error),
@@ -6923,7 +7009,14 @@ fn deploy_unlocked(
         port,
         active: true,
         dry_run: false,
-        message: format!("✓ release {release} active"),
+        message: if warnings.is_empty() {
+            format!("✓ release {release} active")
+        } else {
+            format!(
+                "✓ release {release} active; warnings: {}",
+                warnings.join("; ")
+            )
+        },
     })
 }
 
@@ -7095,6 +7188,24 @@ fn read_current_release<T: RemoteHost + ?Sized>(
         validate_identifier("release", value)?;
         Ok(Some(value.to_owned()))
     }
+}
+
+/// Return the release that is actually backing the service, falling back to
+/// the `current` symlink when the host is not using Linux service slots or the
+/// service manager has no active unit yet.
+fn effective_release_for_app<T: RemoteHost + ?Sized>(
+    transport: &T,
+    os: &HostOs,
+    root: &str,
+    app: &str,
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(active) = active_service(transport, os, root, app)? {
+        if let Some(release) = active.release {
+            return Ok(Some(release));
+        }
+    }
+    Ok(current.map(str::to_owned))
 }
 
 fn previous_release(
@@ -7365,12 +7476,38 @@ fn switch_current_script(os: &HostOs, root: &str, app: &str, release_path: &str)
         HostOs::MacOs => "wheel",
         _ => "root",
     };
+    let move_current = match os {
+        // GNU mv needs -T here: without it, a `current` symlink to a
+        // directory is treated as a destination directory and the temporary
+        // symlink is moved inside the old release instead of replacing it.
+        HostOs::MacOs => "sudo -n rm -f \"$current\"\nsudo -n mv -f \"$tmp\" \"$current\"",
+        _ => "sudo -n mv -fT \"$tmp\" \"$current\"",
+    };
     let app_root = format!("{root}/{app}");
     format!(
-        "set -eu\napp_root={}\ncurrent=\"$app_root/current\"\ntmp=\"$app_root/.current-$$\"\ntrap 'sudo -n rm -f \"$tmp\"' EXIT\nsudo -n test -d {}\nif sudo -n test -e \"$current\" && ! sudo -n test -L \"$current\"; then echo 'current exists but is not a symlink' >&2; exit 1; fi\nsudo -n rm -f \"$tmp\"\nsudo -n ln -s {} \"$tmp\"\nsudo -n chown -h root:{group} \"$tmp\"\nsudo -n mv -f \"$tmp\" \"$current\"\ntrap - EXIT\n",
+        r#"set -eu
+app_root={}
+current="$app_root/current"
+tmp="$app_root/.current-$$"
+trap 'sudo -n rm -f "$tmp"' EXIT
+sudo -n test -d {}
+if sudo -n test -e "$current" && ! sudo -n test -L "$current"; then echo 'current exists but is not a symlink' >&2; exit 1; fi
+for stale in "$app_root"/.current-* "$app_root"/releases/.current-* "$app_root"/releases/*/.current-*; do
+    if sudo -n test -e "$stale" || sudo -n test -L "$stale"; then sudo -n rm -f "$stale"; fi
+done
+sudo -n ln -s {} "$tmp"
+sudo -n chown -h root:{group} "$tmp"
+{move_current}
+actual=$(sudo -n readlink "$current")
+expected={}
+[ "$actual" = "$expected" ] || {{ echo "current symlink verification failed: expected $expected, got $actual" >&2; exit 1; }}
+trap - EXIT
+"#,
         shell_quote(&app_root),
         shell_quote(release_path),
         shell_quote(release_path),
+        shell_quote(release_path),
+        move_current = move_current,
     )
 }
 
@@ -8660,6 +8797,10 @@ mod tests {
         assert!(script.contains(".current-$$"));
         assert!(script.contains("mv -f"));
         assert!(script.contains("chown -h root:root"));
+        assert!(script.contains("current symlink verification failed"));
+        assert!(script.contains("for stale in"));
+        assert!(script.contains("mv -fT"));
+        assert!(script.contains("releases/*/.current-*"));
         assert!(!script.contains("ln -sfn"));
     }
 

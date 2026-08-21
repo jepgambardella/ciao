@@ -50,7 +50,15 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
         .collect::<BTreeSet<_>>();
     audit_cloudflare_exposure(transport, &app_names, &mut items)?;
     for app in &apps {
-        let Some(release) = read_current_release(transport, &root, &app.app)? else {
+        let current = read_current_release(transport, &root, &app.app)?;
+        let Some(release) = effective_release_for_app(
+            transport,
+            &platform.os,
+            &root,
+            &app.app,
+            current.as_deref(),
+        )?
+        else {
             items.push(AuditItem {
                 path: format!("{root}/{}/current", app.app),
                 status: "missing".to_owned(),
@@ -59,6 +67,14 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
             });
             continue;
         };
+        if current.as_deref() != Some(release.as_str()) {
+            items.push(AuditItem {
+                path: format!("{root}/{}/current", app.app),
+                status: "drift".to_owned(),
+                expected: Some(format!("active release {release}")),
+                actual: current,
+            });
+        }
         let manifest = read_release_manifest(transport, &root, &app.app, &release)?;
         let local_domain = local_domain(&app.app)?;
         let local_expected =
@@ -343,7 +359,10 @@ fn audit_cloudflare_exposure(
         }
         let platform = transport.inspect()?;
         let root = host_app_root(&platform.os);
-        if let Some(release) = read_current_release(transport, &root, app)? {
+        let current = read_current_release(transport, &root, app)?;
+        if let Some(release) =
+            effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
+        {
             let manifest = read_release_manifest(transport, &root, app, &release)?;
             let expected_port = manifest.port.unwrap_or(80);
             if expected_port != config.port {

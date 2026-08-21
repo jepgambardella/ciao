@@ -263,6 +263,9 @@ enum EnvCommand {
     Set {
         host: String,
         app: String,
+        /// Environment key. Use KEY=value for a direct value, or KEY and
+        /// provide the value on stdin (recommended for secrets).
+        #[arg(value_name = "KEY[=VALUE]")]
         key: String,
     },
     Unset {
@@ -496,12 +499,6 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Deploy(args) => {
-            if args.action.is_some() && (cli.json || args.ci) {
-                return Err(CiaoError::Config(
-                    "`deploy funnel` requires a normal interactive terminal; omit `--json` and `--ci`"
-                        .to_owned(),
-                ));
-            }
             let path = args.path.canonicalize()?;
             let mut components = detect_project_components(&path)?;
             let mut plan = if components.is_empty() {
@@ -578,17 +575,6 @@ fn run(cli: Cli) -> Result<()> {
             let progress = TerminalProgress::new();
             let interactive_output =
                 !cli.json && !args.ci && io::stdin().is_terminal() && io::stderr().is_terminal();
-            let funnel_declared = matches!(args.action, Some(DeployAction::Funnel))
-                || components
-                    .iter()
-                    .any(|component| component.plan.funnel.enabled)
-                || plan.as_ref().is_some_and(|plan| plan.funnel.enabled);
-            if funnel_declared && !args.dry_run && !interactive_output {
-                return Err(CiaoError::Config(
-                    "Funnel setup requires an interactive terminal for the Tailscale approval flow; run the deploy from a terminal"
-                        .to_owned(),
-                ));
-            }
             if cloudflare_declared
                 && !args.dry_run
                 && !interactive_output
@@ -654,8 +640,9 @@ fn run(cli: Cli) -> Result<()> {
                                     .to_owned(),
                             )
                         })?;
-                    let funnel = setup_tailscale_funnel(&transport, app)?;
-                    println!("{}", funnel.message);
+                    let funnel =
+                        setup_tailscale_funnel_with_mode(&transport, app, interactive_output)?;
+                    print_setup_message(&funnel.message, cli.json || !interactive_output);
                 }
                 if !args.dry_run {
                     if let Some((app, tunnel)) = declared_tunnel.as_ref() {
@@ -726,11 +713,14 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("Would synchronize the Cloudflare Tunnel ingress after deployment.");
             }
             output(&result, cli.json, || result.message.clone());
+            if !args.dry_run
+                && (matches!(args.action, Some(DeployAction::Funnel)) || plan.funnel.enabled)
+            {
+                let funnel =
+                    setup_tailscale_funnel_with_mode(&transport, &result.app, interactive_output)?;
+                print_setup_message(&funnel.message, cli.json || !interactive_output);
+            }
             if !args.ci && !args.dry_run && interactive_output {
-                if matches!(args.action, Some(DeployAction::Funnel)) || plan.funnel.enabled {
-                    let funnel = setup_tailscale_funnel(&transport, &result.app)?;
-                    println!("{}", funnel.message);
-                }
                 if let Err(error) = offer_remote_local_domain(&transport, &result.app) {
                     eprintln!(
                         "! deployment succeeded, but local .ciao routing was not configured: {error}"
@@ -742,7 +732,7 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            if cloudflare_declared && !args.dry_run && !cli.json {
+            if cloudflare_declared && !args.dry_run {
                 if let Some((_, tunnel)) = declared_tunnel.as_ref() {
                     if let Err(error) =
                         setup_cloudflare_tunnel_with_config(&transport, &result.app, tunnel)
@@ -862,7 +852,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ui { host, port } => run_ui(&host, port),
         Command::Env { command } => match command {
             EnvCommand::Set { host, app, key } => {
-                let value = read_secret_value()?;
+                let (key, inline_value) = parse_env_assignment(&key)?;
+                let value = inline_value.unwrap_or(read_secret_value()?);
                 let transport =
                     authorized_transport_for(&host, cli.json, "setting an environment variable")?;
                 set_env(&transport, &app, &key, &value)?;
@@ -1216,7 +1207,11 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<FunnelResult> {
+fn setup_tailscale_funnel_with_mode(
+    transport: &OpenSshTransport,
+    app: &str,
+    interactive: bool,
+) -> Result<FunnelResult> {
     let platform = transport.inspect()?;
     let installation = ensure_tailscale_target(transport, &platform.os)?;
     if installation.installed {
@@ -1226,6 +1221,12 @@ fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<Fun
     }
 
     if let Some(url) = start_tailscale_auth(transport)? {
+        if !interactive {
+            let _ = stop_tailscale_auth(transport);
+            return Err(CiaoError::Config(format!(
+                "Tailscale login is required before a non-interactive Funnel deploy. Open {url}, complete sign-in, then rerun Ciao"
+            )));
+        }
         eprintln!("Ciao is opening the target Tailscale sign-in page in your browser.");
         if let Err(error) = open_tailscale_auth_url(&url) {
             eprintln!("{error}");
@@ -1240,6 +1241,11 @@ fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<Fun
             let Some(url) = tailscale_funnel_approval_url(&error) else {
                 return Err(error);
             };
+            if !interactive {
+                return Err(CiaoError::Config(format!(
+                    "Tailscale Funnel approval is required before a non-interactive deploy. Open {url}, approve Funnel, then rerun Ciao"
+                )));
+            }
             eprintln!("Ciao is opening the Tailscale Funnel approval page in your browser.");
             if let Err(open_error) = open_tailscale_auth_url(&url) {
                 eprintln!("{open_error}");
@@ -1250,6 +1256,14 @@ fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<Fun
             io::stdin().read_line(&mut line)?;
             enable_tailscale_funnel(transport, app)
         }
+    }
+}
+
+fn print_setup_message(message: &str, stderr: bool) {
+    if stderr {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
     }
 }
 
@@ -2771,6 +2785,14 @@ fn read_secret_value() -> Result<String> {
     Ok(value)
 }
 
+fn parse_env_assignment(input: &str) -> Result<(String, Option<String>)> {
+    let (key, value) = input
+        .split_once('=')
+        .map_or((input, None), |(key, value)| (key, Some(value.to_owned())));
+    validate_env_key(key)?;
+    Ok((key.to_owned(), value))
+}
+
 fn diff_is_empty(diff: &EnvDiff) -> bool {
     diff.added.is_empty() && diff.modified.is_empty() && diff.removed.is_empty()
 }
@@ -2816,5 +2838,26 @@ fn confirm_env_push(diff: &EnvDiff, yes: bool, json_output: bool) -> Result<()> 
         Ok(())
     } else {
         Err(CiaoError::Config("environment was not changed".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env_assignment;
+
+    #[test]
+    fn env_assignment_accepts_inline_values_with_equals() {
+        assert_eq!(
+            parse_env_assignment("TOKEN=a=b=c").unwrap(),
+            ("TOKEN".to_owned(), Some("a=b=c".to_owned()))
+        );
+    }
+
+    #[test]
+    fn env_assignment_without_value_uses_stdin() {
+        assert_eq!(
+            parse_env_assignment("TOKEN").unwrap(),
+            ("TOKEN".to_owned(), None)
+        );
     }
 }
