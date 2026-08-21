@@ -68,8 +68,8 @@ ciao deploy home --domain app.example.com
 ```
 
 Ciao installs `cloudflared` when needed, opens the Cloudflare sign-in page once,
-creates or reuses a standard tunnel, creates the DNS route and starts the
-standard `cloudflared` service on the host.
+creates or reuses a standard tunnel, creates the DNS route and starts one
+shared `cloudflared` service on the host.
 
 For a tunnel that belongs to the project, declare the hostname and existing
 tunnel name in `ciao.toml`:
@@ -80,13 +80,22 @@ hostname = "tv.example.com"
 tunnel = "abcmovie"
 ```
 
-Ciao then owns that ingress rule. It points Cloudflare at the port of the
-active release, reloads `cloudflared` after deploy and rollback, checks the
-public hostname with the configured `Host` header, removes the Ciao-owned
-configuration with `ciao app remove`, and shows the hostname and port in
-`ciao status`. Only one `[tunnel]` declaration is accepted in a full-stack
-deploy; use separate Ciao apps when the backend and frontend need separate
-hostnames.
+Ciao owns only that app's ingress rule in the host-level
+`/etc/cloudflared/config.yml`. Each deploy reads the shared file, upserts the
+hostname and the active release port, preserves every other app and the final
+`http_status:404` catch-all, then atomically writes and reloads the one
+`cloudflared` service. DNS routing is idempotent per hostname. A deploy or
+rollback never replaces another app's route; `ciao app remove` removes only
+the marked rule for that app and keeps the shared service while other routes
+remain. Ciao checks the public hostname with the configured `Host` header and
+shows the hostname and real port in `ciao status`. Only one `[tunnel]`
+declaration is accepted in a full-stack deploy; use separate Ciao apps when
+the backend and frontend need separate hostnames.
+
+For an existing host-level Tunnel, Ciao uses the tunnel and credentials already
+referenced by `/etc/cloudflared/config.yml`; a local Cloudflare login is only
+needed when creating the first shared Tunnel. This keeps deploys from CI and
+other non-interactive shells safe.
 
 For a temporary public URL without a Cloudflare domain, add `funnel` after the
 host:

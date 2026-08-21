@@ -4776,124 +4776,200 @@ pub fn cloudflare_tunnel_setup_with_config(
     validate_identifier("app name", app)?;
     validate_domain(&config.hostname)?;
     validate_identifier("Cloudflare tunnel name", &config.tunnel)?;
-    let cloudflared = ensure_local_cloudflared()?;
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        CiaoError::Config("HOME is not set; Ciao cannot find cloudflared credentials".to_owned())
-    })?;
-    let cloudflared_dir = home.join(".cloudflared");
-    let cert = cloudflared_dir.join("cert.pem");
-    if !cert.is_file() {
-        let output = run_local_interactive_script(&format!(
-            "set -eu\n{} tunnel login --loginURL {}\n",
-            shell_quote(&cloudflared),
-            shell_quote(CLOUDFLARE_LOGIN_URL)
-        ))?;
-        if output.status != 0 {
-            return Err(CiaoError::LocalCommand {
-                stage: "sign in to Cloudflare".to_owned(),
-                exit: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            });
-        }
+    let previous_contents = read_cloudflare_config(transport)?;
+    let mut document = previous_contents
+        .as_deref()
+        .map(parse_cloudflare_config)
+        .transpose()?;
+
+    // A shared host config is authoritative. Existing deployments must not
+    // require a local cert or a local copy of the tunnel credentials: those
+    // belong to the host and are already referenced by config.yml.
+    let mut local_warning = None;
+    let mut cloudflared = cloudflared_executable().map(|path| path.to_string_lossy().into_owned());
+    if cloudflared.is_none() && document.is_none() {
+        cloudflared = Some(ensure_local_cloudflared()?);
+    } else if cloudflared.is_none() {
+        local_warning = Some(
+            "local cloudflared is unavailable; skipped DNS reconciliation (host config was still updated)"
+                .to_owned(),
+        );
     }
-    if !cert.is_file() {
-        return Err(CiaoError::Config(
-            "Cloudflare login completed without ~/.cloudflared/cert.pem; rerun `cloudflared tunnel login` and retry".to_owned(),
-        ));
-    }
-    let tunnel_name = config.tunnel.clone();
-    let tunnel_id = find_or_create_cloudflare_tunnel(&cloudflared, &tunnel_name)?;
-    let route = Command::new(&cloudflared)
-        .args([
-            "tunnel",
-            "route",
-            "dns",
-            tunnel_name.as_str(),
-            config.hostname.as_str(),
-        ])
-        .output()
-        .map_err(|error| CiaoError::LocalCommand {
-            stage: "create Cloudflare DNS route".to_owned(),
-            exit: 1,
-            stdout: String::new(),
-            stderr: error.to_string(),
+    let local_cert = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cloudflared/cert.pem"))
+        .filter(|path| path.is_file());
+
+    let mut credentials_to_install = None;
+    let (tunnel, dns_tunnel) = if let Some(existing) = document.as_ref() {
+        (
+            existing.tunnel.clone(),
+            existing
+                .tunnel_name
+                .clone()
+                .unwrap_or_else(|| existing.tunnel.clone()),
+        )
+    } else {
+        let cloudflared = cloudflared.as_deref().ok_or_else(|| {
+            CiaoError::Config(
+                "cloudflared is required to create the first Tunnel on this host".to_owned(),
+            )
         })?;
-    if !route.status.success() {
-        let stdout = String::from_utf8_lossy(&route.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&route.stderr).into_owned();
-        let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-        if !combined.contains("already exists") && !combined.contains("already configured") {
-            return Err(CiaoError::LocalCommand {
-                stage: "create Cloudflare DNS route".to_owned(),
-                exit: route.status.code().unwrap_or(1),
-                stdout,
-                stderr,
-            });
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            CiaoError::Config(
+                "HOME is not set; Ciao needs a logged-in cloudflared account to create the first shared Tunnel"
+                    .to_owned(),
+            )
+        })?;
+        let cloudflared_dir = home.join(".cloudflared");
+        let cert = cloudflared_dir.join("cert.pem");
+        if !cert.is_file() {
+            let output = run_local_interactive_script(&format!(
+                "set -eu\n{} tunnel login --loginURL {}\n",
+                shell_quote(cloudflared),
+                shell_quote(CLOUDFLARE_LOGIN_URL)
+            ))?;
+            if output.status != 0 {
+                return Err(CiaoError::LocalCommand {
+                    stage: "sign in to Cloudflare".to_owned(),
+                    exit: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
         }
-    }
-    let credential_path = cloudflared_dir.join(format!("{tunnel_id}.json"));
-    let credentials = fs::read_to_string(&credential_path).map_err(|error| {
-        CiaoError::Config(format!(
-            "Cloudflare tunnel credentials are missing at {}; rerun `cloudflared tunnel create {tunnel_name}`: {error}",
-            credential_path.display()
-        ))
-    })?;
-    if credentials.is_empty() || credentials.len() > 1024 * 1024 {
-        return Err(CiaoError::Config(
-            "Cloudflare tunnel credentials are empty or unexpectedly large".to_owned(),
+        if !cert.is_file() {
+            return Err(CiaoError::Config(
+                "Cloudflare login completed without ~/.cloudflared/cert.pem; rerun `cloudflared tunnel login` and retry"
+                    .to_owned(),
+            ));
+        }
+        let tunnel_name = config.tunnel.clone();
+        let tunnel_id = find_or_create_cloudflare_tunnel(cloudflared, &tunnel_name)?;
+        let credential_path = cloudflared_dir.join(format!("{tunnel_id}.json"));
+        let credentials = fs::read_to_string(&credential_path).map_err(|error| {
+            CiaoError::Config(format!(
+                "Cloudflare tunnel credentials are missing at {}; rerun `cloudflared tunnel create {tunnel_name}`: {error}",
+                credential_path.display()
+            ))
+        })?;
+        if credentials.is_empty() || credentials.len() > 1024 * 1024 {
+            return Err(CiaoError::Config(
+                "Cloudflare tunnel credentials are empty or unexpectedly large".to_owned(),
+            ));
+        }
+        let remote_credentials = format!("/etc/cloudflared/{tunnel_id}.json");
+        credentials_to_install = Some((remote_credentials.clone(), credentials));
+        (tunnel_id, tunnel_name)
+    };
+
+    if document.is_none() {
+        document = Some(CloudflareConfigDocument::new(
+            &tunnel,
+            Some(&dns_tunnel),
+            &format!("/etc/cloudflared/{tunnel}.json"),
         ));
     }
+    let document = document.as_mut().expect("Cloudflare document initialized");
+    let port = active_cloudflare_port(transport, app)?;
+    // Validate ownership before touching DNS. A hostname belonging to another
+    // Ciao app must never be force-routed to this app's tunnel.
+    document.upsert_route(app, &config.hostname, port)?;
+
+    if let Some(cloudflared) = cloudflared.as_deref() {
+        if local_cert.is_some() {
+            let route = Command::new(cloudflared)
+                .args([
+                    "tunnel",
+                    "route",
+                    "dns",
+                    "-f",
+                    dns_tunnel.as_str(),
+                    config.hostname.as_str(),
+                ])
+                .output();
+            match route {
+                Ok(route) if route.status.success() => {}
+                Ok(route) => {
+                    let stdout = String::from_utf8_lossy(&route.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&route.stderr).into_owned();
+                    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+                    if !combined.contains("already exists")
+                        && !combined.contains("already configured")
+                        && !combined.contains("already has")
+                    {
+                        local_warning = Some(format!(
+                            "DNS route was not updated; host ingress was still synchronized: {}",
+                            stderr.trim()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    local_warning = Some(format!(
+                        "DNS route was not updated; host ingress was still synchronized: {error}"
+                    ));
+                }
+            }
+        } else if previous_contents.is_some() {
+            local_warning = Some(
+                "local cloudflared login is unavailable; skipped DNS reconciliation (existing host route was preserved)"
+                    .to_owned(),
+            );
+        }
+    }
+
     ensure_remote_cloudflared(transport, os)?;
     remote_script(
         transport,
         "prepare Cloudflare Tunnel directory",
         "set -eu\nsudo -n install -d -m 0700 /etc/cloudflared\n",
     )?;
-    let remote_credentials = format!("/etc/cloudflared/{tunnel_id}.json");
-    write_remote_file(
-        transport,
-        &remote_credentials,
-        &credentials,
-        "root",
-        "install Cloudflare Tunnel credentials",
-    )?;
-    remote_script(
-        transport,
-        "protect Cloudflare Tunnel credentials",
-        &format!(
-            "set -eu\nsudo -n chmod 0600 {}\n",
-            shell_quote(&remote_credentials)
-        ),
-    )?;
-    let port = active_cloudflare_port(transport, app)?;
+    if let Some((remote_credentials, credentials)) = credentials_to_install {
+        write_remote_file(
+            transport,
+            &remote_credentials,
+            &credentials,
+            "root",
+            "install Cloudflare Tunnel credentials",
+        )?;
+        remote_script(
+            transport,
+            "protect Cloudflare Tunnel credentials",
+            &format!(
+                "set -eu\nsudo -n chmod 0600 {}\n",
+                shell_quote(&remote_credentials)
+            ),
+        )?;
+    }
     // Cloudflare can proxy directly to the active loopback port. Keep the
     // optional Caddy route in sync when possible, but do not make a native
     // Tunnel depend on a local :443 listener or a healthy Caddy admin API.
     let caddy_warning = configure_domain_for_cloudflare(transport, app, &config.hostname)
         .err()
         .map(|error| format!("; Caddy route skipped: {error}"));
-    let remote_config = "/etc/cloudflared/config.yml";
-    let contents = cloudflare_config_contents(
-        app,
-        &tunnel_id,
-        Some(&tunnel_name),
-        &remote_credentials,
-        &config.hostname,
-        port,
-    );
-    write_remote_file(
+    let contents = document.render();
+    write_cloudflare_config_atomically(
         transport,
-        remote_config,
+        app,
         &contents,
-        "root",
         "write Cloudflare Tunnel configuration",
     )?;
-    remote_script(
+    if let Err(error) = remote_script(
         transport,
         "install Cloudflare Tunnel service",
         &cloudflared_service_script(os),
-    )?;
+    ) {
+        restore_cloudflare_config(transport, app, previous_contents.as_deref());
+        return Err(error);
+    }
+    if let Err(error) = remote_script(
+        transport,
+        "reload Cloudflare Tunnel",
+        &cloudflared_reload_script(os),
+    ) {
+        restore_cloudflare_config(transport, app, previous_contents.as_deref());
+        return Err(error);
+    }
     cloudflare_public_healthcheck(
         transport,
         &config.hostname,
@@ -4902,16 +4978,21 @@ pub fn cloudflare_tunnel_setup_with_config(
     Ok(CloudflareTunnelResult {
         app: app.to_owned(),
         domain: config.hostname.clone(),
-        tunnel: tunnel_name,
+        tunnel: dns_tunnel,
         port,
         message: format!(
-            "Cloudflare Tunnel is active for {} (port {port}){}",
+            "Cloudflare Tunnel is active for {} (port {port}; shared host ingress){}{}",
             config.hostname,
-            caddy_warning.as_deref().unwrap_or_default()
+            caddy_warning.as_deref().unwrap_or_default(),
+            local_warning
+                .as_deref()
+                .map(|warning| format!("; {warning}"))
+                .unwrap_or_default()
         ),
     })
 }
 
+#[cfg(test)]
 fn cloudflare_config_contents(
     app: &str,
     tunnel_id: &str,
@@ -4920,12 +5001,11 @@ fn cloudflare_config_contents(
     hostname: &str,
     port: u16,
 ) -> String {
-    let tunnel_name_comment = tunnel_name
-        .map(|name| format!("# tunnel-name: {name}\n"))
-        .unwrap_or_default();
-    format!(
-        "# managed-by: ciao app={app}\n{tunnel_name_comment}tunnel: {tunnel_id}\ncredentials-file: {credentials}\ningress:\n  - hostname: {hostname}\n    service: http://localhost:{port}\n    originRequest:\n      httpHostHeader: {hostname}\n  - service: http_status:404\n"
-    )
+    let mut document = CloudflareConfigDocument::new(tunnel_id, tunnel_name, credentials);
+    document
+        .upsert_route(app, hostname, port)
+        .expect("generated Cloudflare route is valid");
+    document.render()
 }
 
 fn active_cloudflare_port<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<u16> {
@@ -4950,13 +5030,205 @@ fn read_active_health<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Resul
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedCloudflareConfig {
-    app: Option<String>,
-    tunnel_name: Option<String>,
+struct CloudflareIngressRule {
+    raw: String,
+    hostname: Option<String>,
+    service: Option<String>,
+    origin_host_header: Option<String>,
+    managed_app: Option<String>,
+}
+
+impl CloudflareIngressRule {
+    fn parse(raw: &str) -> Self {
+        let mut hostname = None;
+        let mut service = None;
+        let mut origin_host_header = None;
+        let mut managed_app = None;
+        for line in raw.lines() {
+            let value = line.trim();
+            if let Some(value) = value.strip_prefix("# managed-by: ciao app=") {
+                managed_app = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            } else if let Some(value) = value.strip_prefix("- hostname:") {
+                hostname = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            } else if let Some(value) = value.strip_prefix("- service:") {
+                service = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            } else if let Some(value) = value.strip_prefix("hostname:") {
+                hostname = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            } else if let Some(value) = value.strip_prefix("service:") {
+                service = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            } else if let Some(value) = value.strip_prefix("httpHostHeader:") {
+                origin_host_header = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            }
+        }
+        Self {
+            raw: raw.to_owned(),
+            hostname,
+            service,
+            origin_host_header,
+            managed_app,
+        }
+    }
+
+    fn generated(app: &str, hostname: &str, port: u16) -> Self {
+        Self::parse(&format!(
+            "  # managed-by: ciao app={app}\n  - hostname: {hostname}\n    service: http://localhost:{port}\n    originRequest:\n      httpHostHeader: {hostname}"
+        ))
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.hostname.is_none()
+            && self
+                .service
+                .as_deref()
+                .is_some_and(|service| service.starts_with("http_status:"))
+    }
+
+    fn port(&self) -> Option<u16> {
+        let service = self.service.as_deref()?;
+        let address = service
+            .strip_prefix("http://localhost:")
+            .or_else(|| service.strip_prefix("http://127.0.0.1:"))
+            .or_else(|| service.strip_prefix("https://localhost:"))
+            .or_else(|| service.strip_prefix("https://127.0.0.1:"))?;
+        address.parse::<u16>().ok()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudflareConfigDocument {
+    prefix: String,
+    preamble: Vec<String>,
     tunnel: String,
+    tunnel_name: Option<String>,
     credentials: String,
-    hostname: String,
-    port: u16,
+    legacy_app: Option<String>,
+    rules: Vec<CloudflareIngressRule>,
+}
+
+impl CloudflareConfigDocument {
+    fn new(tunnel: &str, tunnel_name: Option<&str>, credentials: &str) -> Self {
+        let mut prefix = format!("tunnel: {tunnel}\n");
+        if let Some(name) = tunnel_name {
+            prefix.push_str(&format!("# tunnel-name: {name}\n"));
+        }
+        prefix.push_str(&format!("credentials-file: {credentials}\n"));
+        Self {
+            prefix,
+            preamble: Vec::new(),
+            tunnel: tunnel.to_owned(),
+            tunnel_name: tunnel_name.map(str::to_owned),
+            credentials: credentials.to_owned(),
+            legacy_app: None,
+            rules: vec![CloudflareIngressRule::parse("  - service: http_status:404")],
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut output = self.prefix.clone();
+        output.push_str("ingress:\n");
+        for line in &self.preamble {
+            output.push_str(line);
+            output.push('\n');
+        }
+        for rule in &self.rules {
+            output.push_str(&rule.raw);
+            if !rule.raw.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        output
+    }
+
+    fn route_owned_by_app(&self, index: usize, app: &str) -> bool {
+        if self.rules[index].managed_app.as_deref() == Some(app) {
+            return true;
+        }
+        self.legacy_app.as_deref() == Some(app)
+            && !self.rules[index].is_fallback()
+            && self.rules.iter().position(|rule| !rule.is_fallback()) == Some(index)
+    }
+
+    fn route_for_app(&self, app: &str) -> Option<(usize, &CloudflareIngressRule)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .find(|(index, _)| self.route_owned_by_app(*index, app))
+    }
+
+    fn upsert_route(&mut self, app: &str, hostname: &str, port: u16) -> Result<bool> {
+        let before = self.render();
+        for (index, rule) in self.rules.iter().enumerate() {
+            if rule.hostname.as_deref() == Some(hostname) && !self.route_owned_by_app(index, app) {
+                return Err(CiaoError::Config(format!(
+                    "Cloudflare hostname `{hostname}` is already owned by another ingress rule; refusing to modify it"
+                )));
+            }
+        }
+        if let Some(legacy_app) = self.legacy_app.clone() {
+            if legacy_app != app {
+                if let Some(index) = self
+                    .rules
+                    .iter()
+                    .position(|rule| !rule.is_fallback() && rule.managed_app.is_none())
+                {
+                    let marked = format!(
+                        "  # managed-by: ciao app={legacy_app}\n{}",
+                        self.rules[index].raw
+                    );
+                    self.rules[index] = CloudflareIngressRule::parse(&marked);
+                }
+            }
+        }
+        let owned: Vec<usize> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| self.route_owned_by_app(index, app).then_some(index))
+            .collect();
+        let replacement = owned.first().copied();
+        let generated = CloudflareIngressRule::generated(app, hostname, port);
+        if let Some(index) = replacement {
+            self.rules[index] = generated;
+            for index in owned.into_iter().skip(1).rev() {
+                self.rules.remove(index);
+            }
+        } else {
+            let index = self
+                .rules
+                .iter()
+                .position(CloudflareIngressRule::is_fallback)
+                .unwrap_or(self.rules.len());
+            self.rules.insert(index, generated);
+        }
+        // A legacy global marker is converted to per-route ownership on the
+        // first successful upsert, so another app can safely share the file.
+        self.legacy_app = None;
+        Ok(before != self.render())
+    }
+
+    fn remove_route(&mut self, app: &str) -> bool {
+        let mut legacy_index = (self.legacy_app.as_deref() == Some(app))
+            .then(|| self.rules.iter().position(|rule| !rule.is_fallback()))
+            .flatten();
+        let mut removed = false;
+        let mut index = 0;
+        while index < self.rules.len() {
+            let owned_marker = self.rules[index].managed_app.as_deref() == Some(app);
+            if owned_marker || legacy_index == Some(index) {
+                self.rules.remove(index);
+                if legacy_index == Some(index) {
+                    legacy_index = None;
+                }
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        if removed && self.legacy_app.as_deref() == Some(app) {
+            self.legacy_app = None;
+        }
+        removed
+    }
 }
 
 fn read_cloudflare_config<T: RemoteHost + ?Sized>(transport: &T) -> Result<Option<String>> {
@@ -4972,83 +5244,108 @@ fn read_cloudflare_config<T: RemoteHost + ?Sized>(transport: &T) -> Result<Optio
     }
 }
 
-fn parse_cloudflare_config(contents: &str) -> Option<ParsedCloudflareConfig> {
-    let app = contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("# managed-by: ciao app=")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+fn parse_cloudflare_config(contents: &str) -> Result<CloudflareConfigDocument> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let ingress_index = lines
+        .iter()
+        .position(|line| line.trim() == "ingress:")
+        .ok_or_else(|| {
+            CiaoError::Config("/etc/cloudflared/config.yml has no ingress section".to_owned())
+        })?;
+    let value_for = |prefix: &str| {
+        lines[..ingress_index].iter().find_map(|line| {
+            line.trim()
+                .strip_prefix(prefix)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    let tunnel = value_for("tunnel:").ok_or_else(|| {
+        CiaoError::Config("/etc/cloudflared/config.yml has no tunnel identifier".to_owned())
+    })?;
+    let credentials = value_for("credentials-file:").ok_or_else(|| {
+        CiaoError::Config("/etc/cloudflared/config.yml has no credentials-file".to_owned())
+    })?;
+    let tunnel_name = value_for("# tunnel-name:");
+    let legacy_app = value_for("# managed-by: ciao app=").or_else(|| {
+        tunnel_name
+            .as_deref()
+            .and_then(|name| name.strip_prefix("ciao-"))
+            .or_else(|| tunnel.strip_prefix("ciao-"))
             .map(str::to_owned)
     });
-    let tunnel_name = contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("# tunnel-name:")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    });
-    let tunnel = contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("tunnel:")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })?;
-    let credentials = contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("credentials-file:")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })?;
-    let mut hostname = None;
-    let mut port = None;
-    for line in contents.lines() {
-        let value = line.trim();
-        if let Some(value) = value.strip_prefix("- hostname:") {
-            hostname = Some(value.trim().to_owned());
-        } else if let Some(value) = value.strip_prefix("service:") {
-            let service = value.trim();
-            if let Some(address) = service
-                .strip_prefix("http://localhost:")
-                .or_else(|| service.strip_prefix("http://127.0.0.1:"))
-            {
-                port = address.parse::<u16>().ok();
+    let prefix = lines[..ingress_index]
+        .iter()
+        .filter(|line| !line.trim().starts_with("# managed-by: ciao app="))
+        .copied()
+        .collect::<Vec<_>>();
+    let mut preamble = Vec::new();
+    let mut rules = Vec::new();
+    let mut current = Vec::<String>::new();
+    let mut pending_marker = None::<String>;
+    let flush = |current: &mut Vec<String>, rules: &mut Vec<CloudflareIngressRule>| {
+        if !current.is_empty() {
+            rules.push(CloudflareIngressRule::parse(&current.join("\n")));
+            current.clear();
+        }
+    };
+    for line in &lines[ingress_index + 1..] {
+        let marker = line.trim().starts_with("# managed-by: ciao app=");
+        if marker {
+            flush(&mut current, &mut rules);
+            pending_marker = Some((*line).to_owned());
+            continue;
+        }
+        if line.starts_with("  - ") {
+            flush(&mut current, &mut rules);
+            if let Some(marker) = pending_marker.take() {
+                current.push(marker);
             }
+            current.push((*line).to_owned());
+        } else if current.is_empty() {
+            if let Some(marker) = pending_marker.take() {
+                preamble.push(marker);
+            }
+            preamble.push((*line).to_owned());
+        } else {
+            current.push((*line).to_owned());
         }
     }
-    Some(ParsedCloudflareConfig {
-        app,
-        tunnel_name,
+    if let Some(marker) = pending_marker {
+        preamble.push(marker);
+    }
+    flush(&mut current, &mut rules);
+    if rules.is_empty() {
+        return Err(CiaoError::Config(
+            "/etc/cloudflared/config.yml has no ingress rules".to_owned(),
+        ));
+    }
+    Ok(CloudflareConfigDocument {
+        prefix: if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", prefix.join("\n"))
+        },
+        preamble,
         tunnel,
+        tunnel_name,
         credentials,
-        hostname: hostname.filter(|value| !value.is_empty())?,
-        port: port?,
+        legacy_app,
+        rules,
     })
 }
 
-fn cloudflare_config_owned_by_app(config: &ParsedCloudflareConfig, app: &str) -> bool {
-    config.app.as_deref() == Some(app)
-        || config.tunnel_name.as_deref() == Some(&format!("ciao-{app}"))
-        || config.tunnel == format!("ciao-{app}")
-}
-
-fn cloudflare_config_owned_by_app_on_host<T: RemoteHost + ?Sized>(
-    transport: &T,
-    config: &ParsedCloudflareConfig,
-    app: &str,
-    adopt_legacy: bool,
-) -> Result<bool> {
-    if cloudflare_config_owned_by_app(config, app) {
-        return Ok(true);
+fn cloudflare_route_owner(document: &CloudflareConfigDocument, index: usize) -> Option<String> {
+    if document.rules[index].managed_app.is_some() {
+        return document.rules[index].managed_app.clone();
     }
-    if !adopt_legacy {
-        return Ok(false);
+    if let Some(app) = document.legacy_app.as_deref() {
+        if document.route_owned_by_app(index, app) {
+            return Some(app.to_owned());
+        }
     }
-    // Older Ciao versions wrote an unmarked config. If its hostname is still
-    // the app's Caddy domain, take ownership on the next deploy and add the
-    // marker while repairing the active upstream port.
-    Ok(read_existing_domain(transport, app)?.as_deref() == Some(config.hostname.as_str()))
+    None
 }
 
 pub(crate) fn cloudflare_tunnel_status<T: RemoteHost + ?Sized>(
@@ -5058,18 +5355,25 @@ pub(crate) fn cloudflare_tunnel_status<T: RemoteHost + ?Sized>(
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(None);
     };
-    let Some(config) = parse_cloudflare_config(&contents) else {
+    let config = parse_cloudflare_config(&contents)?;
+    let Some((_, route)) = config.route_for_app(app) else {
         return Ok(None);
     };
-    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, true)? {
+    let Some(hostname) = route.hostname.clone() else {
         return Ok(None);
-    }
-    validate_domain(&config.hostname)?;
+    };
+    let Some(port) = route.port() else {
+        return Ok(None);
+    };
+    validate_domain(&hostname)?;
     Ok(Some(CloudflareTunnelStatus {
-        hostname: config.hostname,
-        tunnel: config.tunnel_name.unwrap_or(config.tunnel),
-        port: config.port,
-        managed: config.app.as_deref() == Some(app),
+        hostname,
+        tunnel: config
+            .tunnel_name
+            .clone()
+            .unwrap_or_else(|| config.tunnel.clone()),
+        port,
+        managed: route.managed_app.as_deref() == Some(app),
     }))
 }
 
@@ -5081,47 +5385,26 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
-    let Some(config) = parse_cloudflare_config(&contents) else {
+    let mut config = parse_cloudflare_config(&contents)?;
+    let Some((_, route)) = config.route_for_app(app) else {
         return Ok(false);
     };
-    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, true)? {
-        return Ok(false);
-    }
-    validate_domain(&config.hostname)?;
+    let hostname = route.hostname.clone().ok_or_else(|| {
+        CiaoError::Config(format!("Cloudflare ingress for `{app}` has no hostname"))
+    })?;
+    validate_domain(&hostname)?;
     let platform = transport.inspect()?;
     let port = active_cloudflare_port(transport, app)?;
-    let changed = config.port != port || config.app.as_deref() != Some(app);
+    let changed = config.upsert_route(app, &hostname, port)?;
     if changed {
-        let updated = cloudflare_config_contents(
-            app,
-            &config.tunnel,
-            config.tunnel_name.as_deref(),
-            &config.credentials,
-            &config.hostname,
-            port,
-        );
-        let restore = || {
-            let _ = write_remote_file(
-                transport,
-                "/etc/cloudflared/config.yml",
-                &contents,
-                "root",
-                "restore previous Cloudflare Tunnel configuration",
-            );
-            let _ = remote_script(
-                transport,
-                "reload Cloudflare Tunnel after restore",
-                &cloudflared_reload_script(&platform.os),
-            );
-        };
-        if let Err(error) = write_remote_file(
+        let updated = config.render();
+        if let Err(error) = write_cloudflare_config_atomically(
             transport,
-            "/etc/cloudflared/config.yml",
+            app,
             &updated,
-            "root",
             "synchronize Cloudflare Tunnel ingress",
         ) {
-            restore();
+            restore_cloudflare_config(transport, app, Some(&contents));
             return Err(error);
         }
         if let Err(error) = remote_script(
@@ -5129,12 +5412,12 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
             "reload Cloudflare Tunnel",
             &cloudflared_reload_script(&platform.os),
         ) {
-            restore();
+            restore_cloudflare_config(transport, app, Some(&contents));
             return Err(error);
         }
     }
     let health = read_active_health(transport, app)?;
-    cloudflare_public_healthcheck(transport, &config.hostname, &health)?;
+    cloudflare_public_healthcheck(transport, &hostname, &health)?;
     Ok(changed)
 }
 
@@ -5146,30 +5429,109 @@ pub(crate) fn remove_cloudflare_tunnel_if_owned(
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
-    let Some(config) = parse_cloudflare_config(&contents) else {
-        return Ok(false);
-    };
-    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, false)? {
+    let mut config = parse_cloudflare_config(&contents)?;
+    if !config.remove_route(app) {
         return Ok(false);
     }
     let platform = transport.inspect()?;
-    remote_script(
-        transport,
-        "disable Cloudflare Tunnel service",
-        &cloudflared_disable_script(&platform.os),
-    )?;
-    remote_script(
-        transport,
-        "remove Cloudflare Tunnel ingress",
-        "set -eu\nsudo -n rm -f /etc/cloudflared/config.yml\n",
-    )?;
+    let has_other_routes = config.rules.iter().any(|rule| !rule.is_fallback());
+    if has_other_routes {
+        let updated = config.render();
+        write_cloudflare_config_atomically(
+            transport,
+            app,
+            &updated,
+            "remove Cloudflare Tunnel ingress",
+        )?;
+        if let Err(error) = remote_script(
+            transport,
+            "reload Cloudflare Tunnel after app removal",
+            &cloudflared_reload_script(&platform.os),
+        ) {
+            restore_cloudflare_config(transport, app, Some(&contents));
+            return Err(error);
+        }
+    } else {
+        remote_script(
+            transport,
+            "disable Cloudflare Tunnel service",
+            &cloudflared_disable_script(&platform.os),
+        )?;
+        remote_script(
+            transport,
+            "remove Cloudflare Tunnel ingress",
+            "set -eu\nsudo -n rm -f /etc/cloudflared/config.yml\n",
+        )?;
+    }
     Ok(true)
+}
+
+fn cloudflare_config_temp_path(app: &str) -> String {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "/etc/cloudflared/.config.yml.ciao-{app}-{}-{stamp}",
+        std::process::id()
+    )
+}
+
+fn write_cloudflare_config_atomically(
+    transport: &OpenSshTransport,
+    app: &str,
+    contents: &str,
+    stage: &str,
+) -> Result<()> {
+    validate_identifier("app name", app)?;
+    let temporary = cloudflare_config_temp_path(app);
+    if let Err(error) = write_remote_file(transport, &temporary, contents, "root", stage) {
+        let _ = remote_script(
+            transport,
+            "remove temporary Cloudflare Tunnel configuration",
+            &format!("set -eu\nsudo -n rm -f {}\n", shell_quote(&temporary)),
+        );
+        return Err(error);
+    }
+    let result = remote_script(
+        transport,
+        stage,
+        &format!(
+            "set -eu\ntrap 'sudo -n rm -f {tmp}' EXIT\nsudo -n chmod 0600 {tmp}\nsudo -n mv -f {tmp} /etc/cloudflared/config.yml\ntrap - EXIT\n",
+            tmp = shell_quote(&temporary),
+        ),
+    );
+    if result.is_err() {
+        let _ = remote_script(
+            transport,
+            "remove temporary Cloudflare Tunnel configuration",
+            &format!("set -eu\nsudo -n rm -f {}\n", shell_quote(&temporary)),
+        );
+    }
+    result.map(|_| ())
+}
+
+fn restore_cloudflare_config(transport: &OpenSshTransport, app: &str, contents: Option<&str>) {
+    if let Some(contents) = contents {
+        let _ = write_cloudflare_config_atomically(
+            transport,
+            app,
+            contents,
+            "restore previous Cloudflare Tunnel configuration",
+        );
+    } else {
+        let _ = remote_script(
+            transport,
+            "remove failed Cloudflare Tunnel configuration",
+            "set -eu\nsudo -n rm -f /etc/cloudflared/config.yml\n",
+        );
+    }
 }
 
 fn cloudflared_reload_script(os: &HostOs) -> String {
     match os {
-        HostOs::Linux => "set -eu\nsudo -n systemctl reload cloudflared 2>/dev/null || sudo -n systemctl restart cloudflared\n".to_owned(),
-        HostOs::MacOs => "set -eu\nsudo -n launchctl kickstart -k system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared\n".to_owned(),
+        HostOs::Linux => "set -eu\nsudo -n systemctl reload cloudflared\n".to_owned(),
+        HostOs::MacOs => "set -eu\nsudo -n launchctl kill HUP system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared\n".to_owned(),
         HostOs::Unknown(_) => String::new(),
     }
 }
@@ -5398,12 +5760,11 @@ fn cloudflared_service_script(os: &HostOs) -> String {
 command -v cloudflared >/dev/null 2>&1 || { echo 'cloudflared is not installed on the target' >&2; exit 1; }
 sudo -n cloudflared --config /etc/cloudflared/config.yml service install >/dev/null 2>&1 || true
 sudo -n systemctl enable --now cloudflared
-sudo -n systemctl restart cloudflared
 "#.to_owned(),
         HostOs::MacOs => r#"set -eu
 command -v cloudflared >/dev/null 2>&1 || { echo 'cloudflared is not installed on the target' >&2; exit 1; }
 sudo -n cloudflared --config /etc/cloudflared/config.yml service install >/dev/null 2>&1 || true
-sudo -n launchctl kickstart -k system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared
+sudo -n launchctl print system/com.cloudflare.cloudflared >/dev/null 2>&1 || sudo -n launchctl start com.cloudflare.cloudflared
 "#.to_owned(),
         HostOs::Unknown(_) => String::new(),
     }
@@ -8706,20 +9067,78 @@ mod tests {
         assert!(contents.contains("service: http://localhost:41002"));
         assert!(contents.contains("httpHostHeader: tv.example.com"));
         let parsed = parse_cloudflare_config(&contents).expect("generated config parses");
-        assert_eq!(parsed.app.as_deref(), Some("demo"));
+        let (_, route) = parsed.route_for_app("demo").expect("managed route");
         assert_eq!(parsed.tunnel, "123e4567-e89b-12d3-a456-426614174000");
-        assert_eq!(parsed.hostname, "tv.example.com");
-        assert_eq!(parsed.port, 41002);
+        assert_eq!(route.hostname.as_deref(), Some("tv.example.com"));
+        assert_eq!(route.port(), Some(41002));
+        assert_eq!(parsed.rules.len(), 2);
     }
 
     #[test]
     fn cloudflare_config_recognizes_legacy_ciao_tunnel_ownership() {
         let contents = "tunnel: ciao-demo\ncredentials-file: /etc/cloudflared/demo.json\ningress:\n  - hostname: demo.example.com\n    service: http://127.0.0.1:41001\n  - service: http_status:404\n";
         let parsed = parse_cloudflare_config(contents).expect("legacy config parses");
-        assert!(parsed.app.is_none());
         assert!(parsed.tunnel_name.is_none());
-        assert!(cloudflare_config_owned_by_app(&parsed, "demo"));
-        assert!(!cloudflare_config_owned_by_app(&parsed, "other"));
+        assert!(parsed.route_for_app("demo").is_some());
+        assert!(parsed.route_for_app("other").is_none());
+    }
+
+    #[test]
+    fn cloudflare_config_merge_preserves_other_apps_and_order() {
+        let contents = "tunnel: shared\n# tunnel-name: shared\ncredentials-file: /etc/cloudflared/shared.json\ningress:\n  # managed-by: ciao app=alpha\n  - hostname: alpha.example.com\n    service: http://localhost:41001\n    originRequest:\n      httpHostHeader: alpha.example.com\n  # managed-by: ciao app=beta\n  - hostname: beta.example.com\n    service: http://localhost:41002\n  - hostname: manual.example.com\n    service: http://localhost:41999\n  - service: http_status:404\n";
+        let mut parsed = parse_cloudflare_config(contents).expect("shared config parses");
+        parsed
+            .upsert_route("alpha", "alpha.example.com", 41011)
+            .expect("alpha route updates");
+        let rendered = parsed.render();
+        assert!(rendered.contains("service: http://localhost:41011"));
+        assert!(rendered.contains("service: http://localhost:41002"));
+        assert!(rendered.contains("service: http://localhost:41999"));
+        assert!(rendered.contains("# managed-by: ciao app=alpha"));
+        let alpha = rendered.find("alpha.example.com").unwrap();
+        let beta = rendered.find("beta.example.com").unwrap();
+        let manual = rendered.find("manual.example.com").unwrap();
+        let fallback = rendered.find("http_status:404").unwrap();
+        assert!(alpha < beta && beta < manual && manual < fallback);
+        assert_eq!(parsed.route_for_app("beta").unwrap().1.port(), Some(41002));
+    }
+
+    #[test]
+    fn cloudflare_config_merge_rejects_hostname_owned_by_another_app() {
+        let contents = cloudflare_config_contents(
+            "alpha",
+            "shared-id",
+            Some("shared"),
+            "/etc/cloudflared/shared.json",
+            "alpha.example.com",
+            41001,
+        );
+        let mut parsed = parse_cloudflare_config(&contents).unwrap();
+        let error = parsed
+            .upsert_route("beta", "alpha.example.com", 41002)
+            .expect_err("another app must not be overwritten");
+        assert!(error.to_string().contains("already owned"));
+    }
+
+    #[test]
+    fn cloudflare_config_remove_keeps_other_routes() {
+        let contents = "tunnel: shared\ncredentials-file: /etc/cloudflared/shared.json\ningress:\n  # managed-by: ciao app=alpha\n  - hostname: alpha.example.com\n    service: http://localhost:41001\n  # managed-by: ciao app=beta\n  - hostname: beta.example.com\n    service: http://localhost:41002\n  - service: http_status:404\n";
+        let mut parsed = parse_cloudflare_config(contents).unwrap();
+        assert!(parsed.remove_route("alpha"));
+        let rendered = parsed.render();
+        assert!(!rendered.contains("alpha.example.com"));
+        assert!(rendered.contains("beta.example.com"));
+        assert!(rendered.contains("http_status:404"));
+    }
+
+    #[test]
+    fn cloudflare_legacy_remove_does_not_delete_the_next_route() {
+        let contents = "tunnel: ciao-alpha\ncredentials-file: /etc/cloudflared/shared.json\ningress:\n  - hostname: alpha.example.com\n    service: http://localhost:41001\n  - hostname: beta.example.com\n    service: http://localhost:41002\n  - service: http_status:404\n";
+        let mut parsed = parse_cloudflare_config(contents).unwrap();
+        assert!(parsed.remove_route("alpha"));
+        let rendered = parsed.render();
+        assert!(!rendered.contains("alpha.example.com"));
+        assert!(rendered.contains("beta.example.com"));
     }
 
     #[test]

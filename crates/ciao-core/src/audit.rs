@@ -296,82 +296,105 @@ fn audit_cloudflare_exposure(
     let Some(contents) = read_cloudflare_config(transport)? else {
         return Ok(());
     };
-    let Some(config) = parse_cloudflare_config(&contents) else {
-        items.push(AuditItem {
-            path: "/etc/cloudflared/config.yml".to_owned(),
-            status: "invalid".to_owned(),
-            expected: Some("Ciao-managed Cloudflare ingress".to_owned()),
-            actual: Some("unparseable ingress configuration".to_owned()),
-        });
-        return Ok(());
-    };
-    let owner = config
-        .app
-        .clone()
-        .or_else(|| {
-            config
-                .tunnel_name
-                .as_deref()
-                .and_then(|name| name.strip_prefix("ciao-"))
-                .map(str::to_owned)
-        })
-        .or_else(|| config.tunnel.strip_prefix("ciao-").map(str::to_owned));
-    let owner_status = match owner.as_deref() {
-        Some(app) if app_names.contains(app) => "ok",
-        Some(_) => "orphan",
-        None => "unmanaged",
-    };
-    items.push(AuditItem {
-        path: "/etc/cloudflared/config.yml".to_owned(),
-        status: owner_status.to_owned(),
-        expected: Some("active Ciao Cloudflare ingress".to_owned()),
-        actual: Some(format!("{} → localhost:{}", config.hostname, config.port)),
-    });
-    let hostname_status = if validate_domain(&config.hostname).is_err() {
-        "invalid-hostname"
-    } else {
-        match remote_hostname_resolves(transport, &config.hostname)? {
-            Some(true) => "ok",
-            Some(false) => "unresolved-hostname",
-            None => "unknown-hostname",
-        }
-    };
-    items.push(AuditItem {
-        path: "cloudflared/hostname".to_owned(),
-        status: hostname_status.to_owned(),
-        expected: Some("resolvable public hostname".to_owned()),
-        actual: Some(config.hostname.clone()),
-    });
-    let port_status = match remote_port_is_listening(transport, config.port)? {
-        Some(true) => "ok",
-        Some(false) => "dead-port",
-        None => "unknown-port",
-    };
-    items.push(AuditItem {
-        path: "cloudflared/upstream".to_owned(),
-        status: port_status.to_owned(),
-        expected: Some("active release port".to_owned()),
-        actual: Some(config.port.to_string()),
-    });
-    if let Some(app) = owner.as_deref() {
-        if !app_names.contains(app) {
+    let config = match parse_cloudflare_config(&contents) {
+        Ok(config) => config,
+        Err(error) => {
+            items.push(AuditItem {
+                path: "/etc/cloudflared/config.yml".to_owned(),
+                status: "invalid".to_owned(),
+                expected: Some("Ciao-managed Cloudflare ingress".to_owned()),
+                actual: Some(error.to_string()),
+            });
             return Ok(());
         }
-        let platform = transport.inspect()?;
-        let root = host_app_root(&platform.os);
-        let current = read_current_release(transport, &root, app)?;
-        if let Some(release) =
-            effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
-        {
-            let manifest = read_release_manifest(transport, &root, app, &release)?;
-            let expected_port = manifest.port.unwrap_or(80);
-            if expected_port != config.port {
-                items.push(AuditItem {
-                    path: format!("cloudflared/{app}/upstream"),
-                    status: "drift".to_owned(),
-                    expected: Some(expected_port.to_string()),
-                    actual: Some(config.port.to_string()),
-                });
+    };
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    for (index, rule) in config.rules.iter().enumerate() {
+        if rule.is_fallback() {
+            continue;
+        }
+        let Some(hostname) = rule.hostname.as_deref() else {
+            items.push(AuditItem {
+                path: format!("cloudflared/rule-{index}"),
+                status: "invalid".to_owned(),
+                expected: Some("hostname ingress rule".to_owned()),
+                actual: Some("ingress rule has no hostname".to_owned()),
+            });
+            continue;
+        };
+        let Some(port) = rule.port() else {
+            items.push(AuditItem {
+                path: format!("cloudflared/{hostname}"),
+                status: "invalid".to_owned(),
+                expected: Some("localhost HTTP upstream".to_owned()),
+                actual: rule.service.clone(),
+            });
+            continue;
+        };
+        let owner = cloudflare_route_owner(&config, index);
+        let owner_status = match owner.as_deref() {
+            Some(app) if app_names.contains(app) => "ok",
+            Some(_) => "orphan",
+            None => "unmanaged",
+        };
+        items.push(AuditItem {
+            path: format!("cloudflared/{hostname}"),
+            status: owner_status.to_owned(),
+            expected: Some("active Ciao Cloudflare ingress".to_owned()),
+            actual: Some(format!(
+                "{}{} → localhost:{port}",
+                owner
+                    .as_deref()
+                    .map(|app| format!("{app} → "))
+                    .unwrap_or_default(),
+                hostname
+            )),
+        });
+        let hostname_status = if validate_domain(hostname).is_err() {
+            "invalid-hostname"
+        } else {
+            match remote_hostname_resolves(transport, hostname)? {
+                Some(true) => "ok",
+                Some(false) => "unresolved-hostname",
+                None => "unknown-hostname",
+            }
+        };
+        items.push(AuditItem {
+            path: format!("cloudflared/{hostname}/hostname"),
+            status: hostname_status.to_owned(),
+            expected: Some("resolvable public hostname".to_owned()),
+            actual: Some(hostname.to_owned()),
+        });
+        let port_status = match remote_port_is_listening(transport, port)? {
+            Some(true) => "ok",
+            Some(false) => "dead-port",
+            None => "unknown-port",
+        };
+        items.push(AuditItem {
+            path: format!("cloudflared/{hostname}/upstream"),
+            status: port_status.to_owned(),
+            expected: Some("active release port".to_owned()),
+            actual: Some(port.to_string()),
+        });
+        if let Some(app) = owner.as_deref().filter(|app| app_names.contains(*app)) {
+            if let Some(release) = effective_release_for_app(
+                transport,
+                &platform.os,
+                &root,
+                app,
+                read_current_release(transport, &root, app)?.as_deref(),
+            )? {
+                let manifest = read_release_manifest(transport, &root, app, &release)?;
+                let expected_port = manifest.port.unwrap_or(80);
+                if expected_port != port {
+                    items.push(AuditItem {
+                        path: format!("cloudflared/{app}/upstream"),
+                        status: "drift".to_owned(),
+                        expected: Some(expected_port.to_string()),
+                        actual: Some(port.to_string()),
+                    });
+                }
             }
         }
     }

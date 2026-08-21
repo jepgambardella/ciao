@@ -575,16 +575,6 @@ fn run(cli: Cli) -> Result<()> {
             let progress = TerminalProgress::new();
             let interactive_output =
                 !cli.json && !args.ci && io::stdin().is_terminal() && io::stderr().is_terminal();
-            if cloudflare_declared
-                && !args.dry_run
-                && !interactive_output
-                && !cloudflare_tunnel_login_ready()
-            {
-                return Err(CiaoError::Config(format!(
-                    "Cloudflare login is required before a non-interactive deploy. Open {} and run `cloudflared tunnel login`, then rerun Ciao",
-                    cloudflare_tunnel_login_url()
-                )));
-            }
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
             }

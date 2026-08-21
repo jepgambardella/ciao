@@ -6,6 +6,19 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.18] - 2026-08-21
+
+- Merge Cloudflare Tunnel ingress at host scope: every deploy upserts only the
+  marked app route, preserves other apps and the final catch-all, writes the
+  config through an atomic rename, and reloads the single shared service.
+- Make Cloudflare DNS routing idempotent per hostname and keep app removal
+  scoped to its own ingress rule while other apps remain online.
+- Use the active release port for shared ingress updates, preserve remote
+  tunnel credentials, and allow declared-Tunnel deploys from non-interactive
+  shells when the host config is already usable.
+- Extend `ciao host audit` to report every Cloudflare hostname, owner, upstream
+  port, DNS status and dead-port or release-port drift.
+
 ## [v0.1.17] - 2026-08-21
 
 - Fix Linux `current` activation: replace the symlink with `mv -fT`, verify the
