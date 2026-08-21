@@ -4,8 +4,18 @@ All notable Ciao changes are recorded here.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [v0.1.13] - 2026-08-21
+
 - Require service deployments using Funnel to declare `[run].port` in
   `ciao.toml`; static Funnel apps remain exempt.
+- Retry loopback and domain healthchecks during the configured timeout so a
+  service can finish its normal startup before Ciao decides it is unhealthy.
+- Reactivate the target release through its correct Linux service slot during
+  rollback, keeping `current`, the active slot and the serving process aligned.
+- Store SSH ControlMaster sockets in the short, private
+  `~/.cache/ciao/ssh/control-%C` path instead of `$TMPDIR`.
 
 ## [v0.1.12] - 2026-08-21
 

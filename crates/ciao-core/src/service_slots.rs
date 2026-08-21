@@ -10,6 +10,16 @@ pub(super) fn slot_service_unit_name(app: &str, slot: char) -> Result<String> {
     Ok(format!("ciao-{app}-slot-{slot}.service"))
 }
 
+pub(super) fn opposite_slot(slot: char) -> Result<char> {
+    match slot {
+        'a' => Ok('b'),
+        'b' => Ok('a'),
+        other => Err(CiaoError::Config(format!(
+            "invalid active service slot `{other}`"
+        ))),
+    }
+}
+
 pub(super) fn active_slot_path(root: &str, app: &str) -> String {
     format!("{root}/{app}/active-slot")
 }

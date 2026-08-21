@@ -347,12 +347,10 @@ pub fn rollback_to(
     } else {
         None
     };
+    let rollback_slot = active_slot.map(opposite_slot).transpose()?;
     let previous_path = format!("{root}/{app}/releases/{previous}");
     let current_path = format!("{root}/{app}/releases/{current}");
     let retained_domain = read_existing_domain(transport, app)?;
-    if manifest.app_type == AppType::Service {
-        validate_release_candidate(transport, &platform.os, app, &previous_path, &manifest)?;
-    }
     let activation = (|| {
         remote_script(
             transport,
@@ -360,29 +358,74 @@ pub fn rollback_to(
             &switch_current_script(&platform.os, &root, app, &previous_path),
         )?;
         if manifest.app_type == AppType::Service {
-            let unit = if let Some(slot) = active_slot {
+            if let Some(slot) = rollback_slot {
                 let user = service_user(transport, &platform.os, app)?;
+                let unit = slot_service_unit_name(app, slot)?;
                 install_service(
                     transport,
                     &platform.os,
-                    &slot_service_unit_name(app, slot)?,
+                    &unit,
                     &user,
-                    &format!("{root}/{app}/current"),
+                    &previous_path,
                     &format!("{root}/{app}/shared/env"),
                     false,
                     "./start",
                 )?;
-                slot_service_unit_name(app, slot)?
+                enable_service(transport, &platform.os, &unit)?;
+                service_action(transport, &platform.os, &unit, LifecycleAction::Start)?;
+                remote_healthcheck(
+                    transport,
+                    manifest.port.ok_or_else(|| {
+                        CiaoError::Config("rollback release has no port".to_owned())
+                    })?,
+                    &manifest.health,
+                )?;
             } else {
-                service_unit_name(app, false)
+                let unit = service_unit_name(app, false);
+                let user = service_user(transport, &platform.os, app)?;
+                install_service(
+                    transport,
+                    &platform.os,
+                    &unit,
+                    &user,
+                    &previous_path,
+                    &format!("{root}/{app}/shared/env"),
+                    false,
+                    "./start",
+                )?;
+                enable_service(transport, &platform.os, &unit)?;
+                service_action(transport, &platform.os, &unit, LifecycleAction::Restart)?;
+                remote_healthcheck(
+                    transport,
+                    manifest.port.ok_or_else(|| {
+                        CiaoError::Config("rollback release has no port".to_owned())
+                    })?,
+                    &manifest.health,
+                )?;
+            }
+            if let Some(slot) = active_slot {
+                let old_unit = slot_service_unit_name(app, slot)?;
+                let rollback_slot = rollback_slot.ok_or_else(|| {
+                    CiaoError::Config("active service slot has no rollback slot".to_owned())
+                })?;
+                service_action(transport, &platform.os, &old_unit, LifecycleAction::Stop)?;
+                disable_service(transport, &platform.os, &old_unit)?;
+                write_active_slot(transport, &root, app, rollback_slot)?;
+            }
+        } else if current_manifest.app_type == AppType::Service {
+            let old_unit = match active_slot {
+                Some(slot) => slot_service_unit_name(app, slot)?,
+                None => service_unit_name(app, false),
             };
-            service_action(transport, &platform.os, &unit, LifecycleAction::Restart)?;
-            remote_healthcheck(
+            let _ = service_action(transport, &platform.os, &old_unit, LifecycleAction::Stop);
+            let _ = disable_service(transport, &platform.os, &old_unit);
+            remote_script(
                 transport,
-                manifest
-                    .port
-                    .ok_or_else(|| CiaoError::Config("rollback release has no port".to_owned()))?,
-                &manifest.health,
+                "clear active service slot",
+                &format!(
+                    "set -eu\nsudo -n rm -f {}\n",
+                    shell_quote(&active_slot_path(&root, app))
+                ),
             )?;
         }
         if let Some(domain) = retained_domain.as_deref() {
@@ -405,19 +448,46 @@ pub fn rollback_to(
             if current_manifest.app_type == AppType::Service {
                 let unit = if let Some(slot) = active_slot {
                     let user = service_user(transport, &platform.os, app)?;
+                    let unit = slot_service_unit_name(app, slot)?;
                     install_service(
                         transport,
                         &platform.os,
-                        &slot_service_unit_name(app, slot)?,
+                        &unit,
                         &user,
-                        &format!("{root}/{app}/current"),
+                        &current_path,
                         &format!("{root}/{app}/shared/env"),
                         false,
                         "./start",
                     )?;
-                    slot_service_unit_name(app, slot)?
+                    enable_service(transport, &platform.os, &unit)?;
+                    service_action(transport, &platform.os, &unit, LifecycleAction::Start)?;
+                    if let Some(slot) = rollback_slot {
+                        let failed_unit = slot_service_unit_name(app, slot)?;
+                        let _ = service_action(
+                            transport,
+                            &platform.os,
+                            &failed_unit,
+                            LifecycleAction::Stop,
+                        );
+                        let _ = disable_service(transport, &platform.os, &failed_unit);
+                    }
+                    write_active_slot(transport, &root, app, slot)?;
+                    unit
                 } else {
-                    service_unit_name(app, false)
+                    let unit = service_unit_name(app, false);
+                    let user = service_user(transport, &platform.os, app)?;
+                    install_service(
+                        transport,
+                        &platform.os,
+                        &unit,
+                        &user,
+                        &current_path,
+                        &format!("{root}/{app}/shared/env"),
+                        false,
+                        "./start",
+                    )?;
+                    enable_service(transport, &platform.os, &unit)?;
+                    unit
                 };
                 service_action(transport, &platform.os, &unit, LifecycleAction::Restart)?;
                 remote_healthcheck(

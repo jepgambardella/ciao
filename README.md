@@ -93,7 +93,9 @@ port = 3000
 ```
 
 This is the app port. Funnel itself forwards through Caddy on `127.0.0.1:80`.
-Static apps do not need a service port.
+Static apps do not need a service port. During a Linux blue/green redeploy,
+Ciao may use a second internal candidate port; external traffic should target
+the Caddy/Funnel endpoint, not a release port directly.
 
 Use a normal SSH key for later commands. Ciao can create the key and install
 the public key during the guided host setup.

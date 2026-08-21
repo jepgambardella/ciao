@@ -55,7 +55,7 @@ pub use operations::{
 };
 pub use project::{detect_project, detect_project_components};
 use service_slots::{
-    active_slot_path, read_active_slot, slot_service_unit_name, write_active_slot,
+    active_slot_path, opposite_slot, read_active_slot, slot_service_unit_name, write_active_slot,
 };
 pub use transaction::{deploy_full_stack_with_mode, FullStackDeployResult};
 
@@ -2985,6 +2985,25 @@ pub struct OpenSshTransport {
     pub target: String,
     pub connect_timeout_seconds: u64,
     pub identity_file: Option<PathBuf>,
+    control_path: PathBuf,
+}
+
+/// Return a short, private ControlMaster path. OpenSSH expands `%C` to a
+/// connection hash, keeping one socket per target without embedding the full
+/// host name in the Unix socket path.
+fn prepare_ssh_control_path() -> Result<PathBuf> {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = if std::env::var_os("HOME").is_some() {
+        base.join(".cache").join("ciao").join("ssh")
+    } else {
+        base.join("ciao-ssh")
+    };
+    fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    Ok(directory.join("control-%C"))
 }
 
 impl OpenSshTransport {
@@ -2995,6 +3014,7 @@ impl OpenSshTransport {
             target,
             connect_timeout_seconds: 10,
             identity_file: None,
+            control_path: prepare_ssh_control_path()?,
         })
     }
 
@@ -3008,7 +3028,6 @@ impl OpenSshTransport {
 
     fn ssh_command(&self, command: &CommandSpec) -> Command {
         let mut process = Command::new("ssh");
-        let control_path = std::env::temp_dir().join("ciao-ssh-%C");
         process
             .arg("-T")
             .arg("-o")
@@ -3016,7 +3035,7 @@ impl OpenSshTransport {
             .arg("-o")
             .arg("ControlPersist=60")
             .arg("-o")
-            .arg(format!("ControlPath={}", control_path.display()))
+            .arg(format!("ControlPath={}", self.control_path.display()))
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
@@ -3088,10 +3107,7 @@ impl OpenSshTransport {
                 "-o".to_owned(),
                 "ControlPersist=60".to_owned(),
                 "-o".to_owned(),
-                format!(
-                    "ControlPath={}",
-                    std::env::temp_dir().join("ciao-ssh-%C").display()
-                ),
+                format!("ControlPath={}", self.control_path.display()),
             ];
             if self.identity_file.is_some() {
                 ssh_args.extend(["-o".to_owned(), "IdentitiesOnly=yes".to_owned()]);
@@ -3849,7 +3865,6 @@ pub fn prepare_host_for_deploy_interactive(
 
 fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
     let mut process = Command::new("ssh");
-    let control_path = std::env::temp_dir().join("ciao-ssh-%C");
     process
         .arg("-tt")
         .arg("-o")
@@ -3857,7 +3872,7 @@ fn interactive_ssh_command(transport: &OpenSshTransport) -> Command {
         .arg("-o")
         .arg("ControlPersist=60")
         .arg("-o")
-        .arg(format!("ControlPath={}", control_path.display()))
+        .arg(format!("ControlPath={}", transport.control_path.display()))
         .arg("-o")
         .arg(format!(
             "ConnectTimeout={}",
@@ -6886,42 +6901,6 @@ fn switch_current(
     Ok(())
 }
 
-fn validate_release_candidate(
-    transport: &OpenSshTransport,
-    os: &HostOs,
-    app: &str,
-    release_path: &str,
-    manifest: &ReleaseManifest,
-) -> Result<()> {
-    let port = manifest
-        .port
-        .ok_or_else(|| CiaoError::Config("service release has no port".to_owned()))?;
-    let user = service_user(transport, os, app)?;
-    if *os == HostOs::MacOs {
-        run_macos_candidate(transport, &user, release_path, port, &manifest.health)
-    } else {
-        let unit = service_unit_name(app, true);
-        install_service(
-            transport,
-            os,
-            &unit,
-            &user,
-            release_path,
-            &format!("{}/{app}/shared/env", host_app_root(os)),
-            true,
-            "./start",
-        )?;
-        let result = (|| {
-            service_action(transport, os, &unit, LifecycleAction::Start)?;
-            remote_healthcheck(transport, port, &manifest.health)?;
-            Ok::<(), CiaoError>(())
-        })();
-        let _ = service_action(transport, os, &unit, LifecycleAction::Stop);
-        let _ = remove_service(transport, os, &unit);
-        result
-    }
-}
-
 fn write_remote_file(
     transport: &OpenSshTransport,
     path: &str,
@@ -7235,15 +7214,21 @@ fn remote_healthcheck(
     health: &HealthConfig,
 ) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}{}", health.path);
-    let script = format!(
-        "set -eu\nexpected={}\nif command -v curl >/dev/null 2>&1; then actual=$(curl --silent --show-error --max-time {} --output /dev/null --write-out '%{{http_code}}' {}); elif command -v wget >/dev/null 2>&1; then actual=$(wget --server-response --spider --timeout={} {} 2>&1 | awk '/HTTP\\// {{code=$2}} END {{print code}}'); else echo 'curl or wget is required for HTTP healthchecks' >&2; exit 1; fi\n[ \"$actual\" = \"$expected\" ] || {{ echo \"expected HTTP $expected, got $actual\" >&2; exit 1; }}\n",
-        health.expected_status,
-        health.timeout_seconds,
-        shell_quote(&url),
-        health.timeout_seconds,
-        shell_quote(&url)
-    );
+    let script = healthcheck_script(&url, health);
     remote_script(transport, "healthcheck", &script).map(|_| ())
+}
+
+fn healthcheck_script(url: &str, health: &HealthConfig) -> String {
+    let attempts = health.timeout_seconds.saturating_mul(2).saturating_add(1);
+    format!(
+        "set -eu\nexpected={}\nattempts={}\nprobe() {{\n    if command -v curl >/dev/null 2>&1; then\n        curl --silent --max-time 1 --output /dev/null --write-out '%{{http_code}}' {} || true\n    elif command -v wget >/dev/null 2>&1; then\n        wget --server-response --spider --timeout=1 {} 2>&1 | awk '/HTTP\\// {{code=$2}} END {{print code}}' || true\n    else\n        echo 'curl or wget is required for HTTP healthchecks' >&2\n        exit 1\n    fi\n}}\nfor attempt in $(seq 1 \"$attempts\"); do\n    actual=$(probe)\n    [ -n \"$actual\" ] || actual=000\n    if [ \"$actual\" = \"$expected\" ]; then exit 0; fi\n    if [ \"$actual\" != 000 ]; then\n        echo \"expected HTTP $expected, got $actual\" >&2\n        exit 1\n    fi\n    if [ \"$attempt\" -lt \"$attempts\" ]; then sleep 0.5; fi\ndone\necho \"healthcheck timed out after {}s: expected HTTP $expected at {}\" >&2\nexit 1\n",
+        health.expected_status,
+        attempts,
+        shell_quote(url),
+        shell_quote(url),
+        health.timeout_seconds,
+        shell_quote(url)
+    )
 }
 
 fn remote_domain_healthcheck(
@@ -7254,15 +7239,20 @@ fn remote_domain_healthcheck(
     validate_domain(domain)?;
     let https = format!("https://{domain}{}", health.path);
     let http = format!("http://{domain}{}", health.path);
-    let script = format!(
-        "set -eu\nexpected={}\nactual=$(curl --silent --show-error --insecure --max-time {} --output /dev/null --write-out '%{{http_code}}' {} || true)\nif [ \"$actual\" != \"$expected\" ]; then actual=$(curl --silent --show-error --max-time {} --output /dev/null --write-out '%{{http_code}}' {} || true); fi\n[ \"$actual\" = \"$expected\" ] || {{ echo \"domain smoke check expected HTTP $expected, got $actual\" >&2; exit 1; }}\n",
-        health.expected_status,
-        health.timeout_seconds,
-        shell_quote(&https),
-        health.timeout_seconds,
-        shell_quote(&http),
-    );
+    let script = domain_healthcheck_script(&https, &http, health);
     remote_script(transport, "domain smoke check", &script).map(|_| ())
+}
+
+fn domain_healthcheck_script(https: &str, http: &str, health: &HealthConfig) -> String {
+    let attempts = health.timeout_seconds.saturating_mul(2).saturating_add(1);
+    format!(
+        "set -eu\nexpected={}\nattempts={}\nfor attempt in $(seq 1 \"$attempts\"); do\n    actual=$(curl --silent --insecure --max-time 1 --output /dev/null --write-out '%{{http_code}}' {} || true)\n    if [ \"$actual\" != \"$expected\" ]; then\n        actual=$(curl --silent --insecure --max-time 1 --output /dev/null --write-out '%{{http_code}}' {} || true)\n    fi\n    if [ \"$actual\" = \"$expected\" ]; then exit 0; fi\n    if [ \"$actual\" != 000 ] && [ -n \"$actual\" ]; then\n        echo \"domain smoke check expected HTTP $expected, got $actual\" >&2\n        exit 1\n    fi\n    if [ \"$attempt\" -lt \"$attempts\" ]; then sleep 0.5; fi\ndone\necho \"domain smoke check timed out after {}s: expected HTTP $expected\" >&2\nexit 1\n",
+        health.expected_status,
+        attempts,
+        shell_quote(https),
+        shell_quote(http),
+        health.timeout_seconds,
+    )
 }
 
 fn cleanup_release(
@@ -7555,6 +7545,20 @@ mod tests {
     }
 
     #[test]
+    fn healthcheck_retries_connection_refused_until_timeout() {
+        let health = HealthConfig {
+            path: "/health".to_owned(),
+            expected_status: 200,
+            timeout_seconds: 10,
+        };
+        let script = healthcheck_script("http://127.0.0.1:41000/health", &health);
+        assert!(script.contains("attempts=21"));
+        assert!(script.contains("sleep 0.5"));
+        assert!(script.contains("[ \"$actual\" != 000 ]"));
+        assert!(script.contains("healthcheck timed out after 10s"));
+    }
+
+    #[test]
     fn host_config_accepts_legacy_entries_without_identity_file() {
         let mut file = NamedTempFile::new().unwrap();
         fs::write(file.path(), "[hosts.home]\nssh = \"user@server\"\n").unwrap();
@@ -7579,6 +7583,11 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-o", "IdentitiesOnly=yes"]));
+        let control_path = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("ControlPath="))
+            .expect("ControlPath is configured");
+        assert!(control_path.contains("/.cache/ciao/ssh/control-%C"));
         assert!(!args.iter().any(|arg| arg.contains("ProxyCommand")));
     }
 
@@ -7753,6 +7762,9 @@ mod tests {
             "ciao-demo-slot-b.service"
         );
         assert!(slot_service_unit_name("demo", 'c').is_err());
+        assert_eq!(opposite_slot('a').unwrap(), 'b');
+        assert_eq!(opposite_slot('b').unwrap(), 'a');
+        assert!(opposite_slot('c').is_err());
     }
 
     #[test]
