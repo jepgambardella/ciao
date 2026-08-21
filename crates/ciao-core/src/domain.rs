@@ -153,6 +153,18 @@ pub(super) fn caddy_fragment_with_scheme(
     }
 }
 
+/// Render a dedicated plain-HTTP route for a Tailscale Funnel hostname.
+/// Funnel terminates public HTTPS before forwarding to Caddy on loopback.
+pub(crate) fn funnel_caddy_fragment(
+    transport: &OpenSshTransport,
+    root: &str,
+    app: &str,
+    release: &str,
+    hostname: &str,
+) -> Result<String> {
+    caddy_fragment_with_scheme(transport, root, app, release, hostname, true)
+}
+
 pub(super) fn configure_release_caddy_route(
     transport: &OpenSshTransport,
     os: &HostOs,

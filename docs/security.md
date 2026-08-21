@@ -71,6 +71,15 @@ credential file is read locally and sent over SSH only to the root-owned target
 path with mode `0600`; it is never printed or stored in Ciao state. The public
 TLS connection ends at Cloudflare. Caddy serves the tunnel origin on loopback.
 
+`ciao deploy <host> funnel` is a separate, explicit public-exposure action. It
+installs Tailscale only on the target when needed, requires the normal
+Tailscale sign-in and Funnel approval flow, and routes only the selected Ciao
+app through a dedicated Caddy fragment. Funnel terminates HTTPS at Tailscale
+and forwards to Caddy on `127.0.0.1:80`; Ciao does not open the application
+port in the host firewall. Removing the app disables the Ciao-owned Funnel
+route before deleting its Caddy fragment. Funnel is public to anyone on the
+Internet, so it is never enabled by a normal `ciao deploy`.
+
 GitHub auto-deploy is opt-in. It stores only the dedicated CI private key and
 the trusted known-hosts material in GitHub Actions secrets; Ciao's local integration state
 contains no CI private key or Tailscale bootstrap token. The generated workflow

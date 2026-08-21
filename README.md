@@ -71,6 +71,19 @@ Ciao installs `cloudflared` when needed, opens the Cloudflare sign-in page once,
 creates or reuses a standard tunnel, creates the DNS route and starts the
 standard `cloudflared` service on the host.
 
+For a temporary public URL without a Cloudflare domain, add `funnel` after the
+host:
+
+```bash
+ciao deploy home funnel
+```
+
+Ciao installs Tailscale on the host when needed, opens the Tailscale sign-in or
+Funnel approval page when required, routes the deployed app through Caddy and
+prints a stable `https://<host>.<tailnet>.ts.net` URL. Funnel is public to the
+whole Internet. To turn this route off, run `sudo tailscale funnel --https=443 off`
+on the host.
+
 Use a normal SSH key for later commands. Ciao can create the key and install
 the public key during the guided host setup.
 

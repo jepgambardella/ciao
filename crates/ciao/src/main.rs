@@ -1,5 +1,5 @@
 use ciao_core::*;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use serde_json::json;
@@ -112,6 +112,9 @@ enum HostCommand {
 #[derive(Debug, Args)]
 struct DeployArgs {
     host: String,
+    /// Enable a public Tailscale Funnel after the deployment.
+    #[arg(value_enum)]
+    action: Option<DeployAction>,
     #[arg(long)]
     domain: Option<String>,
     #[arg(long, default_value = ".")]
@@ -121,6 +124,11 @@ struct DeployArgs {
     /// Run without the local Ciao config, using CIAO_HOST/CIAO_USER/CIAO_APP.
     #[arg(long)]
     ci: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DeployAction {
+    Funnel,
 }
 
 #[derive(Debug, Subcommand)]
@@ -476,6 +484,12 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Deploy(args) => {
+            if args.action.is_some() && (cli.json || args.ci) {
+                return Err(CiaoError::Config(
+                    "`deploy funnel` requires a normal interactive terminal; omit `--json` and `--ci`"
+                        .to_owned(),
+                ));
+            }
             let path = args.path.canonicalize()?;
             let mut components = detect_project_components(&path)?;
             let mut plan = if components.is_empty() {
@@ -543,6 +557,29 @@ fn run(cli: Cli) -> Result<()> {
                 if !cli.json && args.dry_run {
                     eprintln!("✓ dry-run complete");
                 }
+                if matches!(args.action, Some(DeployAction::Funnel)) && args.dry_run {
+                    let app = result
+                        .components
+                        .last()
+                        .map(|component| component.app.as_str())
+                        .unwrap_or("frontend");
+                    eprintln!(
+                        "Would enable a public Tailscale Funnel for `{app}` after deployment."
+                    );
+                } else if matches!(args.action, Some(DeployAction::Funnel)) {
+                    let app = result
+                        .components
+                        .last()
+                        .map(|component| component.app.as_str())
+                        .ok_or_else(|| {
+                            CiaoError::Config(
+                                "full-stack deployment produced no frontend component for Funnel"
+                                    .to_owned(),
+                            )
+                        })?;
+                    let funnel = setup_tailscale_funnel(&transport, app)?;
+                    println!("{}", funnel.message);
+                }
                 output(&result, cli.json, || result.message.clone());
                 return Ok(());
             }
@@ -577,8 +614,18 @@ fn run(cli: Cli) -> Result<()> {
             if !cli.json && !args.ci && args.dry_run {
                 eprintln!("✓ dry-run complete");
             }
+            if matches!(args.action, Some(DeployAction::Funnel)) && args.dry_run {
+                eprintln!(
+                    "Would enable a public Tailscale Funnel for `{}` after deployment.",
+                    result.app
+                );
+            }
             output(&result, cli.json, || result.message.clone());
             if !args.ci && !args.dry_run && interactive_output {
+                if matches!(args.action, Some(DeployAction::Funnel)) {
+                    let funnel = setup_tailscale_funnel(&transport, &result.app)?;
+                    println!("{}", funnel.message);
+                }
                 if let Err(error) = offer_remote_local_domain(&transport, &result.app) {
                     eprintln!(
                         "! deployment succeeded, but local .ciao routing was not configured: {error}"
@@ -1052,6 +1099,52 @@ fn local_run_command(args: RunArgs, json_output: bool) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn setup_tailscale_funnel(transport: &OpenSshTransport, app: &str) -> Result<FunnelResult> {
+    let platform = transport.inspect()?;
+    let installation = ensure_tailscale_target(transport, &platform.os)?;
+    if installation.installed {
+        eprintln!("✓ Tailscale installed on target");
+    } else {
+        eprintln!("✓ Tailscale already installed on target");
+    }
+
+    if let Some(url) = start_tailscale_auth(transport)? {
+        eprintln!("Ciao is opening the target Tailscale sign-in page in your browser.");
+        if let Err(error) = open_tailscale_auth_url(&url) {
+            eprintln!("{error}");
+        }
+        eprintln!("Complete sign-in. Ciao will continue automatically.");
+        wait_for_tailscale_auth(transport, Duration::from_secs(300))?;
+    }
+
+    match enable_tailscale_funnel(transport, app) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let Some(url) = tailscale_funnel_approval_url(&error) else {
+                return Err(error);
+            };
+            eprintln!("Ciao is opening the Tailscale Funnel approval page in your browser.");
+            if let Err(open_error) = open_tailscale_auth_url(&url) {
+                eprintln!("{open_error}");
+            }
+            eprint!("Approve Funnel in the browser, then press Enter to continue: ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            enable_tailscale_funnel(transport, app)
+        }
+    }
+}
+
+fn tailscale_funnel_approval_url(error: &CiaoError) -> Option<String> {
+    match error {
+        CiaoError::RemoteCommand { stdout, stderr, .. } => {
+            tailscale_auth_url_from_output(&format!("{stdout}\n{stderr}"))
+        }
+        _ => None,
+    }
 }
 
 fn offer_remote_local_domain(transport: &OpenSshTransport, app: &str) -> Result<()> {

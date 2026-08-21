@@ -16,7 +16,8 @@ output. The MCP server is a local JSON-RPC-over-stdio process.
 The core is split by responsibility without extra crates: `project` handles
 detection, `domain` renders Caddy routes, `operations` owns status/logs/lifecycle
 and rollback, `service_slots` owns Linux A/B state, `env` owns secret-file
-operations, `hooks` owns the four lifecycle hook points, `transaction` performs
+operations, `funnel` owns public Tailscale Funnel routes, `hooks` owns the four
+lifecycle hook points, `transaction` performs
 compensating full-stack deploys, and `audit` performs read-only host drift
 checks.
 

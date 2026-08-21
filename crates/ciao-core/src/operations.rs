@@ -91,8 +91,9 @@ pub fn remove_app(transport: &OpenSshTransport, app: &str) -> Result<OperationRe
             }
         }
     }
+    disable_tailscale_funnel(transport, app)?;
     let caddy = format!(
-        "set -eu\nsudo -n rm -f /etc/caddy/ciao/{app}.caddy /etc/caddy/ciao/{app}.local.caddy\n",
+        "set -eu\nsudo -n rm -f /etc/caddy/ciao/{app}.caddy /etc/caddy/ciao/{app}.local.caddy /etc/caddy/ciao/{app}.funnel.caddy\n",
         app = shell_quote(app)
     );
     remote_script(transport, "remove application Caddy routes", &caddy)?;

@@ -24,6 +24,7 @@ use thiserror::Error;
 mod audit;
 mod domain;
 mod env;
+mod funnel;
 mod hooks;
 mod operations;
 mod project;
@@ -36,8 +37,8 @@ pub use domain::{
 };
 use domain::{
     caddy_fragment_with_scheme, caddy_reload_script, configure_domain,
-    configure_release_caddy_route, existing_domain_is_plain_http, read_existing_domain,
-    remove_domain_fragment,
+    configure_release_caddy_route, existing_domain_is_plain_http, funnel_caddy_fragment,
+    read_existing_domain, remove_domain_fragment,
 };
 #[cfg(test)]
 use env::env_file_line;
@@ -45,6 +46,8 @@ pub use env::{
     diff_env, generate_env, pull_env, push_env, set_env, unset_env, validate_env_key, EnvDiff,
     EnvGenerateResult,
 };
+use funnel::disable_tailscale_funnel;
+pub use funnel::{enable_tailscale_funnel, FunnelResult};
 use hooks::{run_local_hook, run_remote_hook};
 pub use operations::{
     app_logs, app_status, follow_app_logs, lifecycle_action, list_apps, list_releases, remove_app,
@@ -6942,6 +6945,33 @@ fn write_remote_file(
         ),
     )?;
     Ok(())
+}
+
+fn read_remote_file(
+    transport: &OpenSshTransport,
+    path: &str,
+    stage: &str,
+) -> Result<Option<String>> {
+    if path.contains(['\n', '\r', ';', '|', '&', '$', '`', ' ']) || !path.starts_with('/') {
+        return Err(CiaoError::Config("remote file path is invalid".to_owned()));
+    }
+    let output = transport.exec(
+        CommandSpec::fixed("sh", &["-s"], stage)
+            .with_stdin(
+                format!(
+                    "set -eu\nif sudo -n test -f {}; then sudo -n cat {}; else printf '__CIAO_MISSING__'; fi\n",
+                    shell_quote(path),
+                    shell_quote(path)
+                )
+                .into_bytes(),
+            )
+            .with_full_output(),
+    )?;
+    if output.stdout == "__CIAO_MISSING__" {
+        Ok(None)
+    } else {
+        Ok(Some(output.stdout))
+    }
 }
 
 fn run_as_user_script(

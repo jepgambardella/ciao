@@ -83,6 +83,36 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
                 &expected,
             )?;
         }
+        let funnel_path = format!("/etc/caddy/ciao/{}.funnel.caddy", app.app);
+        if let Some(actual) = read_remote_file(transport, &funnel_path, "audit Funnel route")? {
+            if let Ok(target) = tailscale_target(transport) {
+                if let Some(hostname) = target.hostname {
+                    let expected =
+                        funnel_caddy_fragment(transport, &root, &app.app, &release, &hostname)?;
+                    let status = if actual == expected { "ok" } else { "drift" };
+                    items.push(AuditItem {
+                        path: funnel_path,
+                        status: status.to_owned(),
+                        expected: Some(expected),
+                        actual: Some(actual),
+                    });
+                } else {
+                    items.push(AuditItem {
+                        path: funnel_path,
+                        status: "ok".to_owned(),
+                        expected: Some("managed Tailscale Funnel route".to_owned()),
+                        actual: Some("present".to_owned()),
+                    });
+                }
+            } else {
+                items.push(AuditItem {
+                    path: funnel_path,
+                    status: "ok".to_owned(),
+                    expected: Some("managed Tailscale Funnel route".to_owned()),
+                    actual: Some("present".to_owned()),
+                });
+            }
+        }
         if manifest.app_type == AppType::Service {
             match platform.os {
                 HostOs::Linux => {
@@ -134,6 +164,7 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
     for path in remote_caddy_fragments(transport)? {
         let name = path
             .trim_end_matches(".local.caddy")
+            .trim_end_matches(".funnel.caddy")
             .trim_end_matches(".caddy")
             .rsplit('/')
             .next()
