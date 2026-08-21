@@ -68,10 +68,12 @@ per-project `/etc/hosts` entries are created.
 this same filesystem/service state through the shared core. The UI binds only
 to loopback and is read-only; it is not a remote dashboard or control plane.
 
-Cloudflare Tunnel remains an optional external integration. Ciao does not
-create accounts, store tunnel credentials, or replace `cloudflared` service
-management. A future narrow adapter may operate on an explicitly supplied
-existing tunnel configuration.
+Cloudflare Tunnel remains an optional external integration. Ciao delegates
+authentication and tunnel creation to the official `cloudflared` CLI. When a
+project declares `[tunnel]`, Ciao owns the marked ingress configuration, keeps
+its upstream aligned with the active release manifest, reloads the service
+after a switch, and removes that Ciao-owned configuration during app removal.
+Unmarked `cloudflared` configurations remain outside Ciao's ownership.
 
 GitHub auto-deploy is another thin client of the same core. GitHub Actions
 checks out the application and a pinned Ciao revision, connects to the target

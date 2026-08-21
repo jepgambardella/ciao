@@ -66,10 +66,20 @@ store secrets, or expose a generic command runner.
 When `ciao deploy` receives `--domain`, Ciao uses the official `cloudflared`
 CLI. It installs the client only when needed, opens `cloudflared tunnel login`
 in the browser, creates or reuses a tunnel named `ciao-<app>`, creates the DNS
-route and installs the standard `cloudflared` service on the target. The tunnel
+route and installs the standard `cloudflared` service on the target. A project
+can instead declare `[tunnel] hostname = "..."` and `tunnel = "..."`; Ciao
+marks and owns that ingress rule. On every activation and rollback it reads the
+active release manifest, updates the local upstream port, reloads the service,
+and probes the public hostname with the configured `Host` header. The tunnel
 credential file is read locally and sent over SSH only to the root-owned target
 path with mode `0600`; it is never printed or stored in Ciao state. The public
-TLS connection ends at Cloudflare. Caddy serves the tunnel origin on loopback.
+TLS connection ends at Cloudflare.
+
+`ciao host audit` reports the Cloudflare ingress together with Caddy fragments
+and Tailscale Funnel/Serve rules. It flags orphaned Ciao rules, unresolved
+hostnames, dead upstream ports and an ingress port that differs from the active
+release. `ciao app remove` disables and removes only a Ciao-owned Cloudflare
+configuration; an unmanaged `/etc/cloudflared/config.yml` is left untouched.
 
 `ciao deploy <host> funnel` is a separate, explicit public-exposure action. It
 installs Tailscale only on the target when needed, requires the normal

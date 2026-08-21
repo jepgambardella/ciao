@@ -16,6 +16,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         .and_then(|app| app.public)
         .unwrap_or(false);
     let funnel = parse_funnel_config(config.funnel.as_ref(), public)?;
+    let tunnel = parse_tunnel_config(config.tunnel.as_ref())?;
     let name = config
         .app
         .as_ref()
@@ -170,6 +171,7 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         health: HealthConfig::default(),
         public,
         funnel,
+        tunnel,
         static_directory,
         port_explicit,
         deploy_port_explicit,
@@ -402,6 +404,23 @@ fn parse_funnel_config(config: Option<&FunnelConfigFile>, public: bool) -> Resul
         enabled: config.enabled.unwrap_or(false),
         auth,
     })
+}
+
+fn parse_tunnel_config(config: Option<&TunnelConfigFile>) -> Result<Option<TunnelConfig>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let hostname = config
+        .hostname
+        .clone()
+        .ok_or_else(|| CiaoError::Config("[tunnel].hostname is required".to_owned()))?;
+    validate_domain(&hostname)?;
+    let tunnel = config
+        .tunnel
+        .clone()
+        .ok_or_else(|| CiaoError::Config("[tunnel].tunnel is required".to_owned()))?;
+    validate_identifier("Cloudflare tunnel name", &tunnel)?;
+    Ok(Some(TunnelConfig { hostname, tunnel }))
 }
 
 /// Detect the common two-directory full-stack layout without requiring a

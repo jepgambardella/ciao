@@ -344,6 +344,13 @@ pub struct FunnelConfig {
     pub auth: FunnelAuth,
 }
 
+/// A project-owned Cloudflare Tunnel ingress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelConfig {
+    pub hostname: String,
+    pub tunnel: String,
+}
+
 impl Default for FunnelConfig {
     fn default() -> Self {
         Self {
@@ -384,6 +391,8 @@ pub struct ProjectPlan {
     pub public: bool,
     #[serde(default)]
     pub funnel: FunnelConfig,
+    #[serde(default)]
+    pub tunnel: Option<TunnelConfig>,
     pub static_directory: Option<String>,
     pub port_explicit: bool,
     /// Whether the remote service port was explicitly set in `[run]`.
@@ -422,6 +431,7 @@ struct ProjectConfig {
     build: Option<BuildConfig>,
     run: Option<RunConfig>,
     funnel: Option<FunnelConfigFile>,
+    tunnel: Option<TunnelConfigFile>,
     health: Option<HealthConfigFile>,
     dev: Option<DevConfig>,
     releases: Option<ReleasesConfig>,
@@ -445,6 +455,12 @@ struct AppConfig {
 struct FunnelConfigFile {
     enabled: Option<bool>,
     auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TunnelConfigFile {
+    hostname: Option<String>,
+    tunnel: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4715,7 +4731,18 @@ pub struct CloudflareTunnelResult {
     pub app: String,
     pub domain: String,
     pub tunnel: String,
+    #[serde(default)]
+    pub port: u16,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareTunnelStatus {
+    pub hostname: String,
+    pub tunnel: String,
+    pub port: u16,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 /// Configure one standard, locally-managed Cloudflare Tunnel.
@@ -4725,8 +4752,29 @@ pub fn cloudflare_tunnel_setup(
     app: &str,
     domain: &str,
 ) -> Result<CloudflareTunnelResult> {
+    cloudflare_tunnel_setup_with_config(
+        transport,
+        os,
+        app,
+        &TunnelConfig {
+            hostname: domain.to_owned(),
+            tunnel: format!("ciao-{app}"),
+        },
+    )
+}
+
+/// Configure a project-declared Cloudflare Tunnel and make Ciao the owner of
+/// its ingress rule. The generated config always points at the active release
+/// port, never at a port selected during a previous deployment.
+pub fn cloudflare_tunnel_setup_with_config(
+    transport: &OpenSshTransport,
+    os: &HostOs,
+    app: &str,
+    config: &TunnelConfig,
+) -> Result<CloudflareTunnelResult> {
     validate_identifier("app name", app)?;
-    validate_domain(domain)?;
+    validate_domain(&config.hostname)?;
+    validate_identifier("Cloudflare tunnel name", &config.tunnel)?;
     let cloudflared = ensure_local_cloudflared()?;
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
         CiaoError::Config("HOME is not set; Ciao cannot find cloudflared credentials".to_owned())
@@ -4752,10 +4800,16 @@ pub fn cloudflare_tunnel_setup(
             "Cloudflare login completed without ~/.cloudflared/cert.pem; rerun `cloudflared tunnel login` and retry".to_owned(),
         ));
     }
-    let tunnel_name = format!("ciao-{app}");
+    let tunnel_name = config.tunnel.clone();
     let tunnel_id = find_or_create_cloudflare_tunnel(&cloudflared, &tunnel_name)?;
     let route = Command::new(&cloudflared)
-        .args(["tunnel", "route", "dns", tunnel_name.as_str(), domain])
+        .args([
+            "tunnel",
+            "route",
+            "dns",
+            tunnel_name.as_str(),
+            config.hostname.as_str(),
+        ])
         .output()
         .map_err(|error| CiaoError::LocalCommand {
             stage: "create Cloudflare DNS route".to_owned(),
@@ -4810,14 +4864,21 @@ pub fn cloudflare_tunnel_setup(
             shell_quote(&remote_credentials)
         ),
     )?;
+    let port = active_cloudflare_port(transport, app)?;
+    configure_domain_for_cloudflare(transport, app, &config.hostname)?;
     let remote_config = "/etc/cloudflared/config.yml";
-    let config = format!(
-        "tunnel: {tunnel_id}\ncredentials-file: {remote_credentials}\ningress:\n  - hostname: {domain}\n    service: http://127.0.0.1:80\n    originRequest:\n      httpHostHeader: {domain}\n  - service: http_status:404\n"
+    let contents = cloudflare_config_contents(
+        app,
+        &tunnel_id,
+        Some(&tunnel_name),
+        &remote_credentials,
+        &config.hostname,
+        port,
     );
     write_remote_file(
         transport,
         remote_config,
-        &config,
+        &contents,
         "root",
         "write Cloudflare Tunnel configuration",
     )?;
@@ -4826,12 +4887,287 @@ pub fn cloudflare_tunnel_setup(
         "install Cloudflare Tunnel service",
         &cloudflared_service_script(os),
     )?;
+    cloudflare_public_healthcheck(
+        transport,
+        &config.hostname,
+        &read_active_health(transport, app)?,
+    )?;
     Ok(CloudflareTunnelResult {
         app: app.to_owned(),
-        domain: domain.to_owned(),
+        domain: config.hostname.clone(),
         tunnel: tunnel_name,
-        message: format!("Cloudflare Tunnel is active for {domain}"),
+        port,
+        message: format!(
+            "Cloudflare Tunnel is active for {} (port {port})",
+            config.hostname
+        ),
     })
+}
+
+fn cloudflare_config_contents(
+    app: &str,
+    tunnel_id: &str,
+    tunnel_name: Option<&str>,
+    credentials: &str,
+    hostname: &str,
+    port: u16,
+) -> String {
+    let tunnel_name_comment = tunnel_name
+        .map(|name| format!("# tunnel-name: {name}\n"))
+        .unwrap_or_default();
+    format!(
+        "# managed-by: ciao app={app}\n{tunnel_name_comment}tunnel: {tunnel_id}\ncredentials-file: {credentials}\ningress:\n  - hostname: {hostname}\n    service: http://localhost:{port}\n    originRequest:\n      httpHostHeader: {hostname}\n  - service: http_status:404\n"
+    )
+}
+
+fn active_cloudflare_port<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<u16> {
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    let release = read_current_release(transport, &root, app)?
+        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    let manifest = read_release_manifest(transport, &root, app, &release)?;
+    Ok(manifest.port.unwrap_or(80))
+}
+
+fn read_active_health<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<HealthConfig> {
+    let platform = transport.inspect()?;
+    let root = host_app_root(&platform.os);
+    let release = read_current_release(transport, &root, app)?
+        .ok_or_else(|| CiaoError::Config(format!("app `{app}` has no active release")))?;
+    Ok(read_release_manifest(transport, &root, app, &release)?.health)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCloudflareConfig {
+    app: Option<String>,
+    tunnel_name: Option<String>,
+    tunnel: String,
+    credentials: String,
+    hostname: String,
+    port: u16,
+}
+
+fn read_cloudflare_config<T: RemoteHost + ?Sized>(transport: &T) -> Result<Option<String>> {
+    let output = remote_script(
+        transport,
+        "read Cloudflare Tunnel configuration",
+        "set -eu\nif sudo -n test -f /etc/cloudflared/config.yml; then sudo -n cat /etc/cloudflared/config.yml; else printf '__CIAO_MISSING__'; fi\n",
+    )?;
+    if output.stdout.trim() == "__CIAO_MISSING__" || output.stdout.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(output.stdout))
+    }
+}
+
+fn parse_cloudflare_config(contents: &str) -> Option<ParsedCloudflareConfig> {
+    let app = contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# managed-by: ciao app=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let tunnel_name = contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# tunnel-name:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let tunnel = contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("tunnel:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })?;
+    let credentials = contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("credentials-file:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })?;
+    let mut hostname = None;
+    let mut port = None;
+    for line in contents.lines() {
+        let value = line.trim();
+        if let Some(value) = value.strip_prefix("- hostname:") {
+            hostname = Some(value.trim().to_owned());
+        } else if let Some(value) = value.strip_prefix("service:") {
+            let service = value.trim();
+            if let Some(address) = service
+                .strip_prefix("http://localhost:")
+                .or_else(|| service.strip_prefix("http://127.0.0.1:"))
+            {
+                port = address.parse::<u16>().ok();
+            }
+        }
+    }
+    Some(ParsedCloudflareConfig {
+        app,
+        tunnel_name,
+        tunnel,
+        credentials,
+        hostname: hostname.filter(|value| !value.is_empty())?,
+        port: port?,
+    })
+}
+
+fn cloudflare_config_owned_by_app(config: &ParsedCloudflareConfig, app: &str) -> bool {
+    config.app.as_deref() == Some(app)
+        || config.tunnel_name.as_deref() == Some(&format!("ciao-{app}"))
+        || config.tunnel == format!("ciao-{app}")
+}
+
+fn cloudflare_config_owned_by_app_on_host<T: RemoteHost + ?Sized>(
+    transport: &T,
+    config: &ParsedCloudflareConfig,
+    app: &str,
+    adopt_legacy: bool,
+) -> Result<bool> {
+    if cloudflare_config_owned_by_app(config, app) {
+        return Ok(true);
+    }
+    if !adopt_legacy {
+        return Ok(false);
+    }
+    // Older Ciao versions wrote an unmarked config. If its hostname is still
+    // the app's Caddy domain, take ownership on the next deploy and add the
+    // marker while repairing the active upstream port.
+    Ok(read_existing_domain(transport, app)?.as_deref() == Some(config.hostname.as_str()))
+}
+
+pub(crate) fn cloudflare_tunnel_status<T: RemoteHost + ?Sized>(
+    transport: &T,
+    app: &str,
+) -> Result<Option<CloudflareTunnelStatus>> {
+    let Some(contents) = read_cloudflare_config(transport)? else {
+        return Ok(None);
+    };
+    let Some(config) = parse_cloudflare_config(&contents) else {
+        return Ok(None);
+    };
+    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, true)? {
+        return Ok(None);
+    }
+    validate_domain(&config.hostname)?;
+    Ok(Some(CloudflareTunnelStatus {
+        hostname: config.hostname,
+        tunnel: config.tunnel_name.unwrap_or(config.tunnel),
+        port: config.port,
+        managed: config.app.as_deref() == Some(app),
+    }))
+}
+
+pub(crate) fn sync_cloudflare_tunnel_if_present(
+    transport: &OpenSshTransport,
+    app: &str,
+) -> Result<bool> {
+    validate_identifier("app name", app)?;
+    let Some(contents) = read_cloudflare_config(transport)? else {
+        return Ok(false);
+    };
+    let Some(config) = parse_cloudflare_config(&contents) else {
+        return Ok(false);
+    };
+    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, true)? {
+        return Ok(false);
+    }
+    validate_domain(&config.hostname)?;
+    let platform = transport.inspect()?;
+    let port = active_cloudflare_port(transport, app)?;
+    let changed = config.port != port || config.app.as_deref() != Some(app);
+    if changed {
+        let updated = cloudflare_config_contents(
+            app,
+            &config.tunnel,
+            config.tunnel_name.as_deref(),
+            &config.credentials,
+            &config.hostname,
+            port,
+        );
+        write_remote_file(
+            transport,
+            "/etc/cloudflared/config.yml",
+            &updated,
+            "root",
+            "synchronize Cloudflare Tunnel ingress",
+        )?;
+        remote_script(
+            transport,
+            "reload Cloudflare Tunnel",
+            &cloudflared_reload_script(&platform.os),
+        )?;
+    }
+    let health = read_active_health(transport, app)?;
+    cloudflare_public_healthcheck(transport, &config.hostname, &health)?;
+    Ok(changed)
+}
+
+pub(crate) fn remove_cloudflare_tunnel_if_owned(
+    transport: &OpenSshTransport,
+    app: &str,
+) -> Result<bool> {
+    validate_identifier("app name", app)?;
+    let Some(contents) = read_cloudflare_config(transport)? else {
+        return Ok(false);
+    };
+    let Some(config) = parse_cloudflare_config(&contents) else {
+        return Ok(false);
+    };
+    if !cloudflare_config_owned_by_app_on_host(transport, &config, app, false)? {
+        return Ok(false);
+    }
+    let platform = transport.inspect()?;
+    remote_script(
+        transport,
+        "disable Cloudflare Tunnel service",
+        &cloudflared_disable_script(&platform.os),
+    )?;
+    remote_script(
+        transport,
+        "remove Cloudflare Tunnel ingress",
+        "set -eu\nsudo -n rm -f /etc/cloudflared/config.yml\n",
+    )?;
+    Ok(true)
+}
+
+fn cloudflared_reload_script(os: &HostOs) -> String {
+    match os {
+        HostOs::Linux => "set -eu\nsudo -n systemctl reload cloudflared 2>/dev/null || sudo -n systemctl restart cloudflared\n".to_owned(),
+        HostOs::MacOs => "set -eu\nsudo -n launchctl kickstart -k system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl start com.cloudflare.cloudflared\n".to_owned(),
+        HostOs::Unknown(_) => String::new(),
+    }
+}
+
+fn cloudflared_disable_script(os: &HostOs) -> String {
+    match os {
+        HostOs::Linux => "set -eu\nsudo -n systemctl disable --now cloudflared 2>/dev/null || true\n".to_owned(),
+        HostOs::MacOs => "set -eu\nsudo -n launchctl bootout system/com.cloudflare.cloudflared 2>/dev/null || sudo -n launchctl stop com.cloudflare.cloudflared 2>/dev/null || true\n".to_owned(),
+        HostOs::Unknown(_) => "set -eu\ntrue\n".to_owned(),
+    }
+}
+
+fn cloudflare_public_healthcheck(
+    transport: &OpenSshTransport,
+    hostname: &str,
+    health: &HealthConfig,
+) -> Result<()> {
+    validate_domain(hostname)?;
+    let url = format!("https://{hostname}{}", health.path);
+    let attempts = health.timeout_seconds.saturating_mul(2).saturating_add(1);
+    let script = format!(
+        "set -eu\nexpected={}\nattempts={}\nfor attempt in $(seq 1 \"$attempts\"); do\n    actual=$(curl --silent --insecure --max-time 3 --header {} --output /dev/null --write-out '%{{http_code}}' {} || true)\n    if [ \"$actual\" = \"$expected\" ]; then exit 0; fi\n    case \"$actual\" in 000|5??|'') ;; *) echo \"Cloudflare healthcheck expected HTTP $expected, got $actual\" >&2; exit 1;; esac\n    if [ \"$attempt\" -lt \"$attempts\" ]; then sleep 0.5; fi\ndone\necho \"Cloudflare healthcheck timed out after {}s for {}\" >&2\nexit 1\n",
+        health.expected_status,
+        attempts,
+        shell_quote(&format!("Host: {hostname}")),
+        shell_quote(&url),
+        health.timeout_seconds,
+        shell_quote(hostname),
+    );
+    remote_script(transport, "Cloudflare public healthcheck", &script).map(|_| ())
 }
 
 fn cloudflared_executable() -> Option<PathBuf> {
@@ -5772,6 +6108,8 @@ pub struct StatusResult {
     pub port: Option<u16>,
     pub app_type: Option<AppType>,
     pub service_manager: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare: Option<CloudflareTunnelStatus>,
     pub message: String,
 }
 
@@ -6355,6 +6693,9 @@ fn deploy_unlocked(
         progress_step(reporter, "synchronize Funnel route", || {
             sync_tailscale_funnel_route_if_present(transport, &plan.name).map(|_| ())
         })?;
+        progress_step(reporter, "synchronize Cloudflare Tunnel", || {
+            sync_cloudflare_tunnel_if_present(transport, &plan.name).map(|_| ())
+        })?;
         if let Some(domain) = effective_domain {
             progress_step(reporter, "configure domain", || {
                 if existing_domain_is_plain_http(transport, &plan.name)? {
@@ -6466,6 +6807,7 @@ fn deploy_unlocked(
                 }
                 let _ = configure_remote_ciao_domain(transport, &plan.name);
                 let _ = sync_tailscale_funnel_route_if_present(transport, &plan.name);
+                let _ = sync_cloudflare_tunnel_if_present(transport, &plan.name);
             }
         } else {
             if effective_domain.is_some() {
@@ -7831,6 +8173,33 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_config_is_detected_and_requires_both_values() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("package.json"), "{}\n").unwrap();
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"tv\"\n[tunnel]\nhostname = \"tv.example.com\"\ntunnel = \"production\"\n",
+        )
+        .unwrap();
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(
+            plan.tunnel,
+            Some(TunnelConfig {
+                hostname: "tv.example.com".to_owned(),
+                tunnel: "production".to_owned(),
+            })
+        );
+
+        fs::write(
+            directory.path().join("ciao.toml"),
+            "[app]\nname = \"tv\"\n[tunnel]\nhostname = \"tv.example.com\"\n",
+        )
+        .unwrap();
+        let error = detect_project(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("[tunnel].tunnel is required"));
+    }
+
+    #[test]
     fn funnel_defaults_to_token_and_none_requires_public_declaration() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
@@ -8137,6 +8506,37 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000".to_owned())
         );
         assert!(uuid_from_text("not a tunnel id").is_none());
+    }
+
+    #[test]
+    fn cloudflare_config_uses_the_active_port_and_ignores_fallback_ingress() {
+        let contents = cloudflare_config_contents(
+            "demo",
+            "123e4567-e89b-12d3-a456-426614174000",
+            Some("production"),
+            "/etc/cloudflared/demo.json",
+            "tv.example.com",
+            41002,
+        );
+        assert!(contents.contains("# managed-by: ciao app=demo"));
+        assert!(contents.contains("# tunnel-name: production"));
+        assert!(contents.contains("service: http://localhost:41002"));
+        assert!(contents.contains("httpHostHeader: tv.example.com"));
+        let parsed = parse_cloudflare_config(&contents).expect("generated config parses");
+        assert_eq!(parsed.app.as_deref(), Some("demo"));
+        assert_eq!(parsed.tunnel, "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(parsed.hostname, "tv.example.com");
+        assert_eq!(parsed.port, 41002);
+    }
+
+    #[test]
+    fn cloudflare_config_recognizes_legacy_ciao_tunnel_ownership() {
+        let contents = "tunnel: ciao-demo\ncredentials-file: /etc/cloudflared/demo.json\ningress:\n  - hostname: demo.example.com\n    service: http://127.0.0.1:41001\n  - service: http_status:404\n";
+        let parsed = parse_cloudflare_config(contents).expect("legacy config parses");
+        assert!(parsed.app.is_none());
+        assert!(parsed.tunnel_name.is_none());
+        assert!(cloudflare_config_owned_by_app(&parsed, "demo"));
+        assert!(!cloudflare_config_owned_by_app(&parsed, "other"));
     }
 
     #[test]

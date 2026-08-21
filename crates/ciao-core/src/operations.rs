@@ -25,6 +25,14 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
             HostOs::Unknown(_) => "unsupported".to_owned(),
         },
     };
+    let cloudflare = cloudflare_tunnel_status(transport, app)?;
+    let message = match cloudflare.as_ref() {
+        Some(tunnel) => format!(
+            "{app}: {status}\n  Cloudflare: https://{} (port {})",
+            tunnel.hostname, tunnel.port
+        ),
+        None => format!("{app}: {status}"),
+    };
     Ok(StatusResult {
         app: app.to_owned(),
         status: status.clone(),
@@ -32,7 +40,8 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
         port: manifest.as_ref().and_then(|manifest| manifest.port),
         app_type: manifest.map(|manifest| manifest.app_type),
         service_manager: platform.os.service_manager_name().to_owned(),
-        message: format!("{app}: {status}"),
+        cloudflare,
+        message,
     })
 }
 
@@ -77,6 +86,7 @@ pub fn remove_app(transport: &OpenSshTransport, app: &str) -> Result<OperationRe
         .filter_map(|release| release.port)
         .collect::<Vec<_>>();
     cleanup_tailscale_serve_for_ports(transport, app, &serve_ports)?;
+    remove_cloudflare_tunnel_if_owned(transport, app)?;
     if !manifest
         .as_ref()
         .is_some_and(|manifest| manifest.app_type == AppType::Static)
@@ -466,6 +476,7 @@ pub fn rollback_to(
         }
         configure_remote_ciao_domain(transport, app)?;
         sync_tailscale_funnel_route_if_present(transport, app)?;
+        sync_cloudflare_tunnel_if_present(transport, app)?;
         Ok::<(), CiaoError>(())
     })();
     if let Err(error) = activation {
@@ -571,6 +582,7 @@ pub fn rollback_to(
             }
             configure_remote_ciao_domain(transport, app)?;
             sync_tailscale_funnel_route_if_present(transport, app)?;
+            sync_cloudflare_tunnel_if_present(transport, app)?;
             Ok::<(), CiaoError>(())
         })();
         let recovery = match restore {

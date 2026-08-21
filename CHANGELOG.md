@@ -6,6 +6,24 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.15] - 2026-08-21
+
+- Add project-owned Cloudflare Tunnel declarations with `[tunnel] hostname`
+  and `tunnel` settings. Ciao writes a marked ingress, targets the active
+  release port, reloads `cloudflared` after deploy and rollback, and reports
+  the public hostname and port in `ciao status`.
+- Probe declared Cloudflare hostnames through the public HTTPS chain with the
+  configured `Host` header and retry window instead of probing a candidate
+  loopback port directly.
+- Remove Ciao-owned Cloudflare configuration during `ciao app remove` while
+  leaving unmarked user configuration untouched; adopt older Ciao routes on a
+  matching Caddy hostname during the next deploy.
+- Extend `ciao host audit` with Cloudflare ingress, hostname resolution, dead
+  upstream port and active-release drift checks alongside Caddy and Funnel
+  exposure findings.
+- Keep Caddy's Cloudflare route and the generated release start script aligned
+  through the active release manifest, including stable `[run].port` services.
+
 ## [v0.1.14] - 2026-08-21
 
 - Treat `[run].port` as a stable service port and verify explicit-port services

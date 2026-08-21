@@ -48,6 +48,7 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
         .iter()
         .map(|app| app.app.clone())
         .collect::<BTreeSet<_>>();
+    audit_cloudflare_exposure(transport, &app_names, &mut items)?;
     for app in &apps {
         let Some(release) = read_current_release(transport, &root, &app.app)? else {
             items.push(AuditItem {
@@ -83,6 +84,25 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
                 &format!("/etc/caddy/ciao/{}.caddy", app.app),
                 &expected,
             )?;
+            if let Some(actual) = read_remote_file(
+                transport,
+                &format!("/etc/caddy/ciao/{}.caddy", app.app),
+                "audit public Caddy route",
+            )? {
+                if let Some(port) = caddy_upstream_port(&actual) {
+                    let status = match remote_port_is_listening(transport, port)? {
+                        Some(true) => "ok",
+                        Some(false) => "dead-port",
+                        None => "unknown-port",
+                    };
+                    items.push(AuditItem {
+                        path: format!("caddy/{}/upstream", app.app),
+                        status: status.to_owned(),
+                        expected: Some("active release port".to_owned()),
+                        actual: Some(port.to_string()),
+                    });
+                }
+            }
         }
         let funnel_path = format!("/etc/caddy/ciao/{}.funnel.caddy", app.app);
         if let Some(actual) = read_remote_file(transport, &funnel_path, "audit Funnel route")? {
@@ -250,6 +270,93 @@ pub fn host_audit(transport: &OpenSshTransport) -> Result<HostAuditResult> {
             format!("⚠ host audit: {drift_count} drift item(s)")
         },
     })
+}
+
+fn audit_cloudflare_exposure(
+    transport: &OpenSshTransport,
+    app_names: &BTreeSet<String>,
+    items: &mut Vec<AuditItem>,
+) -> Result<()> {
+    let Some(contents) = read_cloudflare_config(transport)? else {
+        return Ok(());
+    };
+    let Some(config) = parse_cloudflare_config(&contents) else {
+        items.push(AuditItem {
+            path: "/etc/cloudflared/config.yml".to_owned(),
+            status: "invalid".to_owned(),
+            expected: Some("Ciao-managed Cloudflare ingress".to_owned()),
+            actual: Some("unparseable ingress configuration".to_owned()),
+        });
+        return Ok(());
+    };
+    let owner = config
+        .app
+        .clone()
+        .or_else(|| {
+            config
+                .tunnel_name
+                .as_deref()
+                .and_then(|name| name.strip_prefix("ciao-"))
+                .map(str::to_owned)
+        })
+        .or_else(|| config.tunnel.strip_prefix("ciao-").map(str::to_owned));
+    let owner_status = match owner.as_deref() {
+        Some(app) if app_names.contains(app) => "ok",
+        Some(_) => "orphan",
+        None => "unmanaged",
+    };
+    items.push(AuditItem {
+        path: "/etc/cloudflared/config.yml".to_owned(),
+        status: owner_status.to_owned(),
+        expected: Some("active Ciao Cloudflare ingress".to_owned()),
+        actual: Some(format!("{} → localhost:{}", config.hostname, config.port)),
+    });
+    let hostname_status = if validate_domain(&config.hostname).is_err() {
+        "invalid-hostname"
+    } else {
+        match remote_hostname_resolves(transport, &config.hostname)? {
+            Some(true) => "ok",
+            Some(false) => "unresolved-hostname",
+            None => "unknown-hostname",
+        }
+    };
+    items.push(AuditItem {
+        path: "cloudflared/hostname".to_owned(),
+        status: hostname_status.to_owned(),
+        expected: Some("resolvable public hostname".to_owned()),
+        actual: Some(config.hostname.clone()),
+    });
+    let port_status = match remote_port_is_listening(transport, config.port)? {
+        Some(true) => "ok",
+        Some(false) => "dead-port",
+        None => "unknown-port",
+    };
+    items.push(AuditItem {
+        path: "cloudflared/upstream".to_owned(),
+        status: port_status.to_owned(),
+        expected: Some("active release port".to_owned()),
+        actual: Some(config.port.to_string()),
+    });
+    if let Some(app) = owner.as_deref() {
+        if !app_names.contains(app) {
+            return Ok(());
+        }
+        let platform = transport.inspect()?;
+        let root = host_app_root(&platform.os);
+        if let Some(release) = read_current_release(transport, &root, app)? {
+            let manifest = read_release_manifest(transport, &root, app, &release)?;
+            let expected_port = manifest.port.unwrap_or(80);
+            if expected_port != config.port {
+                items.push(AuditItem {
+                    path: format!("cloudflared/{app}/upstream"),
+                    status: "drift".to_owned(),
+                    expected: Some(expected_port.to_string()),
+                    actual: Some(config.port.to_string()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn audit_tailscale_exposures(

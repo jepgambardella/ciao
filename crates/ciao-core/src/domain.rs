@@ -213,8 +213,8 @@ pub(super) fn configure_release_caddy_route(
     Ok(())
 }
 
-pub(super) fn read_existing_domain(
-    transport: &OpenSshTransport,
+pub(super) fn read_existing_domain<T: RemoteHost + ?Sized>(
+    transport: &T,
     app: &str,
 ) -> Result<Option<String>> {
     validate_identifier("app name", app)?;
@@ -242,8 +242,8 @@ pub(super) fn read_existing_domain(
     }
 }
 
-pub(super) fn existing_domain_is_plain_http(
-    transport: &OpenSshTransport,
+pub(super) fn existing_domain_is_plain_http<T: RemoteHost + ?Sized>(
+    transport: &T,
     app: &str,
 ) -> Result<bool> {
     validate_identifier("app name", app)?;

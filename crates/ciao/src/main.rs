@@ -546,6 +546,23 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            let declared_tunnel = declared_cloudflare_tunnel(&components, plan.as_ref())?;
+            if let (Some((_, tunnel)), Some(domain)) =
+                (declared_tunnel.as_ref(), args.domain.as_deref())
+            {
+                if tunnel.hostname != domain {
+                    return Err(CiaoError::Config(format!(
+                        "[tunnel].hostname is `{}`, but --domain requested `{domain}`",
+                        tunnel.hostname
+                    )));
+                }
+            }
+            let cloudflare_declared = declared_tunnel.is_some() || args.domain.is_some();
+            let deploy_domain = if cloudflare_declared {
+                None
+            } else {
+                args.domain.as_deref()
+            };
             if !cli.json {
                 if let Some(plan) = plan.as_ref() {
                     if let Some(warning) = plan.binding_warning.as_deref() {
@@ -572,6 +589,12 @@ fn run(cli: Cli) -> Result<()> {
                         .to_owned(),
                 ));
             }
+            if cloudflare_declared && !args.dry_run && !interactive_output {
+                return Err(CiaoError::Config(
+                    "Cloudflare Tunnel setup requires an interactive terminal; run the deploy from a terminal"
+                        .to_owned(),
+                ));
+            }
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
             }
@@ -583,7 +606,7 @@ fn run(cli: Cli) -> Result<()> {
                     &transport,
                     &path,
                     &components,
-                    args.domain.as_deref(),
+                    deploy_domain,
                     args.dry_run,
                     if !interactive_output {
                         &NoopProgressReporter
@@ -599,6 +622,9 @@ fn run(cli: Cli) -> Result<()> {
                 .map_err(|error| actionable_deploy_error(error, &args.host))?;
                 if !cli.json && args.dry_run {
                     eprintln!("✓ dry-run complete");
+                }
+                if cloudflare_declared && args.dry_run {
+                    eprintln!("Would synchronize the Cloudflare Tunnel ingress after deployment.");
                 }
                 if matches!(args.action, Some(DeployAction::Funnel)) && args.dry_run {
                     let app = result
@@ -627,6 +653,31 @@ fn run(cli: Cli) -> Result<()> {
                     let funnel = setup_tailscale_funnel(&transport, app)?;
                     println!("{}", funnel.message);
                 }
+                if !args.dry_run {
+                    if let Some((app, tunnel)) = declared_tunnel.as_ref() {
+                        if let Err(error) =
+                            setup_cloudflare_tunnel_with_config(&transport, app, tunnel)
+                        {
+                            eprintln!(
+                                "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
+                            );
+                        }
+                    } else if let Some(domain) = args.domain.as_deref() {
+                        if let Err(error) = setup_cloudflare_tunnel(
+                            &transport,
+                            result
+                                .components
+                                .last()
+                                .map(|component| component.app.as_str())
+                                .unwrap_or("frontend"),
+                            domain,
+                        ) {
+                            eprintln!(
+                                "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
+                            );
+                        }
+                    }
+                }
                 output(&result, cli.json, || result.message.clone());
                 return Ok(());
             }
@@ -636,7 +687,7 @@ fn run(cli: Cli) -> Result<()> {
                     &transport,
                     &path,
                     &plan,
-                    args.domain.as_deref(),
+                    deploy_domain,
                     args.dry_run,
                     if !interactive_output {
                         &NoopProgressReporter
@@ -667,6 +718,9 @@ fn run(cli: Cli) -> Result<()> {
                     result.app
                 );
             }
+            if cloudflare_declared && args.dry_run {
+                eprintln!("Would synchronize the Cloudflare Tunnel ingress after deployment.");
+            }
             output(&result, cli.json, || result.message.clone());
             if !args.ci && !args.dry_run && interactive_output {
                 if matches!(args.action, Some(DeployAction::Funnel)) || plan.funnel.enabled {
@@ -678,7 +732,15 @@ fn run(cli: Cli) -> Result<()> {
                         "! deployment succeeded, but local .ciao routing was not configured: {error}"
                     );
                 }
-                if let Some(domain) = args.domain.as_deref() {
+                if let Some((_, tunnel)) = declared_tunnel.as_ref() {
+                    if let Err(error) =
+                        setup_cloudflare_tunnel_with_config(&transport, &result.app, tunnel)
+                    {
+                        eprintln!(
+                            "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
+                        );
+                    }
+                } else if let Some(domain) = args.domain.as_deref() {
                     if let Err(error) = setup_cloudflare_tunnel(&transport, &result.app, domain) {
                         eprintln!(
                             "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
@@ -1210,6 +1272,36 @@ fn validate_funnel_port(components: &[ProjectComponent], plan: Option<&ProjectPl
     )))
 }
 
+fn declared_cloudflare_tunnel(
+    components: &[ProjectComponent],
+    plan: Option<&ProjectPlan>,
+) -> Result<Option<(String, TunnelConfig)>> {
+    if components.is_empty() {
+        return Ok(plan.and_then(|plan| {
+            plan.tunnel
+                .clone()
+                .map(|tunnel| (plan.name.clone(), tunnel))
+        }));
+    }
+    let declared = components
+        .iter()
+        .filter_map(|component| {
+            component
+                .plan
+                .tunnel
+                .clone()
+                .map(|tunnel| (component.name.clone(), tunnel))
+        })
+        .collect::<Vec<_>>();
+    match declared.as_slice() {
+        [] => Ok(None),
+        [tunnel] => Ok(Some(tunnel.clone())),
+        _ => Err(CiaoError::Config(
+            "only one [tunnel] declaration is supported per full-stack deployment".to_owned(),
+        )),
+    }
+}
+
 fn tailscale_funnel_approval_url(error: &CiaoError) -> Option<String> {
     match error {
         CiaoError::RemoteCommand { stdout, stderr, .. } => {
@@ -1263,7 +1355,18 @@ fn offer_remote_local_domain(transport: &OpenSshTransport, app: &str) -> Result<
 fn setup_cloudflare_tunnel(transport: &OpenSshTransport, app: &str, domain: &str) -> Result<()> {
     let platform = transport.inspect()?;
     let result = cloudflare_tunnel_setup(transport, &platform.os, app, domain)?;
-    configure_domain_for_cloudflare(transport, app, domain)?;
+    println!("✓ public domain: https://{}", result.domain);
+    println!("  {}", result.message);
+    Ok(())
+}
+
+fn setup_cloudflare_tunnel_with_config(
+    transport: &OpenSshTransport,
+    app: &str,
+    config: &TunnelConfig,
+) -> Result<()> {
+    let platform = transport.inspect()?;
+    let result = cloudflare_tunnel_setup_with_config(transport, &platform.os, app, config)?;
     println!("✓ public domain: https://{}", result.domain);
     println!("  {}", result.message);
     Ok(())

@@ -449,6 +449,22 @@ creates or reuses a tunnel, creates the DNS route and installs the standard
 Cloudflare service on the host. The user still owns the Cloudflare account and
 the domain.
 
+For an existing project-owned tunnel, declare the rule instead of passing a
+one-off port or hostname:
+
+```toml
+[tunnel]
+hostname = "tv.example.com"
+tunnel = "abcmovie"
+```
+
+Ciao marks the ingress, reads the active release port after every activation or
+rollback, reloads `cloudflared`, and probes the public hostname with the
+configured `Host` header. `ciao status` shows the managed hostname and port;
+`ciao app remove` removes the Ciao-owned ingress. `ciao host audit` checks this
+ingress together with Funnel rules and Caddy fragments for orphaned rules,
+unresolved hostnames and dead ports.
+
 Architecture:
 
 ```text
@@ -2466,7 +2482,7 @@ HTTPS
 Then:
 
 ```text
-Cloudflare Tunnel adapter
+Cloudflare Tunnel adapter with active-port synchronization
 ```
 
 ---

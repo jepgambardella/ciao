@@ -71,6 +71,23 @@ Ciao installs `cloudflared` when needed, opens the Cloudflare sign-in page once,
 creates or reuses a standard tunnel, creates the DNS route and starts the
 standard `cloudflared` service on the host.
 
+For a tunnel that belongs to the project, declare the hostname and existing
+tunnel name in `ciao.toml`:
+
+```toml
+[tunnel]
+hostname = "tv.example.com"
+tunnel = "abcmovie"
+```
+
+Ciao then owns that ingress rule. It points Cloudflare at the port of the
+active release, reloads `cloudflared` after deploy and rollback, checks the
+public hostname with the configured `Host` header, removes the Ciao-owned
+configuration with `ciao app remove`, and shows the hostname and port in
+`ciao status`. Only one `[tunnel]` declaration is accepted in a full-stack
+deploy; use separate Ciao apps when the backend and frontend need separate
+hostnames.
+
 For a temporary public URL without a Cloudflare domain, add `funnel` after the
 host:
 
@@ -173,7 +190,8 @@ second. If the second step fails, Ciao restores the backend release too. The
 own local `.ciao` route.
 
 Add `ciao.toml` only when you need custom build, run, health check, domain,
-release retention, environment or lifecycle hooks. For example:
+release retention, environment, lifecycle hooks or a project-owned Cloudflare
+Tunnel. For example:
 
 ```toml
 [releases]
@@ -184,6 +202,10 @@ pre_upload = "scripts/backup-db.sh"
 pre_activate = "ciao run-remote bin/rails db:migrate"
 post_activate = "scripts/notify-deploy.sh"
 on_rollback = "scripts/notify-rollback.sh"
+
+[tunnel]
+hostname = "tv.example.com"
+tunnel = "abcmovie"
 ```
 
 `pre_upload` runs on the local computer. The other hooks run remotely as the
