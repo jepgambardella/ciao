@@ -6,6 +6,12 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.35] - 2026-08-22
+
+- Fix `ciao env set HOST APP KEY=value`: inline values no longer trigger an
+  unnecessary stdin read.
+- Add a regression test for the lazy environment-value resolution path.
+
 ## [v0.1.34] - 2026-08-22
 
 - Treat declared Cloudflare Tunnel domains as external edge routes; stale Caddy

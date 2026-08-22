@@ -942,7 +942,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Env { command } => match command {
             EnvCommand::Set { host, app, key } => {
                 let (key, inline_value) = parse_env_assignment(&key)?;
-                let value = inline_value.unwrap_or(read_secret_value()?);
+                // Do not use `unwrap_or(read_secret_value()?)`: function
+                // arguments are evaluated eagerly, which would consume stdin
+                // even when KEY=value already supplied the value.
+                let value = resolve_env_value(inline_value)?;
                 let transport =
                     authorized_transport_for(&host, cli.json, "setting an environment variable")?;
                 set_env(&transport, &app, &key, &value)?;
@@ -2956,6 +2959,13 @@ fn read_secret_value() -> Result<String> {
     Ok(value)
 }
 
+fn resolve_env_value(inline_value: Option<String>) -> Result<String> {
+    match inline_value {
+        Some(value) => Ok(value),
+        None => read_secret_value(),
+    }
+}
+
 fn parse_env_assignment(input: &str) -> Result<(String, Option<String>)> {
     let (key, value) = input
         .split_once('=')
@@ -3014,7 +3024,7 @@ fn confirm_env_push(diff: &EnvDiff, yes: bool, json_output: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_env_assignment;
+    use super::{parse_env_assignment, resolve_env_value};
 
     #[test]
     fn env_assignment_accepts_inline_values_with_equals() {
@@ -3030,5 +3040,10 @@ mod tests {
             parse_env_assignment("TOKEN").unwrap(),
             ("TOKEN".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn inline_environment_value_does_not_read_stdin() {
+        assert_eq!(resolve_env_value(Some("a=b".to_owned())).unwrap(), "a=b");
     }
 }
