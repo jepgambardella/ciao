@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.22] - 2026-08-22
+
+- Remove empty Cloudflare lock directories immediately after interrupted
+  releases, avoiding false concurrent-update errors on the next deploy.
+
 ## [v0.1.21] - 2026-08-22
 
 - Recover empty stale Cloudflare config locks left by interrupted SSH sessions.
