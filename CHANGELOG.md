@@ -6,6 +6,12 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.29] - 2026-08-22
+
+- Migrate stale pre-0.1.28 directory locks safely when the kernel lock is
+  first used, preventing old `.ciao-config-lock` state from bypassing the new
+  lock protocol.
+
 ## [v0.1.28] - 2026-08-22
 
 - Replace the Cloudflare directory lease with a kernel `flock` holder on

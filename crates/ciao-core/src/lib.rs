@@ -5415,6 +5415,27 @@ fn acquire_cloudflare_config_lock<'a>(
     let script = format!(
         r#"set -eu
 sudo -n install -d -m 0700 /etc/cloudflared
+legacy=/etc/cloudflared/.ciao-config-lock
+if sudo -n test -d "$legacy"; then
+    legacy_started=$(sudo -n cat "$legacy/started" 2>/dev/null || true)
+    legacy_owner=$(sudo -n cat "$legacy/owner" 2>/dev/null || true)
+    legacy_mtime=$(sudo -n stat -c %Y "$legacy" 2>/dev/null || printf '0')
+    legacy_stale=0
+    case "$legacy_started" in
+        ''|*[!0-9]*)
+            if [ -z "$legacy_owner" ] && [ "$legacy_mtime" -gt 0 ] && [ $(( $(date +%s) - legacy_mtime )) -gt 30 ]; then legacy_stale=1; fi
+            ;;
+        *)
+            if [ $(( $(date +%s) - legacy_started )) -gt 300 ]; then legacy_stale=1; fi
+            ;;
+    esac
+    if [ "$legacy_stale" -eq 1 ]; then
+        sudo -n rm -rf "$legacy"
+    else
+        echo 'another Ciao Cloudflare config update is already running' >&2
+        exit 73
+    fi
+fi
 command -v flock >/dev/null 2>&1 || {{ echo 'flock is required for Cloudflare config locking' >&2; exit 74; }}
 sudo -n sh -c {holder} </dev/null >/dev/null 2>&1 &
 launcher=$!
