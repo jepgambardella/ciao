@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.37] - 2026-08-22
+
+- Keep log release selection lazy and authoritative: when a systemd slot is
+  active, logs never fall back to a second, potentially stale `current` read.
+
 ## [v0.1.36] - 2026-08-22
 
 - Make `ciao logs` return the latest 200 systemd entries with ISO timestamps.

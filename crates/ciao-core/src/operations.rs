@@ -213,16 +213,10 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
     let root = host_app_root(&platform.os);
     let current = read_current_release(transport, &root, app)?;
     let active = active_service(transport, &platform.os, &root, app)?;
-    let release = active
-        .as_ref()
-        .and_then(|service| service.release.clone())
-        .or(effective_release_for_app(
-            transport,
-            &platform.os,
-            &root,
-            app,
-            current.as_deref(),
-        )?);
+    let release = match active.as_ref().and_then(|service| service.release.clone()) {
+        Some(release) => Some(release),
+        None => effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?,
+    };
     let manifest = if let Some(release) = release.as_deref() {
         let manifest = read_release_manifest(transport, &root, app, release)?;
         if manifest.app_type == AppType::Static {
