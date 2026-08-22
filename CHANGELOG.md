@@ -6,6 +6,13 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.23] - 2026-08-22
+
+- Avoid acquiring the shared Cloudflare Tunnel lock twice during one deploy.
+  Declared tunnels and explicit domains are configured once after activation,
+  preventing false `another Ciao Cloudflare config update is already running`
+  warnings from empty lock directories.
+
 ## [v0.1.22] - 2026-08-22
 
 - Remove empty Cloudflare lock directories immediately after interrupted
