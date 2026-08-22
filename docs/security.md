@@ -75,6 +75,12 @@ credential file is read locally and sent over SSH only to the root-owned target
 path with mode `0600`; it is never printed or stored in Ciao state. The public
 TLS connection ends at Cloudflare.
 
+When `[tunnel]` is present, Ciao does not read or reload the app's public Caddy
+fragment: the tunnel is the edge route. The same explicit behavior is available
+for other external proxies with `ciao deploy --skip-caddy`. A transient SSH
+failure during the initial host inspection can be retried with `--retry N`; no
+retry is attempted after release state changes.
+
 `ciao host audit` reports the Cloudflare ingress together with Caddy fragments
 and Tailscale Funnel/Serve rules. It flags orphaned Ciao rules, unresolved
 hostnames, dead upstream ports and an ingress port that differs from the active

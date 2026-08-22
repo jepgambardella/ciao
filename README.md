@@ -103,6 +103,17 @@ referenced by `/etc/cloudflared/config.yml`; a local Cloudflare login is only
 needed when creating the first shared Tunnel. This keeps deploys from CI and
 other non-interactive shells safe.
 
+When the public hostname is already routed by Cloudflare (or another edge
+proxy) and Caddy must not own the domain, use `--skip-caddy`:
+
+```bash
+ciao deploy home --skip-caddy
+```
+
+Projects with a `[tunnel]` declaration select this behavior automatically, so
+a stale Caddy fragment cannot poison later deploys. For a flaky SSH/Tailscale
+connection, retry only the safe initial host inspection with `--retry 3`.
+
 For a temporary public URL without a Cloudflare domain, add `funnel` after the
 host:
 

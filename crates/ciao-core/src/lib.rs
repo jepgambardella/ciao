@@ -65,7 +65,9 @@ use service_slots::{
     active_service, active_slot_from_unit, active_slot_path, opposite_slot, read_active_slot,
     reconcile_current_to_active, slot_service_unit_name, write_active_slot,
 };
-pub use transaction::{deploy_full_stack_with_mode, FullStackDeployResult};
+pub use transaction::{
+    deploy_full_stack_with_mode, deploy_full_stack_with_mode_options, FullStackDeployResult,
+};
 
 pub const APP_ROOT: &str = "/var/lib/ciao/apps";
 pub const CONFIG_ENV: &str = "CIAO_CONFIG";
@@ -277,6 +279,16 @@ impl ProgressReporter for NoopProgressReporter {}
 pub enum DeployHostMode {
     NonInteractive,
     Interactive,
+}
+
+/// Optional deploy behavior controlled by the CLI. The defaults preserve the
+/// normal Ciao behavior: Caddy routes are managed and SSH inspection is done
+/// once. Retries are intentionally limited to the initial inspection, before
+/// any release or service state can be changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeployOptions {
+    pub skip_caddy: bool,
+    pub retry: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6883,10 +6895,35 @@ pub fn deploy_with_mode(
     reporter: &dyn ProgressReporter,
     host_mode: DeployHostMode,
 ) -> Result<DeployResult> {
+    deploy_with_mode_options(
+        transport,
+        source,
+        plan,
+        domain,
+        dry_run,
+        reporter,
+        host_mode,
+        DeployOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deploy_with_mode_options(
+    transport: &OpenSshTransport,
+    source: &Path,
+    plan: &ProjectPlan,
+    domain: Option<&str>,
+    dry_run: bool,
+    reporter: &dyn ProgressReporter,
+    host_mode: DeployHostMode,
+    options: DeployOptions,
+) -> Result<DeployResult> {
     if dry_run {
-        return deploy_unlocked(transport, source, plan, domain, true, reporter);
+        return deploy_unlocked(transport, source, plan, domain, true, reporter, options);
     }
-    let platform = progress_step(reporter, "inspect host", || transport.inspect())?;
+    let platform = progress_step(reporter, "inspect host", || {
+        inspect_host_with_retry(transport, options.retry)
+    })?;
     // A new host cannot acquire Ciao's root-owned deployment lock yet. Prepare
     // it first, then serialize the release transaction with the normal lock.
     match host_mode {
@@ -6905,7 +6942,7 @@ pub fn deploy_with_mode(
         }
         return Err(error);
     }
-    let result = deploy_unlocked(transport, source, plan, domain, false, reporter);
+    let result = deploy_unlocked(transport, source, plan, domain, false, reporter, options);
     let unlock_result = progress_step_uncancellable(reporter, "release deployment lock", || {
         release_deploy_lock(transport, &root, &plan.name, &lock_owner)
     });
@@ -6952,6 +6989,7 @@ fn deploy_unlocked(
     domain: Option<&str>,
     dry_run: bool,
     reporter: &dyn ProgressReporter,
+    options: DeployOptions,
 ) -> Result<DeployResult> {
     if let Some(domain) = domain {
         validate_domain(domain)?;
@@ -7003,14 +7041,24 @@ fn deploy_unlocked(
     let root = host_app_root(&platform.os);
     let previous_release = read_current_release(transport, &root, &plan.name)?;
     let mut warnings = Vec::new();
-    let retained_domain = match read_existing_domain(transport, &plan.name) {
-        Ok(domain) => domain,
-        Err(error) => {
-            warnings.push(format!("existing domain route could not be read: {error}"));
-            None
+    // A declarative Cloudflare Tunnel owns the public hostname directly. A
+    // stale Caddy fragment must not turn every later deploy into an attempted
+    // :443 reload on hosts where Caddy is intentionally not the edge proxy.
+    let manage_caddy_domain = !options.skip_caddy && plan.tunnel.is_none();
+    let retained_domain = if manage_caddy_domain {
+        match read_existing_domain(transport, &plan.name) {
+            Ok(domain) => domain,
+            Err(error) => {
+                warnings.push(format!("existing domain route could not be read: {error}"));
+                None
+            }
         }
+    } else {
+        None
     };
-    let effective_domain = domain.or(retained_domain.as_deref());
+    let effective_domain = manage_caddy_domain
+        .then(|| domain.or(retained_domain.as_deref()))
+        .flatten();
     let port = if plan.app_type == AppType::Static {
         None
     } else {
@@ -7266,17 +7314,19 @@ fn deploy_unlocked(
                         candidate_slot.expect("Linux service deployments have a candidate slot");
                     let candidate_unit = slot_service_unit_name(&plan.name, slot)?;
                     let mut proxy_ready = true;
-                    if let Err(error) = configure_release_caddy_route(
-                        transport,
-                        &platform.os,
-                        &root,
-                        &plan.name,
-                        &release,
-                        &local_domain(&plan.name)?,
-                        true,
-                    ) {
-                        proxy_ready = false;
-                        warnings.push(format!("local Ciao route unavailable: {error}"));
+                    if !options.skip_caddy {
+                        if let Err(error) = configure_release_caddy_route(
+                            transport,
+                            &platform.os,
+                            &root,
+                            &plan.name,
+                            &release,
+                            &local_domain(&plan.name)?,
+                            true,
+                        ) {
+                            proxy_ready = false;
+                            warnings.push(format!("local Ciao route unavailable: {error}"));
+                        }
                     }
                     if let Some(domain) = effective_domain {
                         let cloudflare =
@@ -7406,10 +7456,12 @@ fn deploy_unlocked(
                 )
             })?;
         }
-        if let Err(error) = progress_step(reporter, "configure local Ciao domain", || {
-            configure_remote_ciao_domain(transport, &plan.name)
-        }) {
-            warnings.push(format!("local Ciao route unavailable: {error}"));
+        if !options.skip_caddy {
+            if let Err(error) = progress_step(reporter, "configure local Ciao domain", || {
+                configure_remote_ciao_domain(transport, &plan.name)
+            }) {
+                warnings.push(format!("local Ciao route unavailable: {error}"));
+            }
         }
         if let Err(error) = progress_step(reporter, "synchronize Funnel route", || {
             sync_tailscale_funnel_route_if_present(transport, &plan.name).map(|_| ())
@@ -7530,15 +7582,20 @@ fn deploy_unlocked(
                         );
                     }
                 }
-                if let Some(domain) = retained_domain.as_deref() {
-                    let _ = if existing_domain_is_plain_http(transport, &plan.name).unwrap_or(false)
-                    {
-                        configure_domain_for_cloudflare(transport, &plan.name, domain)
-                    } else {
-                        configure_domain(transport, &plan.name, domain)
-                    };
+                if manage_caddy_domain {
+                    if let Some(domain) = retained_domain.as_deref() {
+                        let _ = if existing_domain_is_plain_http(transport, &plan.name)
+                            .unwrap_or(false)
+                        {
+                            configure_domain_for_cloudflare(transport, &plan.name, domain)
+                        } else {
+                            configure_domain(transport, &plan.name, domain)
+                        };
+                    }
                 }
-                let _ = configure_remote_ciao_domain(transport, &plan.name);
+                if !options.skip_caddy {
+                    let _ = configure_remote_ciao_domain(transport, &plan.name);
+                }
                 let _ = sync_tailscale_funnel_route_if_present(transport, &plan.name);
                 let _ = sync_cloudflare_tunnel_if_present(transport, &plan.name);
             }
@@ -8525,6 +8582,54 @@ fn remote_healthcheck(
     remote_script(transport, "healthcheck", &script).map(|_| ())
 }
 
+fn inspect_host_with_retry(transport: &OpenSshTransport, retries: usize) -> Result<HostPlatform> {
+    let attempts = retries.saturating_add(1);
+    for attempt in 0..attempts {
+        match transport.inspect() {
+            Ok(platform) => return Ok(platform),
+            Err(error) if attempt + 1 < attempts && is_transient_ssh_error(&error) => {
+                let delay_ms = 250_u64.saturating_mul(1_u64 << attempt.min(3));
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("host inspection retry loop always returns")
+}
+
+fn is_transient_ssh_error(error: &CiaoError) -> bool {
+    let (stage, exit, text) = match error {
+        CiaoError::RemoteCommand {
+            stage,
+            exit,
+            stdout,
+            stderr,
+        } => (stage.as_str(), Some(*exit), format!("{stdout}\n{stderr}")),
+        CiaoError::Transport {
+            stage,
+            message,
+            details,
+        } => (stage.as_str(), None, format!("{message}\n{details}")),
+        _ => return false,
+    };
+    if stage != "host inspection" {
+        return false;
+    }
+    let text = text.to_ascii_lowercase();
+    exit == Some(255)
+        || [
+            "timed out",
+            "connection reset",
+            "connection closed",
+            "broken pipe",
+            "no route to host",
+            "could not resolve hostname",
+            "connection refused",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
 fn healthcheck_script(url: &str, health: &HealthConfig) -> String {
     let attempts = health.timeout_seconds.saturating_mul(2).saturating_add(1);
     format!(
@@ -8743,6 +8848,39 @@ mod tests {
             stderr: "sudo: user is not allowed to run sudo".to_owned(),
         };
         assert!(!remote_sudo_password_required(&policy_error));
+    }
+
+    #[test]
+    fn ciaoignore_patterns_are_forwarded_to_the_upload_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(".ciaoignore"),
+            "match.db\ncache/\n# comment\n!keep.db\n",
+        )
+        .unwrap();
+        let patterns = upload_ignore_patterns(directory.path());
+        assert!(patterns.contains(&"match.db".to_owned()));
+        assert!(patterns.contains(&"./match.db".to_owned()));
+        assert!(patterns.contains(&"cache/".to_owned()));
+        assert!(!patterns.iter().any(|pattern| pattern.contains("keep.db")));
+    }
+
+    #[test]
+    fn host_inspection_retries_only_transient_ssh_failures() {
+        let transient = CiaoError::RemoteCommand {
+            stage: "host inspection".to_owned(),
+            exit: 255,
+            stdout: String::new(),
+            stderr: "ssh: connect to host server port 22: Operation timed out".to_owned(),
+        };
+        assert!(is_transient_ssh_error(&transient));
+        let application_failure = CiaoError::RemoteCommand {
+            stage: "healthcheck".to_owned(),
+            exit: 255,
+            stdout: String::new(),
+            stderr: "connection refused".to_owned(),
+        };
+        assert!(!is_transient_ssh_error(&application_failure));
     }
 
     #[test]

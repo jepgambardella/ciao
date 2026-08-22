@@ -131,6 +131,13 @@ struct DeployArgs {
     /// Run without the local Ciao config, using CIAO_HOST/CIAO_USER/CIAO_APP.
     #[arg(long)]
     ci: bool,
+    /// Do not write or reload Caddy routes. Use this when the hostname is
+    /// served by Cloudflare Tunnel or another external edge proxy.
+    #[arg(long)]
+    skip_caddy: bool,
+    /// Retry transient SSH host-inspection failures with exponential backoff.
+    #[arg(long, default_value_t = 0)]
+    retry: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -590,6 +597,12 @@ fn run(cli: Cli) -> Result<()> {
             let progress = TerminalProgress::new();
             let interactive_output =
                 !cli.json && !args.ci && io::stdin().is_terminal() && io::stderr().is_terminal();
+            let deploy_options = DeployOptions {
+                // A declared tunnel is an external edge route. It must not
+                // inherit a stale Caddy domain fragment on a later deploy.
+                skip_caddy: args.skip_caddy || declared_tunnel.is_some(),
+                retry: args.retry,
+            };
             if !args.dry_run && args.ci {
                 require_noninteractive_sudo(&transport, "CI deployment")?;
             }
@@ -597,7 +610,7 @@ fn run(cli: Cli) -> Result<()> {
                 offer_passwordless_sudo_setup(&transport)?;
             }
             if !components.is_empty() {
-                let result = deploy_full_stack_with_mode(
+                let result = deploy_full_stack_with_mode_options(
                     &transport,
                     &path,
                     &components,
@@ -613,6 +626,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         DeployHostMode::NonInteractive
                     },
+                    deploy_options,
                 )
                 .map_err(|error| actionable_deploy_error(error, &args.host))?;
                 if !cli.json && args.dry_run {
@@ -710,7 +724,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let plan = plan.expect("single project plan is present when components are empty");
             let deploy = || {
-                deploy_with_mode(
+                deploy_with_mode_options(
                     &transport,
                     &path,
                     &plan,
@@ -726,6 +740,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         DeployHostMode::NonInteractive
                     },
+                    deploy_options,
                 )
             };
             let result = match deploy() {
@@ -763,7 +778,7 @@ fn run(cli: Cli) -> Result<()> {
                     setup_tailscale_funnel_with_mode(&transport, &result.app, interactive_output)?;
                 print_setup_message(&funnel.message, cli.json || !interactive_output);
             }
-            if !args.ci && !args.dry_run && interactive_output {
+            if !args.ci && !args.dry_run && interactive_output && !deploy_options.skip_caddy {
                 if let Err(error) = offer_remote_local_domain(&transport, &result.app) {
                     eprintln!(
                         "! deployment succeeded, but local .ciao routing was not configured: {error}"

@@ -25,6 +25,29 @@ pub fn deploy_full_stack_with_mode(
     reporter: &dyn ProgressReporter,
     host_mode: DeployHostMode,
 ) -> Result<FullStackDeployResult> {
+    deploy_full_stack_with_mode_options(
+        transport,
+        project_root,
+        components,
+        domain,
+        dry_run,
+        reporter,
+        host_mode,
+        DeployOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deploy_full_stack_with_mode_options(
+    transport: &OpenSshTransport,
+    project_root: &Path,
+    components: &[ProjectComponent],
+    domain: Option<&str>,
+    dry_run: bool,
+    reporter: &dyn ProgressReporter,
+    host_mode: DeployHostMode,
+    options: DeployOptions,
+) -> Result<FullStackDeployResult> {
     if components.len() < 2
         || !components
             .iter()
@@ -52,7 +75,7 @@ pub fn deploy_full_stack_with_mode(
             "deploy {} component `{}`",
             component.role, component.name
         ));
-        match deploy_with_mode(
+        match deploy_with_mode_options(
             transport,
             &component.path,
             &component.plan,
@@ -60,6 +83,7 @@ pub fn deploy_full_stack_with_mode(
             dry_run,
             reporter,
             host_mode,
+            options,
         ) {
             Ok(result) => deployed.push(result),
             Err(error) if deployed.is_empty() || dry_run => return Err(error),

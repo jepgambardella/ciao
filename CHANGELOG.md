@@ -6,6 +6,15 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.34] - 2026-08-22
+
+- Treat declared Cloudflare Tunnel domains as external edge routes; stale Caddy
+  fragments no longer trigger a reload on every deploy.
+- Add `ciao deploy --skip-caddy` for hosts where another proxy owns the public
+  listener, and `--retry N` for transient SSH failures during host inspection.
+- Add regression coverage for `.ciaoignore` upload exclusions and retry
+  classification.
+
 ## [v0.1.33] - 2026-08-22
 
 - Reject SQLite-like runtime artifacts in service sources before upload; use
