@@ -1087,6 +1087,44 @@ fn project_declares_tunnel(path: &Path) -> bool {
     false
 }
 
+fn audit_local_tunnel_manifest(
+    transport: &OpenSshTransport,
+    result: &mut HostAuditResult,
+) -> Result<()> {
+    let root = PathBuf::from(".");
+    let Ok(plan) = detect_project(&root) else {
+        return Ok(());
+    };
+    let Some(tunnel) = plan.tunnel else {
+        return Ok(());
+    };
+    let Ok(status) = app_status(transport, &plan.name) else {
+        return Ok(());
+    };
+    let actual = status.domain.clone();
+    result.items.push(AuditItem {
+        path: "ciao.toml/tunnel/domain".to_owned(),
+        status: if actual.as_deref() == Some(tunnel.hostname.as_str()) {
+            "ok".to_owned()
+        } else {
+            "drift".to_owned()
+        },
+        expected: Some(tunnel.hostname),
+        actual,
+    });
+    result.drift_count = result
+        .items
+        .iter()
+        .filter(|item| item.status != "ok")
+        .count();
+    result.message = if result.drift_count == 0 {
+        "✓ host audit: no drift detected".to_owned()
+    } else {
+        format!("⚠ host audit: {} drift item(s)", result.drift_count)
+    };
+    Ok(())
+}
+
 fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {
     // Keep the natural `ciao dev stop` spelling while retaining the explicit
     // `--stop` alias. A project directory literally named `stop` is not a
@@ -2383,7 +2421,8 @@ fn host_command(command: HostCommand, json_output: bool) -> Result<()> {
         }
         HostCommand::Audit { name, diff } => {
             let transport = transport_for(&name)?;
-            let result = host_audit(&transport)?;
+            let mut result = host_audit(&transport)?;
+            audit_local_tunnel_manifest(&transport, &mut result)?;
             if json_output {
                 println!(
                     "{}",

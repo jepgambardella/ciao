@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.26] - 2026-08-22
+
+- Extend `ciao host audit` with the local manifest versus remote public-domain
+  coherence check when run from a project directory.
+
 ## [v0.1.25] - 2026-08-22
 
 - Persist `ciao deploy --domain` in the project `ciao.toml`.
