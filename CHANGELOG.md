@@ -6,6 +6,10 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.21] - 2026-08-22
+
+- Recover empty stale Cloudflare config locks left by interrupted SSH sessions.
+
 ## [v0.1.20] - 2026-08-21
 
 - Preserve manual Cloudflare ingress routes when a legacy global ownership
