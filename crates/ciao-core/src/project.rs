@@ -413,6 +413,9 @@ fn parse_tunnel_config(
     let Some(config) = config else {
         return Ok(None);
     };
+    if config.domain.is_none() && config.hostname.is_some() {
+        eprintln!("⚠ [tunnel].hostname è deprecato, usa [tunnel].domain");
+    }
     let hostname = config
         .domain
         .clone()

@@ -545,6 +545,20 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             let declared_tunnel = declared_cloudflare_tunnel(&components, plan.as_ref())?;
+            if let Some((_, tunnel)) = declared_tunnel.as_ref() {
+                let manifest_path = if components.is_empty() {
+                    path.join("ciao.toml")
+                } else {
+                    components
+                        .iter()
+                        .find(|component| component.plan.tunnel.is_some())
+                        .map(|component| component.path.join("ciao.toml"))
+                        .unwrap_or_else(|| path.join("ciao.toml"))
+                };
+                if project_uses_legacy_tunnel(&manifest_path) {
+                    persist_tunnel_config(&manifest_path, &tunnel.hostname, Some(&tunnel.tunnel))?;
+                }
+            }
             if let (Some((_, tunnel)), Some(domain)) =
                 (declared_tunnel.as_ref(), args.domain.as_deref())
             {
@@ -1085,6 +1099,27 @@ fn project_declares_tunnel(path: &Path) -> bool {
         }
     }
     false
+}
+
+fn project_uses_legacy_tunnel(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut in_tunnel = false;
+    let mut legacy = false;
+    let mut modern = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            in_tunnel = trimmed == "[tunnel]";
+            continue;
+        }
+        if in_tunnel {
+            legacy |= trimmed.starts_with("hostname =") || trimmed.starts_with("tunnel =");
+            modern |= trimmed.starts_with("domain =") || trimmed.starts_with("name =");
+        }
+    }
+    legacy && !modern
 }
 
 fn audit_local_tunnel_manifest(

@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.27] - 2026-08-22
+
+- Warn on legacy `[tunnel].hostname` and normalize legacy tunnel keys to the
+  `domain`/`name` schema during deployment.
+
 ## [v0.1.26] - 2026-08-22
 
 - Extend `ciao host audit` with the local manifest versus remote public-domain
