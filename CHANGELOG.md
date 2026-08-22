@@ -6,6 +6,12 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.31] - 2026-08-22
+
+- Reconcile existing Cloudflare ingress for projects with a declared
+  `[tunnel]` before reporting the new release active; a locked or unavailable
+  exposure now fails the deploy instead of being silently skipped.
+
 ## [v0.1.30] - 2026-08-22
 
 - Make concurrent Cloudflare updates wait up to 30 seconds on the kernel lock

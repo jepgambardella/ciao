@@ -7403,11 +7403,11 @@ fn deploy_unlocked(
         }) {
             warnings.push(format!("Funnel route not synchronized: {error}"));
         }
-        // A declared tunnel (or an explicit domain) is configured by the CLI
-        // after activation. Do not acquire the host Cloudflare lock here as
-        // well: doing so creates two sequential lock lifecycles in one deploy
-        // and can leave an empty lock directory between them.
-        if plan.tunnel.is_none() && domain.is_none() {
+        // Reconcile an existing host config before the deploy is reported
+        // active. A declared tunnel may still be a first-time setup (in which
+        // case no config exists and this is a no-op), but an existing route
+        // must never be silently skipped when its lock cannot be acquired.
+        if domain.is_none() {
             progress_step(reporter, "synchronize Cloudflare Tunnel", || {
                 sync_cloudflare_tunnel_if_present(transport, &plan.name).map(|_| ())
             })?;

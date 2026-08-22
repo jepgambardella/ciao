@@ -3,7 +3,7 @@ members = ["crates/ciao-core", "crates/ciao"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.30"
+version = "0.1.31"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
