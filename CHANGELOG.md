@@ -6,6 +6,14 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.28] - 2026-08-22
+
+- Replace the Cloudflare directory lease with a kernel `flock` holder on
+  `/etc/cloudflared/config.lock`; interrupted holders no longer leave a stale
+  directory lock.
+- Wait briefly for concurrent Cloudflare updates and fail the deployment when
+  an existing exposure cannot be synchronized, allowing normal rollback.
+
 ## [v0.1.27] - 2026-08-22
 
 - Warn on legacy `[tunnel].hostname` and normalize legacy tunnel keys to the

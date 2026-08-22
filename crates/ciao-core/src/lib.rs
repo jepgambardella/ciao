@@ -5379,11 +5379,11 @@ impl Drop for CloudflareConfigLock<'_> {
             self.transport,
             "release Cloudflare Tunnel config lock",
             &format!(
-                "set -eu\nif sudo -n test -f {owner_file} && [ \"$(sudo -n cat {owner_file})\" = {owner} ]; then sudo -n rm -f {owner_file} {started_file}; sudo -n rmdir {lock}; fi\n",
-                owner_file = shell_quote(&format!("{}/owner", self.path)),
-                started_file = shell_quote(&format!("{}/started", self.path)),
+                "set -eu\nif sudo -n test -f {owner_file} && [ \"$(sudo -n cat {owner_file})\" = {owner} ]; then pid=$(sudo -n cat {pid_file} 2>/dev/null || true); case \"$pid\" in ''|*[!0-9]*) ;; *) sudo -n pkill -TERM -P \"$pid\" 2>/dev/null || true; sudo -n kill \"$pid\" 2>/dev/null || true ;; esac; sudo -n rm -f {owner_file} {pid_file} {result_file}; fi\n",
+                owner_file = shell_quote(&format!("{}.owner", self.path)),
+                pid_file = shell_quote(&format!("{}.pid", self.path)),
+                result_file = shell_quote(&format!("{}.result-{}", self.path, self.owner)),
                 owner = shell_quote(&self.owner),
-                lock = shell_quote(&self.path),
             ),
         );
     }
@@ -5394,14 +5394,55 @@ fn acquire_cloudflare_config_lock<'a>(
     app: &str,
 ) -> Result<CloudflareConfigLock<'a>> {
     validate_identifier("app name", app)?;
-    let path = "/etc/cloudflared/.ciao-config-lock".to_owned();
+    let path = "/etc/cloudflared/config.lock".to_owned();
     let owner = format!("{}-{app}-{}", std::process::id(), release_id());
-    let script = format!(
-        "set -eu\nsudo -n install -d -m 0700 /etc/cloudflared\nnow=$(date +%s)\nif ! sudo -n mkdir -m 0700 {lock} 2>/dev/null; then started=''; if sudo -n test -f {started_file}; then started=$(sudo -n cat {started_file} || true); fi; stale=0; case \"$started\" in ''|*[!0-9]*) mtime=$(sudo -n stat -c %Y {lock} 2>/dev/null || sudo -n stat -f %m {lock} 2>/dev/null || printf '0'); if ! sudo -n test -f {owner_file}; then case \"$mtime\" in ''|*[!0-9]*) ;; *) if [ $((now - mtime)) -gt 30 ]; then stale=1; fi;; esac; else case \"$mtime\" in ''|*[!0-9]*) ;; *) if [ $((now - mtime)) -gt 900 ]; then stale=1; fi;; esac; fi;; *) if [ $((now - started)) -gt 900 ]; then stale=1; fi;; esac; if [ \"$stale\" -eq 1 ]; then sudo -n rm -rf {lock}; fi; fi\nif ! sudo -n mkdir -m 0700 {lock} 2>/dev/null; then echo 'another Ciao Cloudflare config update is already running' >&2; exit 73; fi\nprintf '%s\\n' {owner} | sudo -n tee {owner_file} >/dev/null\nprintf '%s\\n' \"$now\" | sudo -n tee {started_file} >/dev/null\n",
-        lock = shell_quote(&path),
+    let owner_file = format!("{path}.owner");
+    let pid_file = format!("{path}.pid");
+    let result_file = format!("{path}.result-{owner}");
+    let payload = format!(
+        "printf '%s\\n' {owner} >{owner_file}; printf '%s\\n' \"$$\" >{pid}; printf '%s\\n' acquired >{result}; trap 'rm -f {owner_file} {pid_file} {result}; exit' TERM INT HUP EXIT; sleep 300",
         owner = shell_quote(&owner),
-        owner_file = shell_quote(&format!("{path}/owner")),
-        started_file = shell_quote(&format!("{path}/started")),
+        owner_file = owner_file,
+        pid = pid_file,
+        result = result_file,
+    );
+    let holder = format!(
+        "if flock -n {lock} sh -c {payload}; then :; else printf '%s\\n' busy >{result}; exit 73; fi",
+        lock = path,
+        payload = shell_quote(&payload),
+        result = shell_quote(&result_file),
+    );
+    let script = format!(
+        r#"set -eu
+sudo -n install -d -m 0700 /etc/cloudflared
+command -v flock >/dev/null 2>&1 || {{ echo 'flock is required for Cloudflare config locking' >&2; exit 74; }}
+sudo -n sh -c {holder} </dev/null >/dev/null 2>&1 &
+launcher=$!
+attempt=0
+while :; do
+    state=$(sudo -n cat {result} 2>/dev/null || true)
+    case "$state" in
+        acquired)
+            sudo -n rm -f {result}
+            break
+            ;;
+        busy)
+            sudo -n rm -f {result}
+            echo 'another Ciao Cloudflare config update is already running' >&2
+            exit 73
+            ;;
+    esac
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 30 ]; then
+        kill "$launcher" 2>/dev/null || true
+        echo 'timed out waiting for the Cloudflare config lock' >&2
+        exit 73
+    fi
+    sleep 1
+done
+"#,
+        holder = shell_quote(&holder),
+        result = shell_quote(&result_file),
     );
     remote_script(transport, "acquire Cloudflare Tunnel config lock", &script)?;
     Ok(CloudflareConfigLock {
@@ -5583,10 +5624,13 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
     app: &str,
 ) -> Result<bool> {
     validate_identifier("app name", app)?;
-    let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
-    let Some(contents) = read_cloudflare_config(transport)? else {
+    // Avoid creating a global lock on hosts that have no Cloudflare config.
+    // Once a config exists, reread it under the lock before changing it.
+    let Some(initial_contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
+    let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
+    let contents = read_cloudflare_config(transport)?.unwrap_or(initial_contents);
     let mut config = parse_cloudflare_config(&contents)?;
     let Some((_, route)) = config.route_for_app(app) else {
         return Ok(false);
@@ -7343,11 +7387,9 @@ fn deploy_unlocked(
         // well: doing so creates two sequential lock lifecycles in one deploy
         // and can leave an empty lock directory between them.
         if plan.tunnel.is_none() && domain.is_none() {
-            if let Err(error) = progress_step(reporter, "synchronize Cloudflare Tunnel", || {
+            progress_step(reporter, "synchronize Cloudflare Tunnel", || {
                 sync_cloudflare_tunnel_if_present(transport, &plan.name).map(|_| ())
-            }) {
-                warnings.push(format!("Cloudflare Tunnel not synchronized: {error}"));
-            }
+            })?;
         }
         if let Some(domain) = effective_domain {
             if let Err(error) = progress_step(reporter, "configure domain", || {
