@@ -643,24 +643,55 @@ fn run(cli: Cli) -> Result<()> {
                             eprintln!(
                                 "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
                             );
+                        } else if args.domain.is_some() {
+                            if let Err(error) = persist_tunnel_config(
+                                &path.join("ciao.toml"),
+                                &tunnel.hostname,
+                                Some(&tunnel.tunnel),
+                            ) {
+                                eprintln!(
+                                    "! Cloudflare Tunnel is active, but ciao.toml was not updated: {error}"
+                                );
+                            } else if !cli.json {
+                                println!("✓ dominio {} salvato in ciao.toml", tunnel.hostname);
+                                println!("  rimozione: ciao domain remove {} {app}", args.host);
+                                println!("✓ pubblico: https://{}", tunnel.hostname);
+                            }
                         }
                     } else if let Some(domain) = args.domain.as_deref() {
-                        if let Err(error) = setup_cloudflare_tunnel(
-                            &transport,
-                            result
-                                .components
-                                .last()
-                                .map(|component| component.app.as_str())
-                                .unwrap_or("frontend"),
-                            domain,
-                        ) {
+                        let app = result
+                            .components
+                            .last()
+                            .map(|component| component.app.as_str())
+                            .unwrap_or("frontend");
+                        if let Err(error) = setup_cloudflare_tunnel(&transport, app, domain) {
                             eprintln!(
                                 "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
                             );
+                        } else if let Err(error) =
+                            persist_tunnel_config(&path.join("ciao.toml"), domain, None)
+                        {
+                            eprintln!(
+                                "! Cloudflare Tunnel is active, but ciao.toml was not updated: {error}"
+                            );
+                        } else if !cli.json {
+                            println!("✓ dominio {domain} salvato in ciao.toml");
+                            println!("  rimozione: ciao domain remove {} {app}", args.host);
+                            println!("✓ pubblico: https://{domain}");
                         }
                     }
                 }
                 output(&result, cli.json, || result.message.clone());
+                if !cloudflare_declared
+                    && !args.dry_run
+                    && !cli.json
+                    && !project_declares_tunnel(&path)
+                {
+                    eprintln!(
+                        "suggerimento: per esporre pubblicamente questa app: ciao deploy {} --domain <d>",
+                        args.host
+                    );
+                }
                 return Ok(());
             }
             let plan = plan.expect("single project plan is present when components are empty");
@@ -704,6 +735,13 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("Would synchronize the Cloudflare Tunnel ingress after deployment.");
             }
             output(&result, cli.json, || result.message.clone());
+            if !cloudflare_declared && !args.dry_run && !cli.json && !project_declares_tunnel(&path)
+            {
+                eprintln!(
+                    "suggerimento: per esporre pubblicamente questa app: ciao deploy {} --domain <d>",
+                    args.host
+                );
+            }
             if !args.dry_run
                 && (matches!(args.action, Some(DeployAction::Funnel)) || plan.funnel.enabled)
             {
@@ -731,12 +769,42 @@ fn run(cli: Cli) -> Result<()> {
                         eprintln!(
                             "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
                         );
+                    } else if args.domain.is_some() {
+                        if let Err(error) = persist_tunnel_config(
+                            &path.join("ciao.toml"),
+                            &tunnel.hostname,
+                            Some(&tunnel.tunnel),
+                        ) {
+                            eprintln!(
+                                "! Cloudflare Tunnel is active, but ciao.toml was not updated: {error}"
+                            );
+                        } else if !cli.json {
+                            println!("✓ dominio {} salvato in ciao.toml", tunnel.hostname);
+                            println!(
+                                "  rimozione: ciao domain remove {} {}",
+                                args.host, result.app
+                            );
+                            println!("✓ pubblico: https://{}", tunnel.hostname);
+                        }
                     }
                 } else if let Some(domain) = args.domain.as_deref() {
                     if let Err(error) = setup_cloudflare_tunnel(&transport, &result.app, domain) {
                         eprintln!(
                             "! deployment succeeded, but Cloudflare Tunnel was not configured: {error}"
                         );
+                    } else if let Err(error) =
+                        persist_tunnel_config(&path.join("ciao.toml"), domain, None)
+                    {
+                        eprintln!(
+                            "! Cloudflare Tunnel is active, but ciao.toml was not updated: {error}"
+                        );
+                    } else if !cli.json {
+                        println!("✓ dominio {domain} salvato in ciao.toml");
+                        println!(
+                            "  rimozione: ciao domain remove {} {}",
+                            args.host, result.app
+                        );
+                        println!("✓ pubblico: https://{domain}");
                     }
                 }
             }
@@ -762,10 +830,11 @@ fn run(cli: Cli) -> Result<()> {
                         .iter()
                         .map(|app| {
                             format!(
-                                "{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}",
                                 app.app,
                                 app.status,
-                                app.release.as_deref().unwrap_or("-")
+                                app.release.as_deref().unwrap_or("-"),
+                                app.domain.as_deref().unwrap_or("-")
                             )
                         })
                         .collect::<Vec<_>>()
@@ -952,6 +1021,7 @@ fn run(cli: Cli) -> Result<()> {
             DomainCommand::Add { host, app, domain } => {
                 let transport = authorized_transport_for(&host, cli.json, "configuring a domain")?;
                 add_domain(&transport, &app, &domain)?;
+                persist_tunnel_config(&PathBuf::from("ciao.toml"), &domain, None)?;
                 if cli.json {
                     println!("{}", json!({"app": app, "domain": domain, "changed": true}));
                 } else {
@@ -962,6 +1032,7 @@ fn run(cli: Cli) -> Result<()> {
             DomainCommand::Remove { host, app, domain } => {
                 let transport = authorized_transport_for(&host, cli.json, "removing a domain")?;
                 remove_domain(&transport, &app, &domain)?;
+                remove_tunnel_config(&PathBuf::from("ciao.toml"), Some(&domain))?;
                 if cli.json {
                     println!("{}", json!({"app": app, "domain": domain, "changed": true}));
                 } else {
@@ -996,6 +1067,24 @@ fn detect_single_project(path: &Path) -> Result<ProjectPlan> {
         )));
     }
     detect_project(path)
+}
+
+fn project_declares_tunnel(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path.join("ciao.toml")) else {
+        return false;
+    };
+    let mut in_tunnel = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            in_tunnel = trimmed == "[tunnel]";
+            continue;
+        }
+        if in_tunnel && (trimmed.starts_with("domain =") || trimmed.starts_with("hostname =")) {
+            return true;
+        }
+    }
+    false
 }
 
 fn local_dev_command(args: DevArgs, json_output: bool) -> Result<()> {

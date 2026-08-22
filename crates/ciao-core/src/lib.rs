@@ -56,7 +56,9 @@ pub use operations::{
     app_logs, app_status, follow_app_logs, lifecycle_action, list_apps, list_releases, remove_app,
     rollback, rollback_to,
 };
-pub use project::{detect_project, detect_project_components};
+pub use project::{
+    detect_project, detect_project_components, persist_tunnel_config, remove_tunnel_config,
+};
 use service_slots::{
     active_service, active_slot_from_unit, active_slot_path, opposite_slot, read_active_slot,
     reconcile_current_to_active, slot_service_unit_name, write_active_slot,
@@ -460,6 +462,8 @@ struct FunnelConfigFile {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct TunnelConfigFile {
+    domain: Option<String>,
+    name: Option<String>,
     hostname: Option<String>,
     tunnel: Option<String>,
 }
@@ -6718,6 +6722,8 @@ pub struct StatusResult {
     pub app_type: Option<AppType>,
     pub service_manager: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloudflare: Option<CloudflareTunnelStatus>,
     pub message: String,
 }
@@ -8896,12 +8902,12 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_config_is_detected_and_requires_both_values() {
+    fn tunnel_config_supports_new_schema_and_legacy_alias() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("package.json"), "{}\n").unwrap();
         fs::write(
             directory.path().join("ciao.toml"),
-            "[app]\nname = \"tv\"\n[tunnel]\nhostname = \"tv.example.com\"\ntunnel = \"production\"\n",
+            "[app]\nname = \"tv\"\n[tunnel]\ndomain = \"tv.example.com\"\nname = \"production\"\n",
         )
         .unwrap();
         let plan = detect_project(directory.path()).unwrap();
@@ -8918,8 +8924,37 @@ mod tests {
             "[app]\nname = \"tv\"\n[tunnel]\nhostname = \"tv.example.com\"\n",
         )
         .unwrap();
-        let error = detect_project(directory.path()).unwrap_err();
-        assert!(error.to_string().contains("[tunnel].tunnel is required"));
+        let plan = detect_project(directory.path()).unwrap();
+        assert_eq!(
+            plan.tunnel.as_ref().map(|tunnel| tunnel.hostname.as_str()),
+            Some("tv.example.com")
+        );
+        assert_eq!(
+            plan.tunnel.as_ref().map(|tunnel| tunnel.tunnel.as_str()),
+            Some("ciao-tv")
+        );
+    }
+
+    #[test]
+    fn tunnel_config_persistence_preserves_other_sections_and_removes_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ciao.toml");
+        fs::write(
+            &path,
+            "# keep me\n[app]\nname = \"tv\"\n\n[tunnel]\n# route comment\nhostname = \"old.example.com\"\ntunnel = \"old\"\n\n[health]\npath = \"/health\"\n",
+        )
+        .unwrap();
+        persist_tunnel_config(&path, "new.example.com", None).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# route comment"));
+        assert!(updated.contains("domain = \"new.example.com\""));
+        assert!(!updated.contains("hostname ="));
+        assert!(!updated.contains("tunnel ="));
+        assert!(updated.contains("[health]"));
+        remove_tunnel_config(&path, Some("new.example.com")).unwrap();
+        let removed = fs::read_to_string(&path).unwrap();
+        assert!(!removed.contains("[tunnel]"));
+        assert!(removed.contains("[health]"));
     }
 
     #[test]

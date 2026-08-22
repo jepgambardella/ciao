@@ -15,8 +15,6 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         .as_ref()
         .and_then(|app| app.public)
         .unwrap_or(false);
-    let funnel = parse_funnel_config(config.funnel.as_ref(), public)?;
-    let tunnel = parse_tunnel_config(config.tunnel.as_ref())?;
     let name = config
         .app
         .as_ref()
@@ -27,6 +25,8 @@ pub fn detect_project(root: &Path) -> Result<ProjectPlan> {
         })
         .ok_or_else(|| CiaoError::Detection("project has no usable name".to_owned()))?;
     validate_identifier("app name", &name)?;
+    let funnel = parse_funnel_config(config.funnel.as_ref(), public)?;
+    let tunnel = parse_tunnel_config(config.tunnel.as_ref(), &name)?;
 
     let (runtime, app_type, install, build, run, port, static_directory) = if root
         .join("Cargo.toml")
@@ -406,21 +406,175 @@ fn parse_funnel_config(config: Option<&FunnelConfigFile>, public: bool) -> Resul
     })
 }
 
-fn parse_tunnel_config(config: Option<&TunnelConfigFile>) -> Result<Option<TunnelConfig>> {
+fn parse_tunnel_config(
+    config: Option<&TunnelConfigFile>,
+    app: &str,
+) -> Result<Option<TunnelConfig>> {
     let Some(config) = config else {
         return Ok(None);
     };
     let hostname = config
-        .hostname
+        .domain
         .clone()
-        .ok_or_else(|| CiaoError::Config("[tunnel].hostname is required".to_owned()))?;
+        .or_else(|| config.hostname.clone())
+        .ok_or_else(|| CiaoError::Config("[tunnel].domain is required".to_owned()))?;
     validate_domain(&hostname)?;
     let tunnel = config
-        .tunnel
+        .name
         .clone()
-        .ok_or_else(|| CiaoError::Config("[tunnel].tunnel is required".to_owned()))?;
+        .or_else(|| config.tunnel.clone())
+        .unwrap_or_else(|| format!("ciao-{app}"));
     validate_identifier("Cloudflare tunnel name", &tunnel)?;
     Ok(Some(TunnelConfig { hostname, tunnel }))
+}
+
+/// Persist the public routing choice in the project manifest. The edit is
+/// intentionally line-based: existing comments and unrelated sections stay
+/// untouched, while the write itself is atomic.
+pub fn persist_tunnel_config(path: &Path, domain: &str, name: Option<&str>) -> Result<()> {
+    validate_domain(domain)?;
+    if let Some(name) = name {
+        validate_identifier("Cloudflare tunnel name", name)?;
+    }
+    let contents = if path.is_file() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let section = tunnel_section_bounds(&lines);
+    let block = {
+        let mut replacement = vec![
+            "[tunnel]".to_owned(),
+            format!("domain = \"{}\"", toml_escape(domain)),
+        ];
+        if let Some(name) = name {
+            replacement.push(format!("name = \"{}\"", toml_escape(name)));
+        }
+        replacement
+    };
+    match section {
+        Some((start, end)) => {
+            let old = &lines[start..end];
+            let mut replacement = old.to_vec();
+            let mut domain_written = false;
+            let mut name_written = name.is_none();
+            for line in &mut replacement {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("domain =") || trimmed.starts_with("hostname =") {
+                    *line = format!("domain = \"{}\"", toml_escape(domain));
+                    domain_written = true;
+                } else if trimmed.starts_with("name =") || trimmed.starts_with("tunnel =") {
+                    if let Some(name) = name {
+                        *line = format!("name = \"{}\"", toml_escape(name));
+                    } else {
+                        line.clear();
+                    }
+                    name_written = true;
+                }
+            }
+            if !domain_written {
+                replacement.insert(1.min(replacement.len()), block[1].clone());
+            }
+            if let Some(name) = name {
+                if !name_written {
+                    replacement.push(format!("name = \"{}\"", toml_escape(name)));
+                }
+            }
+            lines.splice(start..end, replacement);
+        }
+        None => {
+            if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
+                lines.push(String::new());
+            }
+            lines.extend(block);
+        }
+    }
+    write_project_toml_atomic(path, &lines.join("\n"))
+}
+
+/// Remove the persisted public routing choice while retaining unrelated
+/// project configuration and comments.
+pub fn remove_tunnel_config(path: &Path, domain: Option<&str>) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let Some((start, end)) = tunnel_section_bounds(&lines) else {
+        return Ok(false);
+    };
+    if let Some(expected) = domain {
+        validate_domain(expected)?;
+        let actual = lines[start..end].iter().find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("domain =")
+                .or_else(|| trimmed.strip_prefix("hostname ="))
+                .map(str::trim)
+                .and_then(|value| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+        });
+        if actual.is_some_and(|actual| actual != expected) {
+            return Err(CiaoError::Config(format!(
+                "ciao.toml tunnel domain is `{}`, not `{expected}`",
+                actual.unwrap_or("unknown")
+            )));
+        }
+    }
+    let replacement = lines[start..end]
+        .iter()
+        .skip(1)
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("domain =")
+                || trimmed.starts_with("hostname =")
+                || trimmed.starts_with("name =")
+                || trimmed.starts_with("tunnel ="))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let meaningful = replacement.iter().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    });
+    if meaningful {
+        lines.splice(start..end, replacement);
+    } else {
+        lines.splice(start..end, std::iter::empty());
+    }
+    write_project_toml_atomic(path, &lines.join("\n"))?;
+    Ok(true)
+}
+
+fn tunnel_section_bounds(lines: &[String]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|line| line.trim() == "[tunnel]")?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.starts_with('[') && !trimmed.starts_with("[[")).then_some(index)
+        })
+        .unwrap_or(lines.len());
+    Some((start, end))
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn write_project_toml_atomic(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    fs::write(&temp, format!("{contents}\n"))?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        CiaoError::Io(error)
+    })?;
+    Ok(())
 }
 
 /// Detect the common two-directory full-stack layout without requiring a

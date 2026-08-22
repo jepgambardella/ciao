@@ -6,6 +6,14 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.25] - 2026-08-22
+
+- Persist `ciao deploy --domain` in the project `ciao.toml`.
+- Support `[tunnel].domain` and optional `[tunnel].name`, while accepting the
+  legacy `hostname`/`tunnel` keys.
+- Make `ciao domain add/remove` update the local project manifest.
+- Expose the configured public domain in status and app listings.
+
 ## [v0.1.24] - 2026-08-22
 
 - Remove ownerless Cloudflare lock directories robustly, including partially

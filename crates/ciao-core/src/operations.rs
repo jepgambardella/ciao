@@ -36,6 +36,7 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
         },
     };
     let cloudflare = cloudflare_tunnel_status(transport, app)?;
+    let configured_domain = read_existing_domain(transport, app)?;
     let mut message = match cloudflare.as_ref() {
         Some(tunnel) => format!(
             "{app}: {status}\n  Cloudflare: https://{} (tunnel {}, port {}, connector {})",
@@ -57,6 +58,10 @@ pub fn app_status<T: RemoteHost + ?Sized>(transport: &T, app: &str) -> Result<St
         port: manifest.as_ref().and_then(|manifest| manifest.port),
         app_type: manifest.map(|manifest| manifest.app_type),
         service_manager: platform.os.service_manager_name().to_owned(),
+        domain: cloudflare
+            .as_ref()
+            .map(|tunnel| tunnel.hostname.clone())
+            .or(configured_domain),
         cloudflare,
         message,
     })
