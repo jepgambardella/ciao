@@ -8,7 +8,7 @@ Install Ciao on macOS or Linux.
 Usage:
   install.sh                 Install the latest GitHub release.
   install.sh --local          Install the release binary from this checkout.
-  install.sh --version v0.1.23
+  install.sh --version v0.1.24
   install.sh --help
 
 Environment:

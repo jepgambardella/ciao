@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.24] - 2026-08-22
+
+- Remove ownerless Cloudflare lock directories robustly, including partially
+  created directories where `rmdir` could not complete.
+
 ## [v0.1.23] - 2026-08-22
 
 - Avoid acquiring the shared Cloudflare Tunnel lock twice during one deploy.
