@@ -6830,6 +6830,14 @@ pub struct ReleaseInfo {
 pub struct LogsResult {
     pub app: String,
     pub logs: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_timestamp: Option<String>,
     pub message: String,
 }
 
@@ -8694,11 +8702,15 @@ fn validate_service_unit(unit: &str) -> Result<()> {
 }
 
 fn validate_since(value: &str) -> Result<()> {
+    // systemd accepts RFC3339 timestamps (including timezone offsets such as
+    // `+02:00`) and relative specifications such as `15 minutes ago`.
+    // Keep the accepted alphabet deliberately narrow because the value is
+    // passed to a remote command, while allowing all documented time syntax.
     if value.is_empty()
-        || value.len() > 32
+        || value.len() > 64
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-+ _.".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-+ :._TZ/t".contains(&byte))
     {
         return Err(CiaoError::Config("invalid --since value".to_owned()));
     }
@@ -8980,6 +8992,14 @@ mod tests {
         assert!(script.contains("sleep 0.5"));
         assert!(script.contains("[ \"$actual\" != 000 ]"));
         assert!(script.contains("healthcheck timed out after 10s"));
+    }
+
+    #[test]
+    fn logs_since_accepts_rfc3339_offsets_and_relative_durations() {
+        assert!(validate_since("2026-08-22T14:30:00+02:00").is_ok());
+        assert!(validate_since("15 minutes ago").is_ok());
+        assert!(validate_since("yesterday").is_ok());
+        assert!(validate_since("2026-08-22T14:30:00+02:00;id").is_err());
     }
 
     #[test]

@@ -212,40 +212,47 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
     }
     let root = host_app_root(&platform.os);
     let current = read_current_release(transport, &root, app)?;
-    if let Some(release) =
-        effective_release_for_app(transport, &platform.os, &root, app, current.as_deref())?
-    {
-        let manifest = read_release_manifest(transport, &root, app, &release)?;
+    let active = active_service(transport, &platform.os, &root, app)?;
+    let release = active
+        .as_ref()
+        .and_then(|service| service.release.clone())
+        .or(effective_release_for_app(
+            transport,
+            &platform.os,
+            &root,
+            app,
+            current.as_deref(),
+        )?);
+    let manifest = if let Some(release) = release.as_deref() {
+        let manifest = read_release_manifest(transport, &root, app, release)?;
         if manifest.app_type == AppType::Static {
             return Err(CiaoError::Config(format!(
                 "app `{app}` is static and has no service logs"
             )));
         }
-    }
+        Some(manifest)
+    } else {
+        None
+    };
+    let mut pid = None;
+    let mut last_event_timestamp = None;
     let result = match platform.os {
         HostOs::Linux => {
-            let unit = if let Some(active) = active_service(transport, &platform.os, &root, app)? {
-                active.unit
+            let unit = if let Some(active) = active.as_ref() {
+                active.unit.clone()
             } else if let Some(slot) = read_active_slot(transport, &root, app)? {
                 slot_service_unit_name(app, slot)?
             } else {
                 service_unit_name(app, false)
             };
-            let mut args = vec!["-u".to_owned(), unit, "--no-pager".to_owned()];
-            if let Some(since) = since {
-                validate_since(since)?;
-                args.extend(["--since".to_owned(), since.to_owned()]);
-            }
+            pid = read_systemd_pid(transport, &unit)?;
+            last_event_timestamp = read_systemd_last_event(transport, &unit, since)?;
             let command = CommandSpec {
                 program: "sudo".to_owned(),
-                args: {
-                    let mut sudo_args = vec!["-n".to_owned(), "journalctl".to_owned()];
-                    sudo_args.extend(args);
-                    sudo_args
-                },
+                args: systemd_log_command_args(&unit, since)?,
                 stdin: None,
                 stage: "read logs".to_owned(),
-                full_output: false,
+                full_output: true,
             };
             transport.exec(command.clone())?
         }
@@ -258,12 +265,12 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
             }
             let command = CommandSpec::fixed("sh", &["-s"], "read logs").with_stdin(
                 format!(
-                    "set -eu\nstdout=/Library/Ciao/logs/{app}.out\nstderr=/Library/Ciao/logs/{app}.err\nif test -f \"$stdout\"; then cat \"$stdout\"; fi\nif test -f \"$stderr\"; then cat \"$stderr\" >&2; fi\n",
+                    "set -eu\nstdout=/Library/Ciao/logs/{app}.out\nstderr=/Library/Ciao/logs/{app}.err\nif test -f \"$stdout\"; then tail -n 200 \"$stdout\"; fi\nif test -f \"$stderr\"; then tail -n 200 \"$stderr\"; fi\n",
                     app = shell_quote(app),
                 )
                 .into_bytes(),
             );
-            transport.exec(command)?
+            transport.exec(command.with_full_output())?
         }
         HostOs::Unknown(_) => {
             return Err(CiaoError::Config("unsupported host OS for logs".to_owned()))
@@ -272,8 +279,77 @@ pub fn app_logs<T: RemoteHost + ?Sized>(
     Ok(LogsResult {
         app: app.to_owned(),
         logs: result.stdout,
+        release,
+        pid,
+        port: manifest.and_then(|manifest| manifest.port),
+        last_event_timestamp,
         message: format!("logs for {app}"),
     })
+}
+
+fn systemd_log_command_args(unit: &str, since: Option<&str>) -> Result<Vec<String>> {
+    validate_service_unit(unit)?;
+    let mut args = vec![
+        "-n".to_owned(),
+        "journalctl".to_owned(),
+        "-u".to_owned(),
+        unit.to_owned(),
+        "-n".to_owned(),
+        "200".to_owned(),
+        "--no-pager".to_owned(),
+        "--output=short-iso".to_owned(),
+    ];
+    if let Some(since) = since {
+        validate_since(since)?;
+        args.extend(["--since".to_owned(), since.to_owned()]);
+    }
+    Ok(args)
+}
+
+fn read_systemd_pid<T: RemoteHost + ?Sized>(transport: &T, unit: &str) -> Result<Option<u32>> {
+    validate_service_unit(unit)?;
+    let output = remote_script(
+        transport,
+        "read service PID",
+        &format!(
+            "set -eu\nsudo -n systemctl show --property=MainPID --value {} 2>/dev/null || true\n",
+            shell_quote(unit)
+        ),
+    )?;
+    Ok(output
+        .stdout
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0))
+}
+
+fn read_systemd_last_event<T: RemoteHost + ?Sized>(
+    transport: &T,
+    unit: &str,
+    since: Option<&str>,
+) -> Result<Option<String>> {
+    let mut args = systemd_log_command_args(unit, since)?;
+    let position = args
+        .iter()
+        .position(|arg| arg == "200")
+        .ok_or_else(|| CiaoError::Config("invalid systemd log arguments".to_owned()))?;
+    args[position] = "1".to_owned();
+    let sudo_args = args;
+    let output = transport.exec(CommandSpec {
+        program: "sudo".to_owned(),
+        args: sudo_args,
+        stdin: None,
+        stage: "read latest log timestamp".to_owned(),
+        full_output: true,
+    })?;
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned))
 }
 
 /// Follow logs through one interactive SSH session. The synchronous transport
@@ -299,7 +375,7 @@ pub fn follow_app_logs(transport: &OpenSshTransport, app: &str, since: Option<&s
                 service_unit_name(app, false)
             };
             format!(
-                "set -eu\nexec sudo -n journalctl -u {} -f --no-pager{}\n",
+                "set -eu\nexec sudo -n journalctl -u {} -n 200 -f --no-pager --output=short-iso{}\n",
                 shell_quote(&unit),
                 since
             )
@@ -675,4 +751,30 @@ pub fn rollback_to(
             "✓ rolled back {app} from {current} to {previous}; active release `{active_after_rollback}`"
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_log_query_is_tail_bounded_and_timestamped() {
+        let args =
+            systemd_log_command_args("ciao-demo-slot-b.service", Some("15 minutes ago")).unwrap();
+        assert_eq!(args[0], "-n");
+        assert_eq!(args[1], "journalctl");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-u", "ciao-demo-slot-b.service"]));
+        assert!(args.windows(2).any(|pair| pair == ["-n", "200"]));
+        assert!(args.contains(&"--output=short-iso".to_owned()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--since", "15 minutes ago"]));
+    }
+
+    #[test]
+    fn systemd_log_query_rejects_unmanaged_units() {
+        assert!(systemd_log_command_args("ssh demo.service", None).is_err());
+    }
 }

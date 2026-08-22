@@ -6,6 +6,16 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.36] - 2026-08-22
+
+- Make `ciao logs` return the latest 200 systemd entries with ISO timestamps.
+- Accept RFC3339 timestamps, timezone offsets and relative systemd durations in
+  `--since`.
+- Preserve complete log output in JSON and include active release, PID, port and
+  latest-event metadata.
+- Select the journal unit and release from the service actually active on the
+  host, not only from the `current` symlink.
+
 ## [v0.1.35] - 2026-08-22
 
 - Fix `ciao env set HOST APP KEY=value`: inline values no longer trigger an

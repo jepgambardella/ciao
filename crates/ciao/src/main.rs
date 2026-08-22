@@ -919,11 +919,23 @@ fn run(cli: Cli) -> Result<()> {
             }
             let result = app_logs(&transport, &args.app, args.follow, args.since.as_deref())?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&result).map_err(ser_error)?
-                );
+                println!("{}", serde_json::to_string(&result).map_err(ser_error)?);
             } else {
+                println!(
+                    "release={} pid={} port={} last_event={}",
+                    result.release.as_deref().unwrap_or("unknown"),
+                    result
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    result
+                        .port
+                        .map(|port| port.to_string())
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    result.last_event_timestamp.as_deref().unwrap_or("unknown")
+                );
                 print!("{}", result.logs);
             }
             Ok(())
@@ -3024,7 +3036,7 @@ fn confirm_env_push(diff: &EnvDiff, yes: bool, json_output: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env_assignment, resolve_env_value};
+    use super::{parse_env_assignment, resolve_env_value, LogsResult};
 
     #[test]
     fn env_assignment_accepts_inline_values_with_equals() {
@@ -3045,5 +3057,25 @@ mod tests {
     #[test]
     fn inline_environment_value_does_not_read_stdin() {
         assert_eq!(resolve_env_value(Some("a=b".to_owned())).unwrap(), "a=b");
+    }
+
+    #[test]
+    fn logs_json_is_one_complete_record_with_escaped_lines_and_metadata() {
+        let result = LogsResult {
+            app: "demo".to_owned(),
+            logs: "2026-08-22T14:30:00+02:00 line one\nline two\n".to_owned(),
+            release: Some("20260822-143000-123".to_owned()),
+            pid: Some(4242),
+            port: Some(41001),
+            last_event_timestamp: Some("2026-08-22T14:30:00+02:00".to_owned()),
+            message: "logs for demo".to_owned(),
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains('\n'));
+        let decoded: LogsResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.logs, result.logs);
+        assert_eq!(decoded.release, result.release);
+        assert_eq!(decoded.pid, Some(4242));
+        assert_eq!(decoded.port, Some(41001));
     }
 }
