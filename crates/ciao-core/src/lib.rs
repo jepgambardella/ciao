@@ -5650,6 +5650,14 @@ pub(crate) fn sync_cloudflare_tunnel_if_present(
     let Some(initial_contents) = read_cloudflare_config(transport)? else {
         return Ok(false);
     };
+    // Do not contend for the shared lock when this app has no managed route.
+    // A project without Cloudflare exposure must not be blocked by another
+    // app's in-progress update. The config is reread after locking below so
+    // an existing route is still reconciled against concurrent changes.
+    let initial_config = parse_cloudflare_config(&initial_contents)?;
+    if initial_config.route_for_app(app).is_none() {
+        return Ok(false);
+    }
     let _cloudflare_lock = acquire_cloudflare_config_lock(transport, app)?;
     let contents = read_cloudflare_config(transport)?.unwrap_or(initial_contents);
     let mut config = parse_cloudflare_config(&contents)?;

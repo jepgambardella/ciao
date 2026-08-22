@@ -6,6 +6,12 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.32] - 2026-08-22
+
+- Avoid contending for the shared Cloudflare lock when an app has no managed
+  ingress route; unrelated deployments are no longer blocked by another app's
+  exposure update.
+
 ## [v0.1.31] - 2026-08-22
 
 - Reconcile existing Cloudflare ingress for projects with a declared
