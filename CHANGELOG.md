@@ -6,6 +6,11 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.30] - 2026-08-22
+
+- Make concurrent Cloudflare updates wait up to 30 seconds on the kernel lock
+  instead of failing immediately.
+
 ## [v0.1.29] - 2026-08-22
 
 - Migrate stale pre-0.1.28 directory locks safely when the kernel lock is

@@ -5407,7 +5407,7 @@ fn acquire_cloudflare_config_lock<'a>(
         result = result_file,
     );
     let holder = format!(
-        "if flock -n {lock} sh -c {payload}; then :; else printf '%s\\n' busy >{result}; exit 73; fi",
+        "if flock -w 30 {lock} sh -c {payload}; then :; else printf '%s\\n' busy >{result}; exit 73; fi",
         lock = path,
         payload = shell_quote(&payload),
         result = shell_quote(&result_file),
