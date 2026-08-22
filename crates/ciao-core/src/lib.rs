@@ -28,6 +28,7 @@ mod funnel;
 mod hooks;
 mod operations;
 mod project;
+mod runtime_state;
 mod service_slots;
 mod transaction;
 pub use audit::{host_audit, AuditItem, HostAuditResult};
@@ -59,6 +60,7 @@ pub use operations::{
 pub use project::{
     detect_project, detect_project_components, persist_tunnel_config, remove_tunnel_config,
 };
+use runtime_state::{quarantine_failed_release, reject_service_runtime_state};
 use service_slots::{
     active_service, active_slot_from_unit, active_slot_path, opposite_slot, read_active_slot,
     reconcile_current_to_active, slot_service_unit_name, write_active_slot,
@@ -6954,6 +6956,9 @@ fn deploy_unlocked(
     if let Some(domain) = domain {
         validate_domain(domain)?;
     }
+    if plan.app_type == AppType::Service {
+        reject_service_runtime_state(source)?;
+    }
     let release = release_id();
     validate_identifier("release", &release)?;
     if dry_run {
@@ -7588,11 +7593,11 @@ fn deploy_unlocked(
                 );
             }
         }
-        // Cleanup performs its own remote current-release check. Keeping that
-        // check and the removal in one SSH command avoids a stale local read
-        // leaving a partial release behind when cancellation interrupts a
-        // preceding SSH session.
-        let _ = cleanup_release(transport, &platform.os, &plan.name, &release);
+        // Preserve the failed candidate for inspection. The quarantine keeps
+        // it out of `releases/`, so rollback can never select it accidentally.
+        let failed_release_preserved =
+            quarantine_failed_release(transport, &platform.os, &plan.name, &release)
+                .unwrap_or(false);
         let _ = reconcile_current_to_active(transport, &platform.os, &root, &plan.name);
         let rollback_hook_message = if previous_release.is_some() {
             plan.hooks
@@ -7641,7 +7646,18 @@ fn deploy_unlocked(
         };
         return Err(CiaoError::Deployment {
             stage: "deploy".to_owned(),
-            message: format!("{}; {active_message}{rollback_hook_message}", error),
+            message: format!(
+                "{}; {active_message}{rollback_hook_message}{}",
+                error,
+                if failed_release_preserved {
+                    format!(
+                        "; failed release preserved under {root}/{}/.failed/{release}",
+                        plan.name
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             previous_release: previous_release.unwrap_or_else(|| "none".to_owned()),
         });
     }
@@ -7997,16 +8013,23 @@ fn start_script(release_path: &str, command: &str, port: u16, env_file: &str) ->
     if !env_file.starts_with('/') || env_file.contains(['\n', '\r']) {
         return Err(CiaoError::Config("environment path is invalid".to_owned()));
     }
+    let shared_dir = Path::new(env_file)
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| CiaoError::Config("shared directory path is invalid".to_owned()))?
+        .to_string_lossy()
+        .into_owned();
     if command.trim().is_empty() {
         return Err(CiaoError::Config(
             "service run command cannot be empty".to_owned(),
         ));
     }
     Ok(format!(
-        "#!/bin/sh\nset -eu\ncd -- {}\nif test -f {}; then set -a; . {}; set +a; fi\nexport HOST=127.0.0.1\nexport PORT={}\nexec {}\n",
+        "#!/bin/sh\nset -eu\ncd -- {}\nif test -f {}; then set -a; . {}; set +a; fi\nexport CIAO_SHARED_DIR={}\nexport HOST=127.0.0.1\nexport PORT={}\nexec {}\n",
         shell_quote(release_path),
         shell_quote(env_file),
         shell_quote(env_file),
+        shell_quote(&shared_dir),
         port,
         command
     ))
@@ -8024,7 +8047,7 @@ fn harden_release(transport: &OpenSshTransport, os: &HostOs, release_path: &str)
         transport,
         "harden release ownership",
         &format!(
-            "set -eu\nsudo -n chown -R root:{group} {}\nsudo -n chmod -R a-w {}\nsudo -n find {} -type d -exec chmod 0755 {{}} +\nsudo -n find {} -type f -name start -exec chmod 0755 {{}} +\n",
+            "set -eu\nsudo -n chown -R -P root:{group} {}\nsudo -n chmod -R a-w {}\nsudo -n find {} -type d -exec chmod 0755 {{}} +\nsudo -n find {} -type f -name start -exec chmod 0755 {{}} +\n",
             shell_quote(release_path),
             shell_quote(release_path),
             shell_quote(release_path),
@@ -8289,14 +8312,21 @@ fn install_service(
         .trim_end_matches("-candidate.service")
         .trim_end_matches(".service");
     validate_identifier("app name", app)?;
+    let shared_dir = Path::new(env_file)
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| CiaoError::Config("shared directory path is invalid".to_owned()))?
+        .to_string_lossy()
+        .into_owned();
     let unit_contents = match os {
         HostOs::Linux => format!(
-            "[Unit]\nDescription=Ciao app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile=-{env_file}\nExecStart=/bin/sh -lc {exec}\nRestart={}\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=Ciao app {app}\nAfter=network.target\n\n[Service]\nUser={user}\nWorkingDirectory={working_directory}\nEnvironmentFile=-{env_file}\nEnvironment=CIAO_SHARED_DIR={shared_dir}\nExecStart=/bin/sh -lc {exec}\nRestart={}\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
             if candidate { "no" } else { "on-failure" },
             app = app,
             user = user,
             working_directory = working_directory,
             env_file = env_file,
+            shared_dir = shared_dir,
             exec = shell_quote(&format!("exec {command}")),
         ),
         HostOs::MacOs => {
@@ -8305,7 +8335,7 @@ fn install_service(
                     "candidate launchd activation requires a separate plist and is not enabled yet".to_owned(),
                 ));
             }
-            launchd_plist(app, working_directory, command, user)?
+            launchd_plist(app, working_directory, command, user, &shared_dir)?
         }
         HostOs::Unknown(value) => return Err(CiaoError::Config(format!("unsupported host OS `{value}`"))),
     };
@@ -8388,15 +8418,18 @@ fn service_action<T: RemoteHost + ?Sized>(
             remote_script(
                 transport,
                 "service lifecycle",
-                &format!("set -eu\nsudo -n systemctl {verb} {}\n", shell_quote(unit)),
+                &format!(
+                    "set -eu\nif ! sudo -n systemctl {verb} {unit}; then\n    echo 'service lifecycle command failed; recent journal:' >&2\n    sudo -n journalctl -u {unit} -n 20 --no-pager >&2 || true\n    exit 1\nfi\n",
+                    unit = shell_quote(unit)
+                ),
             )?;
             if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
                 remote_script(
                     transport,
                     "verify service lifecycle",
                     &format!(
-                        "set -eu\nsudo -n systemctl is-active --quiet {}\n",
-                        shell_quote(unit)
+                        "set -eu\nif ! sudo -n systemctl is-active --quiet {unit}; then\n    echo 'service is not active; recent journal:' >&2\n    sudo -n journalctl -u {unit} -n 20 --no-pager >&2 || true\n    exit 3\nfi\n",
+                        unit = shell_quote(unit)
                     ),
                 )?;
             }
@@ -8529,32 +8562,6 @@ fn domain_healthcheck_script(https: &str, http: &str, health: &HealthConfig) -> 
     )
 }
 
-fn cleanup_release(
-    transport: &OpenSshTransport,
-    os: &HostOs,
-    app: &str,
-    release: &str,
-) -> Result<()> {
-    validate_identifier("app name", app)?;
-    validate_identifier("release", release)?;
-    let root = host_app_root(os);
-    let current_path = format!("{root}/{app}/current");
-    let release_path = format!("{root}/{app}/releases/{release}");
-    let staging_path = format!("/tmp/ciao-{app}-{release}");
-    remote_script(
-        transport,
-        "cleanup failed release",
-        &format!(
-            "set -eu\ncurrent=''\nif sudo -n test -L {current_path}; then current=$(sudo -n readlink {current_path}); fi\ncase \"$(basename \"$current\")\" in {release}) echo 'refusing to clean a release currently selected by current' >&2; exit 1;; esac\nsudo -n rm -rf {release_path} {staging_path}\n",
-            current_path = shell_quote(&current_path),
-            release = shell_quote(release),
-            release_path = shell_quote(&release_path),
-            staging_path = shell_quote(&staging_path),
-        ),
-    )
-    .map(|_| ())
-}
-
 fn prune_releases(transport: &OpenSshTransport, root: &str, app: &str, keep: usize) -> Result<()> {
     let current = read_current_release(transport, root, app)?;
     let current_case = current.unwrap_or_default();
@@ -8623,18 +8630,23 @@ pub fn launchd_plist(
     working_directory: &str,
     command: &str,
     user: &str,
+    shared_dir: &str,
 ) -> Result<String> {
     validate_identifier("app name", app)?;
     validate_owner("launchd user", user)?;
     if !working_directory.starts_with('/') || working_directory.contains(['\n', '\r']) {
         return Err(CiaoError::Config("working directory is invalid".to_owned()));
     }
+    if !shared_dir.starts_with('/') || shared_dir.contains(['\n', '\r']) {
+        return Err(CiaoError::Config("shared directory is invalid".to_owned()));
+    }
     let label = format!("dev.ciao.{app}");
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>UserName</key><string>{user}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-lc</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{working_directory}</string>\n<key>KeepAlive</key><true/>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>UserName</key><string>{user}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>CIAO_SHARED_DIR</key><string>{shared_dir}</string></dict>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-lc</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{working_directory}</string>\n<key>KeepAlive</key><true/>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
         xml_escape(command),
         label = xml_escape(&label),
         user = xml_escape(user),
+        shared_dir = xml_escape(shared_dir),
     ))
 }
 
@@ -9101,6 +9113,7 @@ mod tests {
         )
         .unwrap();
         assert!(script.contains("export PORT=41002\n"));
+        assert!(script.contains("export CIAO_SHARED_DIR='/var/lib/ciao/apps/fixed-port/shared'\n"));
     }
 
     #[test]
@@ -9526,9 +9539,17 @@ mod tests {
 
     #[test]
     fn generated_service_rejects_untrusted_identifiers() {
-        let plist = launchd_plist("good", "/tmp", "./app", "luca").unwrap();
+        let plist = launchd_plist(
+            "good",
+            "/tmp",
+            "./app",
+            "luca",
+            "/Library/Ciao/apps/good/shared",
+        )
+        .unwrap();
         assert!(plist.contains("<key>UserName</key><string>luca</string>"));
         assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("<key>CIAO_SHARED_DIR</key>"));
     }
 
     #[test]

@@ -34,6 +34,7 @@ The remote layout is intentionally ordinary:
   releases/<release>/
   current -> releases/<release>
   shared/env
+  .failed/<release>        # bounded quarantine for failed candidates
 
 /var/cache/ciao/<app>/
   build and package-manager cache (owned by the app user)
@@ -41,7 +42,11 @@ The remote layout is intentionally ordinary:
 
 On macOS the corresponding cache is `/Library/Caches/Ciao/<app>/`. Build and
 install commands use that directory as `HOME`; release contents remain
-immutable and the user's personal home directory is never used.
+immutable and the user's personal home directory is never used. Writable
+runtime state belongs under `shared/`; generated services export
+`CIAO_SHARED_DIR` with that path. SQLite-like files found in a service source
+are rejected before upload so an immutable release cannot fail later with a
+read-only database error.
 
 Linux uses generated `ciao-<app>-slot-a.service` and
 `ciao-<app>-slot-b.service` units and journald. Caddy switches to the healthy
@@ -92,7 +97,7 @@ pre_activate → activate → post_activate → smoke → prune
 ```
 
 Only activation changes `current` or the stable service. Build and health
-failures clean the candidate and preserve the active release. A Linux service
+failures quarantine the candidate under `.failed/` and preserve the active release. A Linux service
 candidate is managed temporarily for its health check; the current macOS
 candidate path runs the candidate script directly and checks its HTTP endpoint
 before stable activation.

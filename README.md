@@ -191,6 +191,12 @@ Deploys are immutable. A failed build or health check does not replace the
 active release. If a deploy is interrupted, Ciao removes its temporary state
 or offers a safe lock recovery on the next deploy.
 
+Service releases cannot contain writable runtime state. Before upload, Ciao
+rejects SQLite-like files (`*.db`, `*.sqlite`, `*.sqlite3`, `*-wal`, `*-shm`,
+and `*-journal`). Store that state below `CIAO_SHARED_DIR`; Ciao exports the
+variable in the generated start script and service unit. Add a pattern to
+`.ciaoignore` only after the application has been migrated to that path.
+
 ## Supported apps
 
 - Rust
@@ -234,6 +240,14 @@ on_rollback = "scripts/notify-rollback.sh"
 hostname = "tv.example.com"
 tunnel = "abcmovie"
 ```
+
+The generated service environment includes:
+
+```text
+CIAO_SHARED_DIR=/var/lib/ciao/apps/<app>/shared
+```
+
+Use it for SQLite files, uploads, indexes and other writable application data.
 
 `pre_upload` runs on the local computer. The other hooks run remotely as the
 application user, in the candidate or active release directory. Hooks are

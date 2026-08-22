@@ -312,6 +312,7 @@ After=network.target
 User=ciao-myapp
 WorkingDirectory=/var/lib/ciao/apps/myapp/current
 EnvironmentFile=/var/lib/ciao/apps/myapp/shared/env
+Environment=CIAO_SHARED_DIR=/var/lib/ciao/apps/myapp/shared
 ExecStart=/var/lib/ciao/apps/myapp/current/start
 Restart=on-failure
 RestartSec=2
@@ -711,6 +712,8 @@ Remote layout:
   shared/
     env
     data/
+
+  .failed/                 # latest failed candidates, kept for inspection
 ```
 
 Build and package-manager caches are kept outside releases:
@@ -725,6 +728,12 @@ during install/build. Ciao never uses `/dev` or the operator's personal home
 directory for deployment state.
 
 Never overwrite the active release in place.
+
+Release directories are read-only after hardening. Ciao rejects SQLite-like
+runtime artifacts in service sources before upload; applications must use
+`CIAO_SHARED_DIR` for writable databases, WAL files, uploads and caches. A
+failed candidate is moved to `.failed/<release>` (latest three retained) and
+is never eligible for rollback.
 
 This makes rollback simple and safe.
 
@@ -1005,6 +1014,10 @@ Support:
 .gitignore
 .ciaoignore
 ```
+
+For a service, `.ciaoignore` is appropriate only after the application has
+been changed to use `CIAO_SHARED_DIR`; ignoring a database while still opening
+it relative to the release directory will fail at runtime.
 
 Avoid requiring `rsync`.
 

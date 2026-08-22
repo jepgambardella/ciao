@@ -6,6 +6,17 @@ All notable Ciao changes are recorded here.
 
 No changes yet.
 
+## [v0.1.33] - 2026-08-22
+
+- Reject SQLite-like runtime artifacts in service sources before upload; use
+  `CIAO_SHARED_DIR` for writable application state.
+- Export `CIAO_SHARED_DIR` from generated start scripts, systemd units and
+  LaunchDaemons.
+- Include the last 20 journal lines when a managed service fails to start or
+  is not active after restart.
+- Preserve failed candidates under `.failed/` (latest three) instead of
+  deleting them or making them rollback targets.
+
 ## [v0.1.32] - 2026-08-22
 
 - Avoid contending for the shared Cloudflare lock when an app has no managed
